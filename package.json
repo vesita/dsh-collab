@@ -1,0 +1,41 @@
+{
+  "name": "dsh-collab",
+  "version": "0.3.0",
+  "description": "Multi-agent real-time collaboration & concurrency lock plugin for DSH",
+  "type": "module",
+  "main": "src/index.js",
+  "types": "src/types/collab.d.ts",
+  "exports": {
+    ".": "./src/index.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "test": "node tests/collab-pure-logic.mjs",
+    "test:types": "tsc --noEmit",
+    "build:types": "tsc --declaration --emitDeclarationOnly",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh-tools": "*"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": "*"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.2"
+  },
+  "keywords": [
+    "dsh",
+    "cordis",
+    "multi-agent",
+    "collaboration",
+    "advisory-lock"
+  ],
+  "author": "",
+  "license": "MIT"
+}

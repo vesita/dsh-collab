@@ -1,0 +1,118 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dsh.local/schema/collab.schema.json",
+  "title": "collab (多智能体协作) 数据与工具契约",
+  "description": "多智能体协作插件的单一事实源契约：注册表状态文档 + 两个模型工具参数。JSON Schema v1。TS 类型 / Python dataclass / Rust struct 均由本文件派生。",
+  "$defs": {
+    "Path": {
+      "type": "string",
+      "description": "项目相对路径。目录以 / 结尾（如 src/backend/），文件不带斜杠。"
+    },
+    "Mode": {
+      "type": "string",
+      "enum": ["exclusive", "shared"],
+      "description": "exclusive 独占（默认，阻塞他人重叠声明）；shared 只声明不排他。"
+    },
+    "Claim": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["claimId", "holderId", "paths", "mode", "ttlSec", "expiresAt", "createdAt"],
+      "properties": {
+        "claimId": { "type": "string", "description": "声明 id，如 c_1。release/heartbeat 用它定位。" },
+        "holderId": { "type": "string", "description": "持有者，格式 agent:<sessionId> 或 human:console。" },
+        "holderName": { "type": "string", "description": "持有者显示名（会话标题截断 24 字）。" },
+        "paths": { "type": "array", "items": { "$ref": "#/$defs/Path" } },
+        "mode": { "$ref": "#/$defs/Mode" },
+        "ttlSec": { "type": "integer", "minimum": 5, "maximum": 86400, "default": 1800, "description": "租约秒数。" },
+        "expiresAt": { "type": "integer", "description": "过期时刻（Unix 毫秒）。过期即视为未占用。" },
+        "note": { "type": "string", "maxLength": 500 },
+        "createdAt": { "type": "integer", "description": "创建时刻（Unix 毫秒）。" }
+      }
+    },
+    "Message": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["msgId", "seq", "channel", "author", "ts", "body"],
+      "properties": {
+        "msgId": { "type": "string", "description": "消息 id，如 m_1。" },
+        "seq": { "type": "integer", "description": "单调递增序号，用于增量读取（read since）。" },
+        "channel": { "type": "string", "default": "general", "description": "频道：general / path:<路径> / agent:<holderId>。" },
+        "author": { "type": "string", "description": "作者 holderId。" },
+        "ts": { "type": "integer", "description": "发送时刻（Unix 毫秒）。" },
+        "body": { "type": "string", "minLength": 1, "description": "消息正文。" },
+        "mentions": { "type": "array", "items": { "type": "string" }, "maxItems": 20, "description": "被 @ 的 holderId。" },
+        "replyTo": { "type": "string", "description": "回复的 msgId，可做成线程。" }
+      }
+    },
+    "Holder": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["holderId", "name", "kind"],
+      "properties": {
+        "holderId": { "type": "string" },
+        "name": { "type": "string" },
+        "kind": { "type": "string", "enum": ["agent", "human"] },
+        "sessionId": { "type": "string" },
+        "lastSeenAt": { "type": "integer", "description": "最近一次活跃（Unix 毫秒）。" }
+      }
+    },
+    "StateDocument": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schemaVersion", "seq", "claims", "messages", "holders"],
+      "properties": {
+        "schemaVersion": { "type": "integer", "const": 1 },
+        "seq": { "type": "integer", "description": "全局单调序号，用于分配 claimId/msgId。" },
+        "claims": { "type": "array", "items": { "$ref": "#/$defs/Claim" } },
+        "messages": { "type": "array", "items": { "$ref": "#/$defs/Message" } },
+        "holders": { "type": "array", "items": { "$ref": "#/$defs/Holder" } }
+      }
+    },
+    "Conflict": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["claimId", "holderId", "path", "overlapsWith", "mode", "expiresAt"],
+      "properties": {
+        "claimId": { "type": "string" },
+        "holderId": { "type": "string" },
+        "holderName": { "type": "string" },
+        "path": { "type": "string" },
+        "overlapsWith": { "type": "string" },
+        "mode": { "$ref": "#/$defs/Mode" },
+        "expiresAt": { "type": "integer" },
+        "remainingSec": { "type": "integer", "description": "当前距离租约到期的剩余秒数" },
+        "suggestedAction": { "type": "string", "enum": ["wait", "negotiate", "switch_path"], "description": "为 AI 提供的下一步协作决策建议" }
+      }
+    },
+    "colabLockParams": {
+      "title": "collab_lock 工具参数",
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["op"],
+      "properties": {
+        "op": { "type": "string", "enum": ["claim", "release", "list", "overview", "status", "heartbeat", "wait"] },
+        "paths": { "type": "array", "items": { "$ref": "#/$defs/Path" } },
+        "claimId": { "type": "string" },
+        "mode": { "$ref": "#/$defs/Mode" },
+        "ttlSec": { "type": "integer", "minimum": 5, "maximum": 86400, "default": 1800 },
+        "timeoutMs": { "type": "integer", "minimum": 0, "maximum": 120000, "default": 30000, "description": "wait 用，最多等待毫秒。" },
+        "note": { "type": "string", "maxLength": 500 }
+      }
+    },
+    "colabBoardParams": {
+      "title": "collab_board 工具参数",
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["op"],
+      "properties": {
+        "op": { "type": "string", "enum": ["post", "read"] },
+        "channel": { "type": "string" },
+        "body": { "type": "string" },
+        "mentions": { "type": "array", "items": { "type": "string" }, "maxItems": 20 },
+        "replyTo": { "type": "string" },
+        "since": { "type": "integer", "minimum": 0, "description": "read 用，只返回 seq 大于此值的消息。" },
+        "limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 }
+      }
+    }
+  }
+}
