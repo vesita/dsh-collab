@@ -11,7 +11,7 @@ export function apply(ctx) {
   const fs = ctx.fs
   const sessions = ctx.get('sessions')
   const sessionTitle = ctx.get('sessionTitle')
-  const COLLAB_DIR = '~/.dsh/collab/projects'
+  const COLLAB_DIR = '.dsh/collab/projects'
   const LEGACY_FILE = '.dsh-collab.json'
   const now = () => Date.now()
 
@@ -237,9 +237,10 @@ export function apply(ctx) {
         timeoutMs: { type: 'number', description: 'wait 用，最多等待毫秒，默认 30000' },
         note: { type: 'string', description: '占用说明' }
       },
+      additionalProperties: true,
       required: ['op']
     },
-    output: { schema: { type: 'object' }, render },
+    output: { schema: { type: 'object', additionalProperties: true }, render },
     execute: lockHandler
   }
 
@@ -257,9 +258,10 @@ export function apply(ctx) {
         since: { type: 'number', description: 'read 用，只返回 seq 大于此值的消息' },
         limit: { type: 'number', description: 'read 用，最多条数，默认 50' }
       },
+      additionalProperties: true,
       required: ['op']
     },
-    output: { schema: { type: 'object' }, render },
+    output: { schema: { type: 'object', additionalProperties: true }, render },
     execute: boardHandler
   }
 
