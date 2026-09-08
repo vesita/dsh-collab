@@ -55,8 +55,9 @@ return {
     const stale = e => { const m = String((e && (e.message || e.code)) || e); return m.includes('FS_STALE_VERSION') || /stale|already exists|EEXIST/i.test(m) }
     const conflict = cs => { const e = new Error('conflict'); e.collabConflict = true; e.conflicts = cs; return e }
     const withWarn = (data, warn) => (warn ? Object.assign({}, data, { warning: warn }) : data)
-    async function cwdOf(agentId) {
+    async function cwdOf(agentId, agent) {
       try {
+        if (agent && agent.session && agent.session.header && typeof agent.session.header.cwd === 'string' && agent.session.header.cwd) return agent.session.header.cwd
         if (agentId && sessions) {
           const s = sessions.get(agentId)
           const c = s && s.header && s.header.cwd
@@ -65,14 +66,14 @@ return {
       } catch (e) {}
       return null
     }
-    async function targetFor(agentId) {
-      const cwd = await cwdOf(agentId)
+    async function targetFor(agentId, agent) {
+      const cwd = await cwdOf(agentId, agent)
       const fileName = storageNameFor(cwd)
       const target = fs.resolve(COLLAB_DIR + '/' + fileName)
       return { cwd, target }
     }
-    async function load(agentId) {
-      const { cwd, target } = await targetFor(agentId)
+    async function load(agentId, agent) {
+      const { cwd, target } = await targetFor(agentId, agent)
       const warn = cwd ? null : 'state-file at default location (no session cwd); per-project isolation disabled'
       let info = await fs.stat(target)
       // 平滑兼容：若外部尚未生成，但项目内存在遗留的 .dsh-collab.json，则自动无缝迁移至外部存储
@@ -96,9 +97,9 @@ return {
       return { state: s, version: info.version, target, warn }
     }
     function expire(s, t) { const b = s.claims.length; s.claims = s.claims.filter(c => c.expiresAt > t); return b - s.claims.length }
-    async function mutate(fn, agentId) {
+    async function mutate(fn, agentId, agent) {
       for (let i = 0; i < 5; i++) {
-        const { state, version, target } = await load(agentId)
+        const { state, version, target } = await load(agentId, agent)
         expire(state, now())
         let out
         try { out = fn(state) } catch (e) { if (e && e.collabConflict) return { ok: false, error: 'conflict', conflicts: e.conflicts }; throw e }
@@ -111,7 +112,7 @@ return {
       }
       return { ok: false, error: 'concurrent-modification', message: 'state busy, retry later' }
     }
-    const holderOf = exec => { const id = exec && exec.agent && exec.agent.id ? String(exec.agent.id) : null; return { holderId: id ? 'agent:' + id : 'human:console', sessionId: id || undefined } }
+    const holderOf = exec => { const agent = exec && exec.agent; const id = agent && agent.id ? String(agent.id) : null; return { agent, holderId: id ? 'agent:' + id : 'human:console', sessionId: id || undefined } }
     function cleanName(s) {
       if (typeof s !== 'string') return s
       let n = s.replace(/\\s+/g, ' ').trim()
@@ -120,7 +121,7 @@ return {
     }
     function hname(h) {
       let name = null
-      if (h.sessionId && sessions && sessionTitle) { try { const s = sessions.get(h.sessionId); if (s) { const t = sessionTitle.get(s); if (t && typeof t.title === 'string' && t.title) name = t.title } } catch (e) {} }
+      if (h.sessionId && (sessions || h.agent) && sessionTitle) { try { const s = (h.agent && h.agent.session) || (sessions && sessions.get(h.sessionId)); if (s) { const t = sessionTitle.get(s); if (t && typeof t.title === 'string' && t.title) name = t.title } } catch (e) {} }
       return cleanName(name || h.holderId)
     }
     function holder(state, h, name) {
@@ -244,20 +245,20 @@ return {
       }
       return { ok: false, error: 'timeout', message: 'paths still claimed', paths, blockers: blockers.map(pub), waitedMs: timeoutMs }
     }
-    const exec = (fn) => async (args, e) => { args = args || {}; const h = holderOf(e); const name = hname(h); const aId = h.sessionId || null; try { return await fn(args, h, name, aId) } catch (err) { return { ok: false, error: 'internal', message: String((err && err.message) || err) } } }
-    const lock = exec((a, h, name, aId) => {
-      if (a.op === 'claim') return mutate(s => claim(s, h, name, a), aId)
-      if (a.op === 'release') return mutate(s => release(s, h, a), aId)
-      if (a.op === 'heartbeat') return mutate(s => heartbeat(s, h, a), aId)
-      if (a.op === 'list') return list(aId)
-      if (a.op === 'overview') return overview(aId)
-      if (a.op === 'status') return status(a, aId)
-      if (a.op === 'wait') return waitFor(a, h, aId)
+    const exec = (fn) => async (args, e) => { args = args || {}; const h = holderOf(e); const name = hname(h); const aId = h.sessionId || null; try { return await fn(args, h, name, aId, h.agent) } catch (err) { return { ok: false, error: 'internal', message: String((err && err.message) || err) } } }
+    const lock = exec((a, h, name, aId, agent) => {
+      if (a.op === 'claim') return mutate(s => claim(s, h, name, a), aId, agent)
+      if (a.op === 'release') return mutate(s => release(s, h, a), aId, agent)
+      if (a.op === 'heartbeat') return mutate(s => heartbeat(s, h, a), aId, agent)
+      if (a.op === 'list') return list(aId, agent)
+      if (a.op === 'overview') return overview(aId, agent)
+      if (a.op === 'status') return status(a, aId, agent)
+      if (a.op === 'wait') return waitFor(a, h, aId, agent)
       return { ok: false, error: 'bad-request', message: 'unknown op: ' + String(a.op) }
     })
-    const board = exec((a, h, name, aId) => {
-      if (a.op === 'post') return mutate(s => post(s, h, name, a), aId)
-      if (a.op === 'read') return msgs(a, aId)
+    const board = exec((a, h, name, aId, agent) => {
+      if (a.op === 'post') return mutate(s => post(s, h, name, a), aId, agent)
+      if (a.op === 'read') return msgs(a, aId, agent)
       return { ok: false, error: 'bad-request', message: 'unknown op: ' + String(a.op) }
     })
     const render = (args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }]
@@ -308,9 +309,9 @@ return {
         const agent = payload && payload.agent
         if (!agent || !agent.id) return
         const h = 'agent:' + String(agent.id)
-        mutate(s => { const rel = s.claims.filter(c => c.holderId === h); if (!rel.length) return { ok: true, changed: false, data: {} }; s.claims = s.claims.filter(c => c.holderId !== h); return { ok: true, changed: true, state: s, data: { released: rel.map(pub) } } }, String(agent.id)).catch(() => {})
+        mutate(s => { const rel = s.claims.filter(c => c.holderId === h); if (!rel.length) return { ok: true, changed: false, data: {} }; s.claims = s.claims.filter(c => c.holderId !== h); return { ok: true, changed: true, state: s, data: { released: rel.map(pub) } } }, String(agent.id), agent).catch(() => {})
       } catch (e) {}
-    })
+    }, { global: true })
   }
 }
 `

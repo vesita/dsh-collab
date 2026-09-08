@@ -20,12 +20,6 @@
     "build:types": "tsc --declaration --emitDeclarationOnly",
     "lint": "tsc --noEmit"
   },
-  "dependencies": {
-    "@deepseek-ai/dsh-tools": "*"
-  },
-  "peerDependencies": {
-    "@deepseek-ai/dsh-tools": "*"
-  },
   "devDependencies": {
     "typescript": "^5.8.2"
   },

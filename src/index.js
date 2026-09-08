@@ -22,8 +22,12 @@ export function apply(ctx) {
   }
   const withWarn = (data, warn) => (warn ? Object.assign({}, data, { warning: warn }) : data)
 
-  async function cwdOf(agentId) {
+  async function cwdOf(agentId, agent) {
     try {
+      if (agent && agent.session && agent.session.header) {
+        const c = agent.session.header.cwd
+        if (typeof c === 'string' && c) return c
+      }
       if (agentId && sessions) {
         const s = sessions.get(agentId)
         const c = s && s.header && s.header.cwd
@@ -33,15 +37,15 @@ export function apply(ctx) {
     return null
   }
 
-  async function targetFor(agentId) {
-    const cwd = await cwdOf(agentId)
+  async function targetFor(agentId, agent) {
+    const cwd = await cwdOf(agentId, agent)
     const fileName = projectStorageFileName(cwd)
     const target = await fs.resolve(COLLAB_DIR + '/' + fileName)
     return { cwd, target }
   }
 
-  async function load(agentId) {
-    const { cwd, target } = await targetFor(agentId)
+  async function load(agentId, agent) {
+    const { cwd, target } = await targetFor(agentId, agent)
     const warn = cwd ? null : 'state-file at default location (no session cwd); per-project isolation disabled'
     let info = await fs.stat(target)
     if (!info && cwd) {
@@ -68,9 +72,9 @@ export function apply(ctx) {
     return { state: s, version: info.version, target, warn }
   }
 
-  async function mutate(fn, agentId) {
+  async function mutate(fn, agentId, agent) {
     for (let i = 0; i < 5; i++) {
-      const { state, version, target } = await load(agentId)
+      const { state, version, target } = await load(agentId, agent)
       expire(state, now())
       let out
       try {
@@ -93,8 +97,13 @@ export function apply(ctx) {
   }
 
   const holderOf = exec => {
-    const id = exec && exec.agent && exec.agent.id ? String(exec.agent.id) : null
-    return { holderId: id ? 'agent:' + id : 'human:console', sessionId: id || undefined }
+    const agent = exec && exec.agent
+    const id = agent && agent.id ? String(agent.id) : null
+    return {
+      agent,
+      holderId: id ? 'agent:' + id : 'human:console',
+      sessionId: id || undefined
+    }
   }
 
   function cleanName(s) {
@@ -106,9 +115,9 @@ export function apply(ctx) {
 
   function hname(h) {
     let name = null
-    if (h.sessionId && sessions && sessionTitle) {
+    if (h.sessionId && (sessions || h.agent) && sessionTitle) {
       try {
-        const s = sessions.get(h.sessionId)
+        const s = (h.agent && h.agent.session) || (sessions && sessions.get(h.sessionId))
         if (s) {
           const t = sessionTitle.get(s)
           if (t && typeof t.title === 'string' && t.title) name = t.title
@@ -118,8 +127,8 @@ export function apply(ctx) {
     return cleanName(name || h.holderId)
   }
 
-  async function list(agentId) {
-    const { state, target, warn } = await load(agentId)
+  async function list(agentId, agent) {
+    const { state, target, warn } = await load(agentId, agent)
     const t = now()
     const ex = expire(state, t)
     return {
@@ -136,8 +145,8 @@ export function apply(ctx) {
     }
   }
 
-  async function overviewOp(agentId) {
-    const { state, target, warn } = await load(agentId)
+  async function overviewOp(agentId, agent) {
+    const { state, target, warn } = await load(agentId, agent)
     const t = now()
     expire(state, t)
     const o = overview(state)
@@ -152,8 +161,8 @@ export function apply(ctx) {
     }
   }
 
-  async function status(a, agentId) {
-    const { state, target, warn } = await load(agentId)
+  async function status(a, agentId, agent) {
+    const { state, target, warn } = await load(agentId, agent)
     const t = now()
     expire(state, t)
     const paths = (Array.isArray(a.paths) ? a.paths : []).map(norm).filter(Boolean)
@@ -170,19 +179,19 @@ export function apply(ctx) {
     }
   }
 
-  async function msgs(a, agentId) {
-    const { state } = await load(agentId)
+  async function msgs(a, agentId, agent) {
+    const { state } = await load(agentId, agent)
     return { ok: true, data: filterMessages(state, a) }
   }
 
-  async function waitFor(a, h, agentId) {
+  async function waitFor(a, h, agentId, agent) {
     const timeoutMs = Math.max(0, Math.min(120000, Number(a.timeoutMs) || 30000))
     const paths = (Array.isArray(a.paths) ? a.paths : []).map(norm).filter(Boolean)
     if (!paths.length) return { ok: false, error: 'bad-request', message: 'paths required' }
     const deadline = now() + timeoutMs
     let bList = []
     while (now() < deadline) {
-      const { state } = await load(agentId)
+      const { state } = await load(agentId, agent)
       const t = now()
       bList = blockers(state, t, h, paths)
       if (bList.length === 0) return { ok: true, data: { paths, blockers: [], waitedMs: Math.round(timeoutMs - Math.max(0, deadline - now())) } }
@@ -198,26 +207,26 @@ export function apply(ctx) {
     h.name = name
     const aId = h.sessionId || null
     try {
-      return await fn(args, h, aId)
+      return await fn(args, h, aId, h.agent)
     } catch (err) {
       return { ok: false, error: 'internal', message: String((err && err.message) || err) }
     }
   }
 
-  const lockHandler = exec((a, h, aId) => {
-    if (a.op === 'claim') return mutate(s => claim(s, h, a, now), aId)
-    if (a.op === 'release') return mutate(s => release(s, h, a, now), aId)
-    if (a.op === 'heartbeat') return mutate(s => heartbeat(s, h, a, now), aId)
-    if (a.op === 'list') return list(aId)
-    if (a.op === 'overview') return overviewOp(aId)
-    if (a.op === 'status') return status(a, aId)
-    if (a.op === 'wait') return waitFor(a, h, aId)
+  const lockHandler = exec((a, h, aId, agent) => {
+    if (a.op === 'claim') return mutate(s => claim(s, h, a, now), aId, agent)
+    if (a.op === 'release') return mutate(s => release(s, h, a, now), aId, agent)
+    if (a.op === 'heartbeat') return mutate(s => heartbeat(s, h, a, now), aId, agent)
+    if (a.op === 'list') return list(aId, agent)
+    if (a.op === 'overview') return overviewOp(aId, agent)
+    if (a.op === 'status') return status(a, aId, agent)
+    if (a.op === 'wait') return waitFor(a, h, aId, agent)
     return { ok: false, error: 'bad-request', message: 'unknown op: ' + String(a.op) }
   })
 
-  const boardHandler = exec((a, h, aId) => {
-    if (a.op === 'post') return mutate(s => post(s, h, a, now), aId)
-    if (a.op === 'read') return msgs(a, aId)
+  const boardHandler = exec((a, h, aId, agent) => {
+    if (a.op === 'post') return mutate(s => post(s, h, a, now), aId, agent)
+    if (a.op === 'read') return msgs(a, aId, agent)
     return { ok: false, error: 'bad-request', message: 'unknown op: ' + String(a.op) }
   })
 
@@ -276,9 +285,9 @@ export function apply(ctx) {
         if (!rel.length) return { ok: true, changed: false, data: {} }
         s.claims = s.claims.filter(c => c.holderId !== h)
         return { ok: true, changed: true, state: s, data: { released: rel.map(pub) } }
-      }, String(agent.id)).catch(() => {})
+      }, String(agent.id), agent).catch(() => {})
     } catch (e) {}
-  })
+  }, { global: true })
 }
 
 export default { name, inject, apply }
