@@ -1,7 +1,7 @@
 import {
   norm, ov, hashProjectKey, projectStorageFileName, init, publish,
-  expire, conflictError, holder, claim, release, heartbeat,
-  post, overview, related, filterMessages, blockers
+  expire, sweep, conflictError, holder, claim, release, heartbeat,
+  post, overview, related, filterMessages, blockers, cleanName
 } from './collab-core.mjs'
 
 export const name = 'dsh-collab'
@@ -56,11 +56,24 @@ export function apply(ctx) {
       } catch (e) {}
     }
     if (!info) return { state: init(), version: null, target, warn }
+    const raw = await fs.readText(target)
     let s
     try {
-      s = Object.assign(init(), JSON.parse(await fs.readText(target)))
+      s = Object.assign(init(), JSON.parse(raw))
     } catch (e) {
-      throw new Error('collab state corrupted: ' + target.displayPath)
+      // 自愈而非砖化：保留损坏文件的备份，重置为空状态并把问题作为 warning 上报。
+      const backupSuffix = '.corrupt-' + now()
+      let backupPath = null
+      try {
+        const backupTarget = await fs.resolve(target.displayPath + backupSuffix)
+        await fs.writeText(backupTarget, raw, { kind: 'createIfAbsent' })
+        backupPath = fs.processPath(backupTarget)
+      } catch (backupError) {}
+      try {
+        await fs.writeText(target, JSON.stringify(init()), { kind: 'replaceIfVersion', version: info.version })
+      } catch (resetError) {}
+      const corruptWarn = 'state corrupted; reinitialized' + (backupPath ? '; backup: ' + backupPath : '')
+      return { state: init(), version: null, target, warn: warn ? warn + '; ' + corruptWarn : corruptWarn }
     }
     s.claims = Array.isArray(s.claims) ? s.claims : []
     s.messages = Array.isArray(s.messages) ? s.messages : []
@@ -71,7 +84,7 @@ export function apply(ctx) {
   async function mutate(fn, agentId) {
     for (let i = 0; i < 5; i++) {
       const { state, version, target } = await load(agentId)
-      expire(state, now())
+      const swept = sweep(state, now())
       let out
       try {
         out = fn(state)
@@ -79,7 +92,16 @@ export function apply(ctx) {
         if (e && e.collabConflict) return { ok: false, error: 'conflict', conflicts: e.conflicts }
         throw e
       }
-      if (!out || out.changed === false) return out ? { ok: out.ok !== false, data: out.data || {} } : { ok: false, error: 'not-found' }
+      if (!out || out.changed === false) {
+        if (!out) return { ok: false, error: 'not-found', message: 'nothing to change' }
+        const data = out.data || {}
+        // 统一错误信封：ok:false 时 error/message 提升到顶层，调用方无需再挖 data。
+        if (out.ok === false) return { ok: false, error: data.error || 'bad-request', message: data.message, ...data }
+        return { ok: true, data }
+      }
+      if (swept.droppedMessages > 0 || swept.prunedHolders > 0) {
+        out.data = Object.assign({}, out.data, { swept })
+      }
       try {
         if (version === null) await fs.writeText(target, JSON.stringify(out.state), { kind: 'createIfAbsent' })
         else await fs.writeText(target, JSON.stringify(out.state), { kind: 'replaceIfVersion', version })
@@ -95,13 +117,6 @@ export function apply(ctx) {
   const holderOf = exec => {
     const id = exec && exec.agent && exec.agent.id ? String(exec.agent.id) : null
     return { holderId: id ? 'agent:' + id : 'human:console', sessionId: id || undefined }
-  }
-
-  function cleanName(s) {
-    if (typeof s !== 'string') return s
-    let n = s.replace(/\s+/g, ' ').trim()
-    if (n.length > 24) n = n.slice(0, 24) + '…'
-    return n
   }
 
   function hname(h) {

@@ -65,7 +65,7 @@ collab_lock op=claim paths=["src/backend/models/"] mode=exclusive ttlSec=1800 no
 | op | 用途 |
 | --- | --- |
 | `list` | 返回全部声明 + holder + `expiredCount`（已过期数），知道整个项目当前占用状态 |
-| `overview` | **按 holder 分组**的项目占用全景（`totalClaims` + 每个 holder 的 claimCount/mode/paths/claims），开工/打标签最省事 |
+| `overview` | **按 holder 分组**的项目占用全景（`totalClaims` + 每个 holder 的 claimCount/mode/paths/claims）；同一 holder 同时持有 exclusive 与 shared 时 `mode` 为 `mixed`，开工/打标签最省事 |
 | `status paths=[...]` | 只查给定路径的 related + exclusive 声明 |
 
 ### 2.4 等待释放

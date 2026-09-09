@@ -58,7 +58,7 @@
 
 ```bash
 # 1. 运行 Node.js 纯逻辑与宿主对拍测试
-node tests/collab-pure-logic.mjs   # 44/44 通过
+node tests/collab-pure-logic.mjs   # 56/56 通过
 
 # 2. 运行 TypeScript 契约静态类型检查
 pnpm run test:types
@@ -69,6 +69,21 @@ uv run python scripts/simulate_collab.py
 # 4. 运行 Rust CLI 单元测试
 cargo test --manifest-path crates/collab-cli/Cargo.toml
 ```
+
+---
+
+## 状态维护（自动，无需人工干预）
+
+`src/collab-core.mjs` 的 `sweep()` 在每次读/写前惰性执行，保证状态文件不会无限增长：
+
+| 行为 | 阈值 | 说明 |
+| --- | --- | --- |
+| 过期声明回收 | 租约到期 | `expire()` 的既有语义 |
+| 留言保留 | 最近 `MAX_MESSAGES = 2000` 条 | 超出部分从最旧的开始丢弃，写入时回报 `swept.droppedMessages` |
+| 陈旧 holder 回收 | 无活跃声明且 `HOLDER_TTL_MS = 24h` 未出现 | 避免 holders 数组长期膨胀 |
+| 损坏状态自愈 | JSON 解析失败 | 备份为 `<state>.corrupt-<ts>` 后重置为空状态，并以 `warning` 上报，而不是让协作工具永久不可用 |
+
+工具返回统一信封：失败时 `error` / `message` 在顶层（如 `bad-request`、`not-found`、`conflict`、`forbidden`、`timeout`），调用方无需再挖 `data`。
 
 ---
 

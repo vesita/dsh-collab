@@ -56,13 +56,42 @@ export function cleanName(s) {
 
 export function init() { return { schemaVersion: 1, seq: 0, claims: [], messages: [], holders: [] } }
 
+// 状态膨胀上限：留言保留最近 MAX_MESSAGES 条，holder 在无活跃声明且 24h 未出现时回收。
+// 两者都由 sweep() 在每次读/写前惰性执行，保证状态文件不会无限增长。
+export const MAX_MESSAGES = 2000
+export const HOLDER_TTL_MS = 24 * 60 * 60 * 1000
+
+// 惰性清理：过期声明 + 超额留言 + 陈旧 holder。
+// 返回各类清理数量，供上层附带诊断信息。
+export function sweep(s, t, opts = {}) {
+  const maxMessages = Number.isInteger(opts.maxMessages) && opts.maxMessages > 0 ? opts.maxMessages : MAX_MESSAGES
+  const holderTtlMs = Number.isInteger(opts.holderTtlMs) && opts.holderTtlMs >= 0 ? opts.holderTtlMs : HOLDER_TTL_MS
+
+  const beforeClaims = s.claims.length
+  s.claims = s.claims.filter(c => c.expiresAt > t)
+  const expiredClaims = beforeClaims - s.claims.length
+
+  let droppedMessages = 0
+  if (s.messages.length > maxMessages) {
+    droppedMessages = s.messages.length - maxMessages
+    s.messages = s.messages.slice(-maxMessages)
+  }
+
+  const active = new Set(s.claims.map(c => c.holderId))
+  const beforeHolders = s.holders.length
+  s.holders = s.holders.filter(h => active.has(h.holderId) || t - (h.lastSeenAt || 0) < holderTtlMs)
+  const prunedHolders = beforeHolders - s.holders.length
+
+  return { expiredClaims, droppedMessages, prunedHolders }
+}
+
+// 惰性清理过期声明，返回清理数量（兼容旧调用方）。
+export function expire(s, t) { return sweep(s, t).expiredClaims }
+
 // 对外发出一条 claim 的公开视图（剥离内部字段）。
 export function publish(c) {
   return { claimId: c.claimId, holderId: c.holderId, holderName: c.holderName, paths: c.paths, mode: c.mode, ttlSec: c.ttlSec, expiresAt: c.expiresAt, note: c.note, createdAt: c.createdAt }
 }
-
-// 惰性清理过期声明，返回清理数量。
-export function expire(s, t) { const b = s.claims.length; s.claims = s.claims.filter(c => c.expiresAt > t); return b - s.claims.length }
 
 // 构造冲突错误（由调用方捕获）。标记 collabConflict 以便 mutate 识别。
 export function conflictError(cs) { const e = new Error('conflict'); e.collabConflict = true; e.conflicts = cs; return e }
@@ -153,7 +182,7 @@ export function post(state, h, a, tNow) {
   return { ok: true, changed: true, state, tNow, data: { msgId: m.msgId, seq: state.seq, ts: m.ts } }
 }
 
-// 按 holder 分组的占用全景。
+// 按 holder 分组的占用全景。holder 的 mode 在多条声明不一致时聚合为 'mixed'。
 export function overview(state) {
   const byHolder = {}
   for (const c of state.claims) {
@@ -161,7 +190,7 @@ export function overview(state) {
     if (!byHolder[k]) byHolder[k] = { holderId: k, holderName: c.holderName || k, claims: [] }
     byHolder[k].claims.push(publish(c))
   }
-  return { totalClaims: state.claims.length, holders: Object.keys(byHolder).map(k => { const h = byHolder[k]; return { holderId: h.holderId, holderName: h.holderName, claimCount: h.claims.length, mode: h.claims[0].mode, paths: h.claims.flatMap(c => c.paths), claims: h.claims } }) }
+  return { totalClaims: state.claims.length, holders: Object.keys(byHolder).map(k => { const h = byHolder[k]; const modes = [...new Set(h.claims.map(c => c.mode))]; return { holderId: h.holderId, holderName: h.holderName, claimCount: h.claims.length, mode: modes.length === 1 ? modes[0] : 'mixed', paths: h.claims.flatMap(c => c.paths), claims: h.claims } }) }
 }
 
 // 查询与给定路径相关的声明。
@@ -169,13 +198,14 @@ export function related(state, paths) {
   return state.claims.filter(c => paths.some(p => c.paths.some(cp => ov(p, cp))))
 }
 
-// 筛选消息（channel / since / limit）。
+// 筛选消息（channel / since / limit）。total 是筛选前的总条数，便于调用方判断是否有更早历史。
 export function filterMessages(state, a) {
   const since = Number(a.since) || 0, limit = Math.max(1, Math.min(200, Number(a.limit) || 50))
   let l = state.messages
   if (typeof a.channel === 'string' && a.channel.trim()) l = l.filter(m => m.channel === a.channel.trim())
-  l = l.filter(m => m.seq > since).slice(-limit)
-  return { since, returned: l.length, messages: l }
+  const matched = l.filter(m => m.seq > since)
+  const returned = matched.slice(-limit)
+  return { since, returned: returned.length, total: matched.length, latestSeq: state.messages.length ? state.messages[state.messages.length - 1].seq : 0, messages: returned }
 }
 
 // 计算在当前时刻 blocking 的独占声明（供 wait）。

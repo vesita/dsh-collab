@@ -5,7 +5,7 @@
 //          与核心库做行为对比，防止内联版与核心库漂移。
 import { readFileSync } from 'node:fs'
 import {
-  norm, ov, cleanName, init, publish, expire, holder, claim, release, heartbeat,
+  norm, ov, cleanName, init, publish, expire, sweep, HOLDER_TTL_MS, holder, claim, release, heartbeat,
   post, overview, related, filterMessages, blockers,
 } from '../src/collab-core.mjs'
 
@@ -103,14 +103,44 @@ console.log('# overview / related')
   ok(o.holders.find(h => h.holderId === 'agent:a').paths.length === 2, 'overview: flattens holder A paths')
   const rel = related(st, ['src/b/'])
   ok(rel.length === 1 && rel[0].holderId === 'agent:a', 'related: matches prefix overlap')
+  // 混合模式聚合
+  const st2 = init()
+  claim(st2, { holderId: 'agent:m', name: 'M' }, { paths: ['src/x/'], mode: 'exclusive' }, T)
+  claim(st2, { holderId: 'agent:m', name: 'M' }, { paths: ['src/y/'], mode: 'shared' }, T)
+  const o2 = overview(st2)
+  ok(o2.holders[0].mode === 'mixed', 'overview: mixed exclusive/shared aggregates to mixed')
 }
 
-// ===== 7. expire：到期清理 =====
-console.log('# expire')
+// ===== 7. expire / sweep：到期清理与状态膨胀上限 =====
+console.log('# expire / sweep')
 {
   const st = init(); claim(st, { holderId: 'agent:a', name: 'A' }, { paths: ['src/a/'], ttlSec: 100 }, () => 1000)
   ok(expire(st, 999) === 0, 'expire: live claim retained when checked in past')
   ok(expire(st, 1e12) === 1 && st.claims.length === 0, 'expire: deep-future expires all')
+}
+{
+  // 留言保留最近 N 条
+  const st = init()
+  for (let i = 0; i < 10; i++) post(st, { holderId: 'agent:a', name: 'A' }, { body: 'm' + i }, () => 1000 + i)
+  const swept = sweep(st, 2000, { maxMessages: 4 })
+  ok(swept.droppedMessages === 6 && st.messages.length === 4, 'sweep: caps messages to maxMessages')
+  ok(st.messages[0].body === 'm6' && st.messages[3].body === 'm9', 'sweep: keeps the newest messages')
+}
+{
+  // 陈旧 holder 回收，活跃声明持有者保留
+  const st = init()
+  claim(st, { holderId: 'agent:live', name: 'Live' }, { paths: ['src/live/'], ttlSec: 90000 }, () => 1000)
+  st.holders.push({ holderId: 'agent:ghost', name: 'Ghost', lastSeenAt: 0 })
+  const swept = sweep(st, HOLDER_TTL_MS + 500)
+  ok(swept.prunedHolders === 1, 'sweep: prunes stale holder')
+  ok(st.holders.some(h => h.holderId === 'agent:live'), 'sweep: keeps holder with a live claim')
+}
+{
+  // filterMessages 增加 total/latestSeq
+  const st = init()
+  for (let i = 0; i < 5; i++) post(st, { holderId: 'agent:a', name: 'A' }, { body: 'x' + i }, () => 1000)
+  const f = filterMessages(st, { limit: 2 })
+  ok(f.returned === 2 && f.total === 5 && f.latestSeq === 5, 'filterMessages: total/latestSeq reported')
 }
 
 // ===== 8. blockers（wait 使用） =====
@@ -142,6 +172,19 @@ console.log('# hostCode inline vs core (drift guard)')
   for (const s of ['  a   b ', 'x'.repeat(40), ''] ) {
     ok(hc(s) === cleanName(s), 'hostCode cleanName matches core: len ' + s.length)
   }
+  // sweep 内联版与核心库行为一致（默认上限 2000 条）
+  const hs = extract('sweep')
+  const mk = () => {
+    const s = init()
+    for (let i = 0; i < 2100; i++) post(s, { holderId: 'agent:a', name: 'A' }, { body: 'm' + i }, () => 1000)
+    s.holders.push({ holderId: 'ghost', name: 'Ghost', lastSeenAt: 0 })
+    return s
+  }
+  const coreState = mk(), hostState = mk()
+  const coreSwept = sweep(coreState, 1000 + HOLDER_TTL_MS + 1)
+  const hostSwept = hs(hostState, 1000 + HOLDER_TTL_MS + 1)
+  ok(JSON.stringify(coreSwept) === JSON.stringify(hostSwept), 'hostCode sweep returns the same diagnostics as core')
+  ok(JSON.stringify(coreState) === JSON.stringify(hostState), 'hostCode sweep mutates state identically to core')
 }
 
 console.log(`\n${fail === 0 ? 'ALL PASS' : 'FAILURES'}: ${pass} passed, ${fail} failed`)

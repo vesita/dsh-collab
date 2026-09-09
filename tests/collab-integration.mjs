@@ -1,4 +1,6 @@
-import { Context } from '../node_modules/.pnpm/node_modules/@deepseek-ai/cordis/lib/index.js'
+// 解析策略：优先裸包名（pnpm 提升 / profile 安装），回退到项目内 pnpm 虚拟store 路径。
+const cordis = await import('@deepseek-ai/cordis').catch(() => import('../node_modules/.pnpm/node_modules/@deepseek-ai/cordis/lib/index.js'))
+const { Context } = cordis
 import collabPlugin from '../src/index.js'
 
 const ctx = new Context()
@@ -65,5 +67,19 @@ await new Promise(r => setTimeout(r, 60))
 // 6. check list after dispose
 const listRes = await lockTool.execute({ op: 'list' }, exec2)
 if (!listRes.ok || listRes.data.claims.length !== 0) throw new Error('disposed claims not cleaned')
+
+// 7. unified error envelope: failures carry a top-level error code
+const badRelease = await lockTool.execute({ op: 'release' }, exec2)
+if (badRelease.ok || badRelease.error !== 'bad-request') throw new Error('release without id/paths must fail with bad-request at top level')
+const badHeartbeat = await lockTool.execute({ op: 'heartbeat', claimId: 'c_nope' }, exec2)
+if (badHeartbeat.ok || badHeartbeat.error !== 'not-found') throw new Error('heartbeat of a missing claim must fail with not-found at top level')
+
+// 8. corrupt state self-heals instead of bricking the tool
+const { projectStorageFileName } = await import('../src/collab-core.mjs')
+const statePath = '.dsh/collab/projects/' + projectStorageFileName('/test/workspace')
+stateStore.set(statePath, 'not-json{{{')
+const healed = await lockTool.execute({ op: 'list' }, exec2)
+if (!healed.ok) throw new Error('corrupt state must self-heal, got ' + JSON.stringify(healed))
+if (!String(healed.data.warning || '').includes('corrupted')) throw new Error('self-heal must surface a warning')
 
 console.log('PASS: Cordis plugin integration test passed (0.1.5-alpha.1 runtime)')
