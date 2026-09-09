@@ -15,16 +15,16 @@
     }
   },
   "scripts": {
-    "test": "node tests/collab-pure-logic.mjs",
+    "test": "node tests/collab-pure-logic.mjs && node tests/collab-integration.mjs",
     "test:types": "tsc --noEmit",
     "build:types": "tsc --declaration --emitDeclarationOnly",
     "lint": "tsc --noEmit"
   },
   "dependencies": {
-    "@deepseek-ai/dsh-tools": "*"
+    "@deepseek-ai/dsh-tools": "^0.1.5-alpha.1"
   },
   "peerDependencies": {
-    "@deepseek-ai/dsh-tools": "*"
+    "@deepseek-ai/dsh-tools": "^0.1.5-alpha.1"
   },
   "devDependencies": {
     "typescript": "^5.8.2"
