@@ -1,7 +1,7 @@
 // 解析策略：优先裸包名（pnpm 提升 / profile 安装），回退到项目内 pnpm 虚拟store 路径。
 const cordis = await import('@deepseek-ai/cordis').catch(() => import('../node_modules/.pnpm/node_modules/@deepseek-ai/cordis/lib/index.js'))
 const { Context } = cordis
-import collabPlugin from '../src/index.js'
+import collabPlugin from '../lib/index.js'
 
 const ctx = new Context()
 ctx.provide('tools')
@@ -75,11 +75,11 @@ const badHeartbeat = await lockTool.execute({ op: 'heartbeat', claimId: 'c_nope'
 if (badHeartbeat.ok || badHeartbeat.error !== 'not-found') throw new Error('heartbeat of a missing claim must fail with not-found at top level')
 
 // 8. corrupt state self-heals instead of bricking the tool
-const { projectStorageFileName } = await import('../src/collab-core.mjs')
+const { projectStorageFileName } = await import('../lib/collab-core.js')
 const statePath = '.dsh/collab/projects/' + projectStorageFileName('/test/workspace')
 stateStore.set(statePath, 'not-json{{{')
 const healed = await lockTool.execute({ op: 'list' }, exec2)
 if (!healed.ok) throw new Error('corrupt state must self-heal, got ' + JSON.stringify(healed))
 if (!String(healed.data.warning || '').includes('corrupted')) throw new Error('self-heal must surface a warning')
 
-console.log('PASS: Cordis plugin integration test passed (0.1.5-alpha.1 runtime)')
+console.log('PASS: Cordis plugin integration test passed (0.1.5-rc.1 runtime)')

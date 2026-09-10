@@ -2,27 +2,118 @@ import {
   norm, ov, hashProjectKey, projectStorageFileName, init, publish,
   expire, sweep, conflictError, holder, claim, release, heartbeat,
   post, overview, related, filterMessages, blockers, cleanName
-} from './collab-core.mjs'
+} from './collab-core.js'
+import type {
+  Claim, ConflictInfo, HolderInput, Mode, OpResult, PublishedClaim, StateDocument
+} from './collab-core.js'
+
+/** fs 服务返回的文件引用（displayPath / version 由 DSH fs 服务提供）。 */
+export interface FileRef {
+  displayPath: string
+  version?: number
+  [key: string]: any
+}
+
+/** ctx.fs 中本插件实际使用的最小接口。 */
+export interface CollabFs {
+  resolve(path: string, opts?: { cwd?: string }): Promise<FileRef>
+  stat(target: FileRef): Promise<{ version: number } | null>
+  readText(target: FileRef): Promise<string>
+  writeText(target: FileRef, content: string, opts?: { kind?: string; version?: number }): Promise<unknown>
+  processPath(target: FileRef): string
+}
+
+interface SessionLike { header?: { cwd?: string } }
+interface SessionsService { get(agentId: string): SessionLike | undefined }
+interface SessionTitleService { get(session: SessionLike): { title?: string } | undefined }
+
+/** 工具调用上下文（execute 的第二个参数），只取 agent.id 作为 holder 身份。 */
+export interface ToolExecContext {
+  agent?: { id?: string }
+  [key: string]: any
+}
+
+/** lock / board 的调用参数（由 JSON Schema 描述，字段随 op 变化）。 */
+export interface CollabArgs {
+  op?: string
+  paths?: string[]
+  claimId?: string
+  mode?: Mode
+  ttlSec?: number
+  timeoutMs?: number
+  note?: string
+  channel?: string
+  body?: string
+  mentions?: string[]
+  replyTo?: string
+  since?: number
+  limit?: number
+}
+
+/** 统一结果信封；ok:false 时 error/message 提升到顶层，少数 op 附加诊断字段。 */
+export interface ToolResult {
+  ok: boolean
+  error?: string
+  message?: string
+  data?: Record<string, any>
+  conflicts?: ConflictInfo[]
+  paths?: string[]
+  blockers?: PublishedClaim[]
+  waitedMs?: number
+}
+
+/** DSH 工具定义（ctx.tools.register 的入参）。 */
+export interface ToolDefinition {
+  name: string
+  description: string
+  parameters: Record<string, unknown>
+  output: {
+    schema: Record<string, unknown>
+    render: (args: CollabArgs, value: unknown) => Array<{ type: string; text: string }>
+  }
+  execute: (args: CollabArgs, exec: ToolExecContext) => Promise<ToolResult>
+}
+
+/** 插件 ctx：只声明本插件实际消费的服务与事件 API。 */
+export interface CollabContext {
+  fs: CollabFs
+  timer: { timeout(ms: number): Promise<void> }
+  tools: { register(tool: ToolDefinition): void }
+  get(name: string): any
+  on(event: string, handler: (payload: any) => void): void
+}
+
+/** 单个 op 的处理函数签名。 */
+type OpHandler = (args: CollabArgs, h: HolderInput, agentId: string | null) => ToolResult | Promise<ToolResult>
+
+/** load() 的返回：状态文档 + 乐观并发版本号 + 存储目标 + 诊断 warning。 */
+interface LoadResult {
+  state: StateDocument
+  version: number | null
+  target: FileRef
+  warn: string | null
+}
 
 export const name = 'dsh-collab'
 export const inject = ['fs', 'timer', 'tools']
 
-export function apply(ctx) {
+export function apply(ctx: CollabContext): void {
   const fs = ctx.fs
-  const sessions = ctx.get('sessions')
-  const sessionTitle = ctx.get('sessionTitle')
+  const sessions = ctx.get('sessions') as SessionsService | undefined
+  const sessionTitle = ctx.get('sessionTitle') as SessionTitleService | undefined
   const COLLAB_DIR = '.dsh/collab/projects'
   const LEGACY_FILE = '.dsh-collab.json'
-  const now = () => Date.now()
+  const now = (): number => Date.now()
 
-  const pub = c => publish(c)
-  const stale = e => {
-    const m = String((e && (e.message || e.code)) || e)
+  const pub = (c: Claim): PublishedClaim => publish(c)
+  const stale = (e: unknown): boolean => {
+    const err = e as { message?: string; code?: string } | null | undefined
+    const m = String((err && (err.message || err.code)) || e)
     return m.includes('FS_STALE_VERSION') || /stale|already exists|EEXIST/i.test(m)
   }
-  const withWarn = (data, warn) => (warn ? Object.assign({}, data, { warning: warn }) : data)
+  const withWarn = (data: Record<string, any>, warn: string | null) => (warn ? Object.assign({}, data, { warning: warn }) : data)
 
-  async function cwdOf(agentId) {
+  async function cwdOf(agentId: string | null): Promise<string | null> {
     try {
       if (agentId && sessions) {
         const s = sessions.get(agentId)
@@ -33,14 +124,14 @@ export function apply(ctx) {
     return null
   }
 
-  async function targetFor(agentId) {
+  async function targetFor(agentId: string | null): Promise<{ cwd: string | null; target: FileRef }> {
     const cwd = await cwdOf(agentId)
     const fileName = projectStorageFileName(cwd)
     const target = await fs.resolve(COLLAB_DIR + '/' + fileName)
     return { cwd, target }
   }
 
-  async function load(agentId) {
+  async function load(agentId: string | null): Promise<LoadResult> {
     const { cwd, target } = await targetFor(agentId)
     const warn = cwd ? null : 'state-file at default location (no session cwd); per-project isolation disabled'
     let info = await fs.stat(target)
@@ -57,13 +148,13 @@ export function apply(ctx) {
     }
     if (!info) return { state: init(), version: null, target, warn }
     const raw = await fs.readText(target)
-    let s
+    let s: StateDocument
     try {
       s = Object.assign(init(), JSON.parse(raw))
     } catch (e) {
       // 自愈而非砖化：保留损坏文件的备份，重置为空状态并把问题作为 warning 上报。
       const backupSuffix = '.corrupt-' + now()
-      let backupPath = null
+      let backupPath: string | null = null
       try {
         const backupTarget = await fs.resolve(target.displayPath + backupSuffix)
         await fs.writeText(backupTarget, raw, { kind: 'createIfAbsent' })
@@ -81,11 +172,11 @@ export function apply(ctx) {
     return { state: s, version: info.version, target, warn }
   }
 
-  async function mutate(fn, agentId) {
+  async function mutate(fn: (s: StateDocument) => OpResult, agentId: string | null): Promise<ToolResult> {
     for (let i = 0; i < 5; i++) {
       const { state, version, target } = await load(agentId)
       const swept = sweep(state, now())
-      let out
+      let out: OpResult | undefined
       try {
         out = fn(state)
       } catch (e) {
@@ -114,13 +205,13 @@ export function apply(ctx) {
     return { ok: false, error: 'concurrent-modification', message: 'state busy, retry later' }
   }
 
-  const holderOf = exec => {
+  const holderOf = (exec: ToolExecContext): HolderInput => {
     const id = exec && exec.agent && exec.agent.id ? String(exec.agent.id) : null
     return { holderId: id ? 'agent:' + id : 'human:console', sessionId: id || undefined }
   }
 
-  function hname(h) {
-    let name = null
+  function hname(h: HolderInput): string {
+    let name: string | null = null
     if (h.sessionId && sessions && sessionTitle) {
       try {
         const s = sessions.get(h.sessionId)
@@ -133,7 +224,7 @@ export function apply(ctx) {
     return cleanName(name || h.holderId)
   }
 
-  async function list(agentId) {
+  async function list(agentId: string | null): Promise<ToolResult> {
     const { state, target, warn } = await load(agentId)
     const t = now()
     const ex = expire(state, t)
@@ -151,7 +242,7 @@ export function apply(ctx) {
     }
   }
 
-  async function overviewOp(agentId) {
+  async function overviewOp(agentId: string | null): Promise<ToolResult> {
     const { state, target, warn } = await load(agentId)
     const t = now()
     expire(state, t)
@@ -167,7 +258,7 @@ export function apply(ctx) {
     }
   }
 
-  async function status(a, agentId) {
+  async function status(a: CollabArgs, agentId: string | null): Promise<ToolResult> {
     const { state, target, warn } = await load(agentId)
     const t = now()
     expire(state, t)
@@ -185,17 +276,17 @@ export function apply(ctx) {
     }
   }
 
-  async function msgs(a, agentId) {
+  async function msgs(a: CollabArgs, agentId: string | null): Promise<ToolResult> {
     const { state } = await load(agentId)
     return { ok: true, data: filterMessages(state, a) }
   }
 
-  async function waitFor(a, h, agentId) {
+  async function waitFor(a: CollabArgs, h: HolderInput, agentId: string | null): Promise<ToolResult> {
     const timeoutMs = Math.max(0, Math.min(120000, Number(a.timeoutMs) || 30000))
     const paths = (Array.isArray(a.paths) ? a.paths : []).map(norm).filter(Boolean)
     if (!paths.length) return { ok: false, error: 'bad-request', message: 'paths required' }
     const deadline = now() + timeoutMs
-    let bList = []
+    let bList: Claim[] = []
     while (now() < deadline) {
       const { state } = await load(agentId)
       const t = now()
@@ -206,7 +297,7 @@ export function apply(ctx) {
     return { ok: false, error: 'timeout', message: 'paths still claimed', paths, blockers: bList.map(pub), waitedMs: timeoutMs }
   }
 
-  const exec = (fn) => async (args, e) => {
+  const exec = (fn: OpHandler) => async (args: CollabArgs, e: ToolExecContext): Promise<ToolResult> => {
     args = args || {}
     const h = holderOf(e)
     const name = hname(h)
@@ -236,9 +327,9 @@ export function apply(ctx) {
     return { ok: false, error: 'bad-request', message: 'unknown op: ' + String(a.op) }
   })
 
-  const render = (args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }]
+  const render = (args: CollabArgs, value: unknown) => [{ type: 'text', text: JSON.stringify(value, null, 2) }]
 
-  const lockTool = {
+  const lockTool: ToolDefinition = {
     name: 'collab_lock',
     description: '多智能体协作中央注册锁：开工前声明占用项目文件夹（目录以 / 结尾，如 src/backend/），查询他人占用，减少共同开发冲突。规范：动手改代码前先 claim；开工前和定期 list/overview；冲突时先 wait 等待或用 board 留言协商；完成即 release；长任务 heartbeat 续租。',
     parameters: {
@@ -259,7 +350,7 @@ export function apply(ctx) {
     execute: lockHandler
   }
 
-  const boardTool = {
+  const boardTool: ToolDefinition = {
     name: 'collab_board',
     description: '多智能体协作留言板：向协作域发消息（频道 general / path:<路径> / agent:<holderId>）或增量读取消息，用于协商、交接、同步进展。',
     parameters: {
@@ -283,7 +374,7 @@ export function apply(ctx) {
   ctx.tools.register(lockTool)
   ctx.tools.register(boardTool)
 
-  ctx.on('agent/disposed', (payload) => {
+  ctx.on('agent/disposed', (payload: { agent?: { id?: string } }) => {
     try {
       const agent = payload && payload.agent
       if (!agent || !agent.id) return

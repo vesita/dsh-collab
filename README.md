@@ -25,20 +25,22 @@
 ├── scripts/
 │   ├── collab_models.py          # Python dataclass 模型定义（Schema 派生）
 │   └── simulate_collab.py        # Python (uv) 多 Agent 高并发冲突仿真与压测脚本
-├── src/
-│   ├── collab-core.mjs           # 纯逻辑唯一事实源（可 import / 可测 / 供多语言对照）
-│   ├── collab-plugin.host.js     # 自包含 Cordis Host 插件源码（可直接作为 code.host）
+├── src/                          # TypeScript 源码（NodeNext 风格，import 写 ./x.js）
+│   ├── index.ts                  # 包入口：注册 collab_lock / collab_board 工具
+│   ├── collab-core.ts            # 纯逻辑唯一事实源（可 import / 可测 / 供多语言对照）
+│   ├── collab-plugin.host.ts     # 自包含 Cordis Host 插件源码（导出 hostCode 字符串，可直接作为 code.host）
 │   ├── schema/
 │   │   └── collab.schema.json    # JSON Schema v1：状态文档 + 工具参数（单一契约）
 │   └── types/
-│       └── collab.d.ts           # TypeScript 类型定义（支持 ts 强校验）
+│       └── collab.d.ts           # TypeScript 类型定义（公共类型面，构建时复制到 lib/types/）
+├── lib/                          # tsc 构建产物（git 忽略，随 npm 包发布）
 └── tests/
-    └── collab-pure-logic.mjs     # 纯逻辑 + 宿主一致性的回归测试
+    └── collab-pure-logic.mjs     # 纯逻辑 + 宿主一致性的回归测试（对 lib/ 运行）
 ```
 
 ### 多工具链协同设计（Python + TS + Rust）
 
-1. **`src/collab-core.mjs` & `src/types/collab.d.ts` (TS/fnm)**
+1. **`src/collab-core.ts` & `src/types/collab.d.ts` (TS/fnm)**
    - 纯逻辑事实源与 TypeScript 强类型定义。
    - 增强了冲突建议语义（`remainingSec`、`suggestedAction`: wait/negotiate/switch_path），为 AI 决策提供确定性下一步方案。
    - 运行类型校验：`pnpm run test:types`。
@@ -57,6 +59,9 @@
 ## 运行测试
 
 ```bash
+# 0. 构建（测试与发布均针对 lib/ 产物，故需先构建）
+pnpm run build
+
 # 1. 运行 Node.js 纯逻辑与宿主对拍测试
 node tests/collab-pure-logic.mjs   # 56/56 通过
 
@@ -74,7 +79,7 @@ cargo test --manifest-path crates/collab-cli/Cargo.toml
 
 ## 状态维护（自动，无需人工干预）
 
-`src/collab-core.mjs` 的 `sweep()` 在每次读/写前惰性执行，保证状态文件不会无限增长：
+`src/collab-core.ts` 的 `sweep()` 在每次读/写前惰性执行，保证状态文件不会无限增长：
 
 | 行为 | 阈值 | 说明 |
 | --- | --- | --- |
@@ -89,11 +94,11 @@ cargo test --manifest-path crates/collab-cli/Cargo.toml
 
 ## 作为动态插件运行
 
-把 `collab-plugin.host.js` 导出的 `hostCode` 作为 `code.host` 传给 `cordis_define` 即可：
+把 `collab-plugin.host.ts` 导出的 `hostCode` 作为 `code.host` 传给 `cordis_define` 即可：
 
 ```js
-// ESM
-import { hostCode } from './src/collab-plugin.host.js'
+// ESM（构建产物；源码为 src/collab-plugin.host.ts）
+import { hostCode } from './lib/collab-plugin.host.js'
 // cordis_define({ plugin: { kind: 'new', idPrefix: 'coll' }, code: { host: hostCode } })
 ```
 

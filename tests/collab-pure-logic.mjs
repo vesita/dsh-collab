@@ -1,13 +1,13 @@
 // collab-pure-logic.mjs
-// 纯逻辑回归测试。import 自 src/collab-core.mjs（唯一事实源），而非复制。
+// 纯逻辑回归测试。import 自 lib/collab-core.js（唯一事实源），而非复制。
 // 运行：node tests/collab-pure-logic.mjs
-// 额外对拍：从 src/collab-plugin.host.js 提取 norm/cleanName 源码并 eval，
+// 额外对拍：从 lib/collab-plugin.host.js 提取 norm/cleanName 源码并 eval，
 //          与核心库做行为对比，防止内联版与核心库漂移。
 import { readFileSync } from 'node:fs'
 import {
   norm, ov, cleanName, init, publish, expire, sweep, HOLDER_TTL_MS, holder, claim, release, heartbeat,
   post, overview, related, filterMessages, blockers,
-} from '../src/collab-core.mjs'
+} from '../lib/collab-core.js'
 
 let pass = 0, fail = 0
 const ok = (cond, label) => { if (cond) { pass++; console.log('  ok  ' + label) } else { fail++; console.log('  FAIL ' + label) } }
@@ -26,7 +26,7 @@ ok(ov('src/foo', 'src/foobar') === false, 'ov: non-overlap segment boundary')
 
 // ===== 1.1 数据外置存储文件名生成 =====
 console.log('# projectStorageFileName')
-import { hashProjectKey, projectStorageFileName } from '../src/collab-core.mjs'
+import { hashProjectKey, projectStorageFileName } from '../lib/collab-core.js'
 ok(typeof hashProjectKey('/home/vesita/my-project') === 'string', 'hashProjectKey returns string')
 ok(projectStorageFileName('/home/vesita/coding/my/dsh-collab').startsWith('dsh-collab-'), 'storage name prefix matches dir basename')
 ok(projectStorageFileName('/home/vesita/coding/my/dsh-collab').endsWith('.json'), 'storage name ends with .json')
@@ -156,7 +156,7 @@ console.log('# blockers')
 // ===== 9. 宿主源码一致性对拍（hostCode 内联版 vs 核心库） =====
 console.log('# hostCode inline vs core (drift guard)')
 {
-  const { hostCode } = await import('../src/collab-plugin.host.js')
+  const { hostCode } = await import('../lib/collab-plugin.host.js')
   // 兼容函数声明 (function norm(...) {) 与箭头函数 (const norm = (...) => {)
   const extract = fnName => {
     const decl = RegExp('function ' + fnName + '\\(([^)]*)\\) \\{([\\s\\S]*?)\\n    \\}', 'm').exec(hostCode)

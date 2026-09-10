@@ -1,17 +1,18 @@
-// collab-plugin.host.js
+// collab-plugin.host.ts
 // 自包含的 Cordis Host 插件源码（等价于动态插件 coll-1/pkg-9，当前运行版本）。
 //
 // 用法：
-//   const { hostCode } = require('./src/collab-plugin.host.js')   // CJS
-//   import { hostCode } from './src/collab-plugin.host.js'        // ESM
+//   import { hostCode } from './lib/collab-plugin.host.js'        // ESM（构建产物）
 //   cordis_define(code: { host: hostCode })                       // 作为 code.host
 //
 // 注意：Cordis 动态插件的 code.host 不接受 import/打包，因此本文件内联了
-// 与 src/collab-core.mjs 逻辑一致的纯逻辑部分。纯逻辑唯一事实源见 collab-core.mjs；
+// 与 src/collab-core.ts 逻辑一致的纯逻辑部分。纯逻辑唯一事实源见 collab-core.ts；
 // 正式化进 host 组合后可直接 import 该核心模块消除重复。
 // 工具参数契约见 src/schema/collab.schema.json（JSON Schema v1）。
 
-export const hostCode = `
+// hostCode 是纯 JavaScript 源码文本，直接作为 Cordis 动态插件的 code.host 使用，
+// 不参与 TypeScript 类型检查；只导出它的本模块是 TypeScript。
+export const hostCode: string = `
 return {
   inject: ['fs', 'timer'],
   apply(ctx) {
@@ -341,5 +342,5 @@ return {
 }
 `
 
-// 供 CommonJS 使用。动态插件场景直接取 hostCode 字符串即可。
+// 默认导出便于 `import host from '...'` 取用；动态插件场景直接取 hostCode 字符串即可。
 export default { hostCode }
