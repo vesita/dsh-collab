@@ -1,17 +1,18 @@
-// collab-plugin.host.js
+// collab-plugin.host.ts
 // 自包含的 Cordis Host 插件源码（等价于动态插件 coll-1/pkg-9，当前运行版本）。
 //
 // 用法：
-//   const { hostCode } = require('./src/collab-plugin.host.js')   // CJS
-//   import { hostCode } from './src/collab-plugin.host.js'        // ESM
+//   import { hostCode } from './lib/collab-plugin.host.js'        // ESM（构建产物）
 //   cordis_define(code: { host: hostCode })                       // 作为 code.host
 //
 // 注意：Cordis 动态插件的 code.host 不接受 import/打包，因此本文件内联了
-// 与 src/collab-core.mjs 逻辑一致的纯逻辑部分。纯逻辑唯一事实源见 collab-core.mjs；
+// 与 src/collab-core.ts 逻辑一致的纯逻辑部分。纯逻辑唯一事实源见 collab-core.ts；
 // 正式化进 host 组合后可直接 import 该核心模块消除重复。
 // 工具参数契约见 src/schema/collab.schema.json（JSON Schema v1）。
 
-export const hostCode = `
+// hostCode 是纯 JavaScript 源码文本，直接作为 Cordis 动态插件的 code.host 使用，
+// 不参与 TypeScript 类型检查；只导出它的本模块是 TypeScript。
+export const hostCode: string = `
 return {
   inject: ['fs', 'timer'],
   apply(ctx) {
@@ -79,7 +80,7 @@ return {
       // 平滑兼容：若外部尚未生成，但项目内存在遗留的 .dsh-collab.json，则自动无缝迁移至外部存储
       if (!info && cwd) {
         try {
-          const legacyTarget = fs.resolve(LEGACY_FILE, { cwd })
+          const legacyTarget = await fs.resolve(LEGACY_FILE, { cwd })
           const legInfo = await fs.stat(legacyTarget)
           if (legInfo) {
             const raw = await fs.readText(legacyTarget)
@@ -89,21 +90,45 @@ return {
         } catch (e) {}
       }
       if (!info) return { state: init(), version: null, target, warn }
+      const raw = await fs.readText(target)
       let s
-      try { s = Object.assign(init(), JSON.parse(await fs.readText(target))) } catch (e) { throw new Error('collab state corrupted: ' + target.displayPath) }
+      try { s = Object.assign(init(), JSON.parse(raw)) } catch (e) {
+        let backupPath = null
+        try {
+          const backupTarget = await fs.resolve(target.displayPath + '.corrupt-' + now())
+          await fs.writeText(backupTarget, raw, { kind: 'createIfAbsent' })
+          backupPath = fs.processPath(backupTarget)
+        } catch (backupError) {}
+        try { await fs.writeText(target, JSON.stringify(init()), { kind: 'replaceIfVersion', version: info.version }) } catch (resetError) {}
+        const corruptWarn = 'state corrupted; reinitialized' + (backupPath ? '; backup: ' + backupPath : '')
+        return { state: init(), version: null, target, warn: warn ? warn + '; ' + corruptWarn : corruptWarn }
+      }
       s.claims = Array.isArray(s.claims) ? s.claims : []
       s.messages = Array.isArray(s.messages) ? s.messages : []
       s.holders = Array.isArray(s.holders) ? s.holders : []
       return { state: s, version: info.version, target, warn }
     }
-    function expire(s, t) { const b = s.claims.length; s.claims = s.claims.filter(c => c.expiresAt > t); return b - s.claims.length }
+    function sweep(s, t) {
+      const b = s.claims.length; s.claims = s.claims.filter(c => c.expiresAt > t); const expiredClaims = b - s.claims.length
+      let droppedMessages = 0
+      if (s.messages.length > 2000) { droppedMessages = s.messages.length - 2000; s.messages = s.messages.slice(-2000) }
+      const active = new Set(s.claims.map(c => c.holderId)); const hb = s.holders.length
+      s.holders = s.holders.filter(h => active.has(h.holderId) || t - (h.lastSeenAt || 0) < 86400000)
+      return { expiredClaims, droppedMessages, prunedHolders: hb - s.holders.length }
+    }
+    function expire(s, t) { return sweep(s, t).expiredClaims }
     async function mutate(fn, agentId, agent) {
       for (let i = 0; i < 5; i++) {
         const { state, version, target } = await load(agentId, agent)
         expire(state, now())
         let out
         try { out = fn(state) } catch (e) { if (e && e.collabConflict) return { ok: false, error: 'conflict', conflicts: e.conflicts }; throw e }
-        if (!out || out.changed === false) return out ? { ok: out.ok !== false, data: out.data || {} } : { ok: false, error: 'not-found' }
+        if (!out || out.changed === false) {
+          if (!out) return { ok: false, error: 'not-found', message: 'nothing to change' }
+          const data = out.data || {}
+          if (out.ok === false) return { ok: false, error: data.error || 'bad-request', message: data.message, ...data }
+          return { ok: true, data }
+        }
         try {
           if (version === null) await fs.writeText(target, JSON.stringify(out.state), { kind: 'createIfAbsent' })
           else await fs.writeText(target, JSON.stringify(out.state), { kind: 'replaceIfVersion', version })
@@ -212,7 +237,8 @@ return {
       }
       const holders = Object.keys(byHolder).map(k => {
         const h = byHolder[k]
-        return { holderId: h.holderId, holderName: h.holderName, claimCount: h.claims.length, mode: h.claims[0].mode, paths: h.claims.flatMap(c => c.paths), claims: h.claims }
+        const modes = [...new Set(h.claims.map(c => c.mode))]
+        return { holderId: h.holderId, holderName: h.holderName, claimCount: h.claims.length, mode: modes.length === 1 ? modes[0] : 'mixed', paths: h.claims.flatMap(c => c.paths), claims: h.claims }
       })
       return { ok: true, data: withWarn({ statePath: fs.processPath(target), serverTime: t, totalClaims: state.claims.length, holders }, warn) }
     }
@@ -227,8 +253,9 @@ return {
       const since = Number(a.since) || 0, limit = Math.max(1, Math.min(200, Number(a.limit) || 50))
       let l = state.messages
       if (typeof a.channel === 'string' && a.channel.trim()) l = l.filter(m => m.channel === a.channel.trim())
-      l = l.filter(m => m.seq > since).slice(-limit)
-      return { ok: true, data: { since, returned: l.length, messages: l } }
+      const matched = l.filter(m => m.seq > since)
+      const returned = matched.slice(-limit)
+      return { ok: true, data: { since, returned: returned.length, total: matched.length, latestSeq: state.messages.length ? state.messages[state.messages.length - 1].seq : 0, messages: returned } }
     }
     async function waitFor(a, h, agentId) {
       const timeoutMs = Math.max(0, Math.min(120000, Number(a.timeoutMs) || 30000))
@@ -316,5 +343,5 @@ return {
 }
 `
 
-// 供 CommonJS 使用。动态插件场景直接取 hostCode 字符串即可。
+// 默认导出便于 `import host from '...'` 取用；动态插件场景直接取 hostCode 字符串即可。
 export default { hostCode }

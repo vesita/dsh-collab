@@ -1,12 +1,15 @@
 {
   "name": "dsh-collab",
-  "version": "0.3.0",
+  "version": "0.3.3",
   "description": "Multi-agent real-time collaboration & concurrency lock plugin for DSH",
   "type": "module",
-  "main": "src/index.js",
-  "types": "src/types/collab.d.ts",
+  "main": "lib/index.js",
+  "types": "lib/types/collab.d.ts",
   "exports": {
-    ".": "./src/index.js",
+    ".": {
+      "types": "./lib/types/collab.d.ts",
+      "default": "./lib/index.js"
+    },
     "./package.json": "./package.json"
   },
   "dsh": {
@@ -14,14 +17,26 @@
       "patch": "./cordis.patch.yml"
     }
   },
+  "files": [
+    "lib/**/*.js",
+    "lib/**/*.d.ts",
+    "cordis.patch.yml",
+    "README.md"
+  ],
   "scripts": {
-    "test": "node tests/collab-pure-logic.mjs",
-    "test:types": "tsc --noEmit",
+    "build": "tsc -p tsconfig.json && cp -R src/types lib/",
     "build:types": "tsc --declaration --emitDeclarationOnly",
+    "prepack": "npm run build",
+    "test": "npm run build && node tests/collab-pure-logic.mjs && node tests/collab-integration.mjs",
+    "test:types": "tsc --noEmit",
     "lint": "tsc --noEmit"
   },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": "^0.1.5-rc.1"
+  },
   "devDependencies": {
-    "typescript": "^5.8.2"
+    "@types/node": "^22.20.1",
+    "typescript": "^5.9.3"
   },
   "keywords": [
     "dsh",
