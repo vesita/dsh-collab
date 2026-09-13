@@ -181,10 +181,20 @@ console.log('# (b)(c)(g) preference ON (explicit true): skill + constant discipl
   const settingsInstall = settings.installed[0]
   ok(settings.installed.length === 1, 'plugin installs exactly one settings section', 'installs=' + settings.installed.length)
   ok(!!settingsInstall && settingsInstall.ns === 'dsh-collab', 'settings namespace is dsh-collab', String(settingsInstall && settingsInstall.ns))
-  ok(!!settingsInstall && !!settingsInstall.schema && JSON.stringify(settingsInstall.schema({})) === '{"exposeDelegationDiscipline":true}',
-    'settings schema defaults exposeDelegationDiscipline to true', JSON.stringify(settingsInstall && settingsInstall.schema && settingsInstall.schema({})))
+  // 0.8.0 起 schema 有**两个**布尔字段（enforceWriteLock 是功能 C 的门控，默认同样为 true）。
+  // 这里从"逐字比一个 JSON 串"改成"逐字段判 + 字段集合判"，判据没有放松：
+  // 字段集合被钉死成恰好这两个，任何一个默认值没落到 true 都会 FAIL。
+  const schemaDefaults = settingsInstall && settingsInstall.schema ? settingsInstall.schema({}) : null
+  ok(!!schemaDefaults && schemaDefaults.exposeDelegationDiscipline === true,
+    'settings schema defaults exposeDelegationDiscipline to true', JSON.stringify(schemaDefaults))
+  ok(!!schemaDefaults && schemaDefaults.enforceWriteLock === true,
+    'settings schema defaults enforceWriteLock to true (write protection defaults ON)', JSON.stringify(schemaDefaults))
+  ok(!!schemaDefaults && Object.keys(schemaDefaults).sort().join(',') === 'enforceWriteLock,exposeDelegationDiscipline',
+    'settings schema exposes exactly the two known boolean fields', Object.keys(schemaDefaults || {}).join(','))
   ok(!!settingsInstall && !!settingsInstall.entry && settingsInstall.entry.exposeDelegationDiscipline === true,
     'composition entry (fallback when settings detach) is true')
+  ok(!!settingsInstall && !!settingsInstall.entry && settingsInstall.entry.enforceWriteLock === true,
+    'composition entry defaults enforceWriteLock to true as well')
 
   ok(captured.liveRegs === 1, 'exactly one live skill registration before unload', 'live=' + captured.liveRegs)
   ok(captured.contexts.has('dsh-collab/delegation'), 'the discipline context is live before unload')

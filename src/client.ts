@@ -4,16 +4,19 @@
     /**
      * dsh-collab 的浏览器半边：Settings → Plugins 下 `dsh-collab` 命名空间的配置卡片。
      *
-     * Host 半边用 `ctx.settings.installSection(...)` 注册了 `dsh-collab` 命名空间，
-     * 但设置页只**枚举**命名空间、从不解释它：一张卡片是通过 `settings.plugin.item`
-     * 按「它编辑的命名空间」为 key 注册进来的，所以**谁拥有设置谁自带卡片**。
-     * 这里就是 dsh-collab 自己的那张卡。
+     * 卡片是一个**默认折叠的配置摘要行**：标题 + 右侧一行当前状态，点击展开。其中
+     * 「委托与验收纪律」带一个下拉（关闭 / 集群协作）与一个「预览」按钮：预览用 DSH
+     * 自己的右侧文档面板打开随包技能正文，**不关闭设置页** —— 本卡片所在的
+     * `settings.plugin.item` 槽位拿不到任何关闭句柄（详见 README）。
      *
-     * 手写 `__ModuleLoader__.load` 包装是浏览器半边的加载协议：浏览器端没有打包器，
-     * 客户端插件以「一个自带 id 的工厂」形式注册，`require` 由加载器注入，只保证
-     * react 与共享的客户端包可用。全文件不使用 JSX —— `React.createElement` 的
-     * 第三个参数起是 children，而自动 jsx runtime 从 `props.children` 读取，混用会
-     * 静默渲染出空元素。
+     * 两处只能由 Host 交出的事实，走 host 半边注册的只读 loopback 路由
+     * `GET /dsh-collab/skill-index`：随包 skill 的**绝对路径**（浏览器拿不到包的安装
+     * 位置）与名称/描述。正文不过网 —— 右侧文档面板自己读文件。
+     *
+     * 手写 `__ModuleLoader__.load` 包装是浏览器半边的加载协议：客户端插件以「一个
+     * 自带 id 的工厂」注册，`require` 由加载器注入。全文件不使用 JSX ——
+     * `React.createElement` 的第三个参数起是 children，而自动 jsx runtime 从
+     * `props.children` 读取，混用会静默渲染出空元素。
      */
     var module = { exports: {} as any }
     var exports = module.exports
@@ -24,44 +27,159 @@
 
     /** 设置命名空间，必须与 Host 半边 installSection 的 ns 逐字一致。 */
     const NS = 'dsh-collab'
-    /** 本卡片编辑的唯一字段。 */
+    /** 本卡片编辑的唯一字段（布尔，默认 true；已持久化的值不能改名/改型）。 */
     const FIELD = 'exposeDelegationDiscipline'
+    /** 功能 C 的写保护开关（布尔，默认 **true**；字段名必须与 Host 半边 schema 逐字一致）。 */
+    const WRITE_LOCK_FIELD = 'enforceWriteLock'
+    /** Host 半边注册的只读技能索引路由。 */
+    const SKILL_ROUTE = '/dsh-collab/skill-index'
+    /** 下拉的两档文案。 */
+    const OFF_LABEL = '关闭'
+    const ON_LABEL = '集群协作'
+    /** 写保护开关的两档文案。 */
+    const LOCK_ON_LABEL = '拦截'
+    const LOCK_OFF_LABEL = '不拦截'
+    /**
+     * `dsh-resource://file/session/<sessionId>/<path>` 前缀。
+     * 只读**会话作用域**：`absolute` 作用域在本部署读不了 —— 文档预览类型的
+     * `canOpen` 要求 `parseFileAddress(address)?.scope === 'session'`，
+     * 且 `sidebarRight.claim` 对无人认领的地址直接抛错。
+     */
+    const RESOURCE_PREFIX = 'dsh-resource://file/session/'
 
-    /** scope 快照中本卡片真正用到的字段。 */
+    /**
+     * 把绝对路径编成资源地址的路径段：逐段 `encodeURIComponent`，分隔符不编码。
+     * Windows 盘符路径先归一成 `/` 分隔（部署的资源语法只认一种分隔符）。
+     */
+    function encodeSegments(path: string): string {
+      const normalized = /^[A-Za-z]:/.test(path) ? path.replace(/\\/g, '/') : path
+      return normalized.split('/').map(encodeURIComponent).join('/')
+    }
+
+    /** 用当前会话把绝对路径编成 session 作用域地址（相对路径不适用：技能在包目录里）。 */
+    function sessionFileAddress(sessionId: string, absolutePath: string): string {
+      return RESOURCE_PREFIX + encodeURIComponent(sessionId) + '/' + encodeSegments(absolutePath)
+    }
+
+    /** 设置 scope 快照中本卡片真正用到的字段。 */
     interface ScopeSnapshot {
       status: 'loading' | 'ready' | 'unavailable'
-      value: { exposeDelegationDiscipline?: boolean } | undefined
+      value: { exposeDelegationDiscipline?: boolean; enforceWriteLock?: boolean } | undefined
       writable: boolean
       revision: number | undefined
     }
 
+    /** 随包技能：路由只交出路径与名称/描述，正文由右侧面板读文件。 */
+    interface SkillInfo {
+      name: string
+      description: string
+      whenToUse?: string
+      path: string
+    }
+
+    interface SkillState {
+      status: 'loading' | 'ready' | 'error'
+      skill: SkillInfo | null
+      error: string | null
+    }
+
     /**
-     * 内联样式：本包不发布 CSS。主题变量只写**被真正定义过**的别名令牌
-     * （`--dsw-alias-*`，定义在 `dsh-client-ui-theme`）——写一个不存在变量名不会报错，
-     * 只会让那条 CSS 属性被静默丢弃。
+     * 内联样式：本包不发布 CSS。用到的主题变量都能在已安装的客户端样式里确认
+     * （settings-plugins 的卡片 / ValueField 样式），不猜变量名。
      */
     const styles: Record<string, any> = {
       card: {
         border: '0.5px solid var(--dsw-alias-border-l4)',
         background: 'var(--dsw-alias-bg-layer-3)',
         borderRadius: '16px',
-        listStyle: 'none',
-        padding: '14px 16px',
-        display: 'flex',
-        flexDirection: 'column',
-        gap: '6px'
+        listStyle: 'none'
       },
-      row: { display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' },
-      label: {
+      header: {
+        appearance: 'none',
+        width: '100%',
+        font: 'inherit',
+        color: 'inherit',
+        textAlign: 'left',
+        cursor: 'pointer',
+        background: '0 0',
+        border: 0,
+        borderRadius: '16px',
+        display: 'flex',
+        alignItems: 'center',
+        gap: '12px',
+        padding: '14px 16px'
+      },
+      chevron: { flex: 'none', color: 'var(--dsw-alias-label-tertiary)' },
+      headText: { minWidth: 0, flex: 1, display: 'flex', flexDirection: 'column', gap: '4px' },
+      name: {
         color: 'var(--dsw-alias-label-primary)',
         fontSize: '15px',
         fontWeight: 600,
         lineHeight: 1.4
       },
+      summary: {
+        color: 'var(--dsw-alias-label-tertiary)',
+        fontSize: '13px',
+        lineHeight: 1.5
+      },
+      body: {
+        borderTop: '0.5px solid var(--dsw-alias-border-l2)',
+        margin: '0 16px',
+        paddingBottom: '8px'
+      },
+      item: { display: 'flex', flexDirection: 'column', gap: '6px', padding: '12px 0' },
+      itemHead: { display: 'flex', alignItems: 'center', gap: '8px' },
+      itemLabel: {
+        minWidth: 0,
+        flex: 1,
+        color: 'var(--dsw-alias-label-primary)',
+        fontSize: '13px',
+        fontWeight: 500,
+        lineHeight: 1.5
+      },
+      itemType: {
+        flex: 'none',
+        color: 'var(--dsw-alias-label-tertiary)',
+        border: '0.5px solid var(--dsw-alias-border-l2)',
+        borderRadius: '6px',
+        padding: '1px 6px',
+        fontSize: '11px',
+        lineHeight: 1.5
+      },
+      controls: { display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' },
+      select: {
+        font: 'inherit',
+        height: '34px',
+        minWidth: '140px',
+        border: '0.5px solid var(--dsw-alias-border-l4)',
+        background: 'var(--dsw-alias-bg-layer-3)',
+        color: 'var(--dsw-alias-label-primary)',
+        borderRadius: '8px',
+        padding: '0 10px',
+        fontSize: '13px'
+      },
+      button: {
+        appearance: 'none',
+        font: 'inherit',
+        cursor: 'pointer',
+        border: '1px solid var(--dsw-alias-border-l2)',
+        borderRadius: '8px',
+        padding: '5px 14px',
+        fontSize: '13px',
+        lineHeight: 1.5,
+        color: 'var(--dsw-alias-label-secondary)',
+        background: '0 0'
+      },
       hint: {
         color: 'var(--dsw-alias-label-tertiary)',
         margin: 0,
-        fontSize: '13px',
+        fontSize: '12px',
+        lineHeight: 1.5
+      },
+      failed: {
+        color: 'var(--dsw-alias-label-error)',
+        margin: 0,
+        fontSize: '12px',
         lineHeight: 1.5
       },
       placeholder: {
@@ -70,12 +188,6 @@
         margin: 0,
         padding: '14px 16px',
         fontSize: '13px',
-        lineHeight: 1.5
-      },
-      failed: {
-        color: 'var(--dsw-alias-state-error-primary)',
-        margin: 0,
-        fontSize: '12px',
         lineHeight: 1.5
       }
     }
@@ -91,45 +203,96 @@
       // 只绑定一次：卡片组件闭包持有它，因此不必经 props 传递。
       const scope = ctx.settingsScope.bind({ namespace: NS })
 
+      /** 取一个可选服务；拿不到就返回 undefined（绝不抛）。 */
+      function service(name: string): any {
+        try {
+          return ctx.get(name)
+        } catch (e) {
+          return undefined
+        }
+      }
+
+      /** 当前选中的会话 id；设置页是全局面板，右侧栏却挂在会话上。 */
+      function currentSessionId(): string | null {
+        try {
+          const sessions = service('sessions')
+          const snapshot = sessions && sessions.list && typeof sessions.list.getSnapshot === 'function'
+            ? sessions.list.getSnapshot()
+            : null
+          const id = snapshot ? snapshot.current : null
+          return typeof id === 'string' && id.length > 0 ? id : null
+        } catch (e) {
+          return null
+        }
+      }
+
       /**
-       * `dsh-collab` 命名空间的配置卡片。
+       * `dsh-collab` 命名空间的配置卡片：默认折叠的摘要行 + 展开后的设置项。
        *
-       * 受控复选框直接写 Host：勾选即 `scope.set`，快照回推后自然反映结果。
-       * 三种快照状态都如实处理：加载中给一行安静占位；命名空间不可用（本部署
-       * 没装 Host 半边）就完全不渲染；只读部署把控件禁用而不是假装可写。
+       * 三种快照状态都如实处理：加载中给一行安静占位；命名空间不可用（本部署没装
+       * Host 半边）就完全不渲染；只读部署把控件禁用而不是假装可写。技能索引读不到
+       * 时只收起预览按钮并说明原因 —— 卡片本身照常可用来改偏好。
        */
       function CollabSettingsCard() {
         const [snapshot, setSnapshot] = React.useState(() => scope.getSnapshot() as ScopeSnapshot)
         const [saving, setSaving] = React.useState(false)
         const [failed, setFailed] = React.useState(false)
+        const [open, setOpen] = React.useState(false)
+        const [skill, setSkill] = React.useState({ status: 'loading', skill: null, error: null } as SkillState)
+        const [notice, setNotice] = React.useState(null as string | null)
 
         React.useEffect(() => {
           setSnapshot(scope.getSnapshot())
           return scope.subscribe(() => setSnapshot(scope.getSnapshot()))
         }, [])
 
+        // 技能索引只取一次：它回答的是「随包技能文件在哪」，与偏好无关。
         React.useEffect(() => {
-          if (!failed) return undefined
-          const timer = setTimeout(() => setFailed(false), 4000)
+          let live = true
+          const load = async () => {
+            try {
+              const response = await fetch(SKILL_ROUTE, { headers: { accept: 'application/json' } })
+              let payload: any = {}
+              try {
+                payload = await response.json()
+              } catch (e) {
+                payload = {}
+              }
+              if (!response.ok) throw new Error((payload && payload.error) || 'HTTP ' + response.status)
+              if (!live) return
+              const items = payload && Array.isArray(payload.items) ? payload.items : []
+              const match = items.find((entry: any) => entry && entry.field === FIELD) || null
+              const found = match && match.skill ? match.skill : null
+              setSkill({
+                status: 'ready',
+                skill: found && typeof found.path === 'string' && found.path.length > 0 ? found : null,
+                error: null
+              })
+            } catch (error) {
+              if (!live) return
+              setSkill({
+                status: 'error',
+                skill: null,
+                error: (error && error.message) || '无法读取技能索引'
+              })
+            }
+          }
+          void load()
+          return () => {
+            live = false
+          }
+        }, [])
+
+        React.useEffect(() => {
+          if (notice === null) return undefined
+          const timer = setTimeout(() => setNotice(null), 6000)
           return () => clearTimeout(timer)
-        }, [failed])
+        }, [notice])
 
-        // hooks 必须无条件调用，早退只能发生在它们之后。
-        if (snapshot.status === 'loading') {
-          return h('li', { style: styles.placeholder, role: 'status' }, '正在加载设置…')
-        }
-        if (snapshot.status === 'unavailable') return null
-
-        // schema 默认开启：只有显式关掉才是关。
-        const checked = snapshot.value?.exposeDelegationDiscipline !== false
-        const disabled = snapshot.writable !== true || saving
-
-        const toggle = () => {
-          if (disabled) return
-          const next = !checked
+        const write = (field: string, next: boolean) => {
           setSaving(true)
           setFailed(false)
-          Promise.resolve(scope.set(FIELD, next)).then(
+          Promise.resolve(scope.set(field, next)).then(
             () => setSaving(false),
             () => {
               setSaving(false)
@@ -138,24 +301,183 @@
           )
         }
 
+        /**
+         * 预览：让右侧栏的文档面板打开随包技能正文。
+         *
+         * 每一处都先确认服务在不在、调用会不会抛 —— 这是浏览器里唯一会失败的路径，
+         * 失败只落一句提示，绝不把异常丢进 React。
+         *
+         * 这里**刻意不调用** `layout.selectPanel(null)`：设置页不是 `layout` 的主面板，
+         * 它是 settings-general 里 `SettingsRoot` 的组件内部状态，`selectPanel(null)`
+         * 对它无效，反而会把中间主面板的选中项清空（把会话从中间列弄掉）。
+         * 本槽位也没有关闭设置页的句柄，见 README。
+         */
+        const preview = () => {
+          const path = skill.skill ? skill.skill.path : null
+          if (path === null) {
+            setNotice('技能路径不可用，无法预览。')
+            return
+          }
+          const sessionId = currentSessionId()
+          if (sessionId === null) {
+            setNotice('当前没有已打开的会话，无法在右侧预览。')
+            return
+          }
+          const sidebarRight = service('sidebarRight')
+          if (!sidebarRight || typeof sidebarRight.openResource !== 'function') {
+            setNotice('右侧栏不可用，无法预览。')
+            return
+          }
+          try {
+            sidebarRight.openResource(sessionFileAddress(sessionId, path))
+            setNotice('已在右侧打开技能预览。')
+          } catch (error) {
+            setNotice('打开预览失败：' + ((error && error.message) || '未知错误'))
+          }
+        }
+
+        // hooks 必须无条件调用，早退只能发生在它们之后。
+        if (snapshot.status === 'loading') {
+          return h('li', { style: styles.placeholder, role: 'status' }, '正在加载设置…')
+        }
+        if (snapshot.status === 'unavailable') return null
+
+        // schema 默认开启：只有显式关掉才是关。
+        const enabled = snapshot.value?.exposeDelegationDiscipline !== false
+        const writeLock = snapshot.value?.enforceWriteLock !== false
+        const disabled = snapshot.writable !== true || saving
+        const stateLabel = enabled ? ON_LABEL : OFF_LABEL
+
+        const header = h(
+          'button',
+          {
+            type: 'button',
+            'aria-expanded': open,
+            style: styles.header,
+            onClick: () => {
+              setOpen(!open)
+            }
+          },
+          h('span', { style: styles.chevron, 'aria-hidden': 'true' }, open ? '▾' : '▸'),
+          h(
+            'span',
+            { style: styles.headText },
+            h('span', { style: styles.name }, 'collab 配置'),
+            h('span', { style: styles.summary }, '委托与验收纪律 · ' + stateLabel + ' · 写保护 ' + (writeLock ? LOCK_ON_LABEL : LOCK_OFF_LABEL))
+          )
+        )
+
+        const controls = [
+          h(
+            'select',
+            {
+              key: 'select',
+              style: styles.select,
+              value: enabled ? 'on' : 'off',
+              disabled,
+              'aria-label': '委托与验收纪律',
+              onChange: (event: any) => {
+                write(FIELD, event.target.value === 'on')
+              }
+            },
+            h('option', { key: 'on', value: 'on' }, ON_LABEL),
+            h('option', { key: 'off', value: 'off' }, OFF_LABEL)
+          ),
+          skill.status === 'ready' && skill.skill !== null
+            ? h(
+                'button',
+                {
+                  key: 'preview',
+                  type: 'button',
+                  style: styles.button,
+                  onClick: () => {
+                    setNotice(null)
+                    preview()
+                  }
+                },
+                '预览'
+              )
+            : null
+        ]
+
         return h(
           'li',
           { style: styles.card },
-          h(
-            'label',
-            { style: styles.row },
-            h('input', { type: 'checkbox', checked, disabled, onChange: toggle }),
-            h('span', { style: styles.label }, '委托与验收纪律')
-          ),
-          h(
-            'p',
-            { style: styles.hint },
-            '开启后，新会话的运行时上下文会注入委托与验收纪律文本（默认开启）。'
-          ),
-          !snapshot.writable
-            ? h('p', { style: styles.hint, role: 'status' }, '本部署的设置为只读，无法在此修改。')
-            : null,
-          failed ? h('p', { style: styles.failed, role: 'status' }, '写入失败，设置未改变。') : null
+          header,
+          open
+            ? h(
+                'div',
+                { style: styles.body },
+                h(
+                  'div',
+                  { style: styles.item },
+                  h(
+                    'div',
+                    { style: styles.itemHead },
+                    h('span', { style: styles.itemLabel }, '委托与验收纪律'),
+                    h('span', { style: styles.itemType }, '技能')
+                  ),
+                  h('div', { style: styles.controls }, ...controls),
+                  h(
+                    'p',
+                    { style: styles.hint },
+                    '集群协作：把委托与验收纪律文本注入会话上下文，并注册随包技能；关闭则两者都撤回。'
+                  ),
+                  skill.status === 'error'
+                    ? h('p', { style: styles.failed, role: 'status' }, '无法读取技能信息：' + skill.error)
+                    : null,
+                  skill.status === 'ready' && skill.skill === null
+                    ? h('p', { style: styles.hint }, '该设置当前没有关联的技能文件。')
+                    : null,
+                  skill.status === 'ready' && skill.skill !== null
+                    ? h('p', { style: styles.hint }, skill.skill.description)
+                    : null
+                ),
+                h(
+                  'div',
+                  { style: styles.item },
+                  h(
+                    'div',
+                    { style: styles.itemHead },
+                    h('span', { style: styles.itemLabel }, '原生写保护'),
+                    h('span', { style: styles.itemType }, '门控')
+                  ),
+                  h(
+                    'div',
+                    { style: styles.controls },
+                    h(
+                      'select',
+                      {
+                        key: 'lock',
+                        style: styles.select,
+                        value: writeLock ? 'on' : 'off',
+                        disabled,
+                        'aria-label': '原生写保护',
+                        onChange: (event: any) => {
+                          write(WRITE_LOCK_FIELD, event.target.value === 'on')
+                        }
+                      },
+                      h('option', { key: 'on', value: 'on' }, LOCK_ON_LABEL),
+                      h('option', { key: 'off', value: 'off' }, LOCK_OFF_LABEL)
+                    )
+                  ),
+                  h(
+                    'p',
+                    { style: styles.hint },
+                    '拦截：写入/修改他人已声明占用的路径前先走原生审批（本部署没有审批提示时，ask 会变成硬拒绝）；关闭则完全不拦。'
+                  )
+                ),
+                h(
+                  'div',
+                  null,
+                  snapshot.writable !== true
+                    ? h('p', { style: styles.hint, role: 'status' }, '本部署的设置为只读，无法在此修改。')
+                    : null,
+                  failed ? h('p', { style: styles.failed, role: 'status' }, '写入失败，设置未改变。') : null,
+                  notice !== null ? h('p', { style: styles.hint, role: 'status' }, notice) : null
+                )
+              )
+            : null
         )
       }
 
@@ -166,6 +488,7 @@
 
     exports.apply = apply
     exports.inject = inject
+    exports.sessionFileAddress = sessionFileAddress
     return module.exports
   }
 })

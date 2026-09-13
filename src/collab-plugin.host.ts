@@ -76,7 +76,11 @@ return {
       const hash = hashProjectKey(normRoot || 'default')
       return base + '-' + hash + '.json'
     }
-    const pub = c => ({ claimId: c.claimId, holderId: c.holderId, holderName: c.holderName, paths: c.paths, mode: c.mode, ttlSec: c.ttlSec, expiresAt: c.expiresAt, note: c.note, createdAt: c.createdAt })
+    // 与 collab-core 的 publish() 同形：readable / readers 归一后输出（缺字段 = true / []）。
+    // 动态宿主形态没有 pre/post-execute 接线（受限环境不注册事件），所以这两个字段在这里
+    // 只保证**形状对拍**，不承担门控/推送语义。
+    const hostReaders = c => { const raw = Array.isArray(c.readers) ? c.readers : []; const out = []; for (const x of raw) if (typeof x === 'string' && x && !out.includes(x)) out.push(x); return out }
+    const pub = c => ({ claimId: c.claimId, holderId: c.holderId, holderName: c.holderName, paths: c.paths, mode: c.mode, ttlSec: c.ttlSec, expiresAt: c.expiresAt, note: c.note, createdAt: c.createdAt, readable: c.readable !== false, readers: hostReaders(c) })
     // 写入失败是否属于"乐观并发冲突，值得重读后重试"。
     // 真实 ctx.fs 抛 FsError：code 是独立字段，message 里不含 code（实测文案见下），
     // 所以必须按 code 精确判定，且不要用裸 /stale/i（会命中路径里的 stale 字样）。
@@ -156,12 +160,16 @@ return {
     }
     // holder 是否仍"新鲜"：age 落在 [-SKEW, TTL) 内。sweep 与 holderView 共用同一判据。
     const holderFresh = (lastSeenAt, t) => { const age = t - (lastSeenAt || 0); return age < 86400000 && age > -300000 }
-    function sweep(s, t) {
+    function sweep(s, t, opts) {
       const b = s.claims.length; s.claims = s.claims.filter(c => c.expiresAt > t); const expiredClaims = b - s.claims.length
       let droppedMessages = 0
       if (s.messages.length > 2000) { droppedMessages = s.messages.length - 2000; s.messages = s.messages.slice(-2000) }
       const active = new Set(s.claims.map(c => c.holderId)); const hb = s.holders.length
       s.holders = s.holders.filter(h => active.has(h.holderId) || holderFresh(h.lastSeenAt, t))
+      // 与 collab-core 的 sweep 同形：**reader 不在这里清理**（0.8.3 修掉的真缺陷）。
+      // 曾经的 liveHolders 判据（agents.get(sessionId) !== undefined）会把只是空闲、
+      // 并未结束的读者一并删掉 —— 该 claim 释放时已无人可通知。读者只由真正的结束
+      // 信号移除（dropHolder / agent-disposed）；有界性由 claim 的 release/到期保证。
       return { expiredClaims, droppedMessages, prunedHolders: hb - s.holders.length }
     }
     function expire(s, t) { return sweep(s, t).expiredClaims }
@@ -222,6 +230,8 @@ return {
         return { ok: false, changed: false, data: { error: 'bad-request', message: 'mode must be one of exclusive | shared | read (got ' + String(a.mode) + ')' } }
       }
       const mode = requested
+      // 可读性（功能 C 的数据维度）：默认 true，只认显式 false；不参与冲突扫描。
+      const readable = a.readable === undefined || a.readable === null ? true : a.readable !== false
       const ttl = Math.max(5, Math.min(86400, Number(a.ttlSec) || 1800))
       const note = typeof a.note === 'string' ? a.note.slice(0, 500) : ''
       const t = now(), cs = []
@@ -256,9 +266,12 @@ return {
       let cl
       if (own) {
         for (const p of paths) if (!own.paths.includes(p)) own.paths.push(p)
-        own.ttlSec = ttl; own.note = note || own.note; own.expiresAt = expiresAt; cl = own
+        own.ttlSec = ttl; own.note = note || own.note; own.expiresAt = expiresAt
+        // 只在显式给出时改写可读性（缺省不重置）；readers 原样保留。
+        if (a.readable !== undefined && a.readable !== null) own.readable = readable
+        cl = own
       }
-      else { cl = { claimId: 'c_' + (++state.seq), holderId: h.holderId, holderName: name, paths, mode, ttlSec: ttl, expiresAt, note, createdAt: t }; state.claims.push(cl) }
+      else { cl = { claimId: 'c_' + (++state.seq), holderId: h.holderId, holderName: name, paths, mode, ttlSec: ttl, expiresAt, note, createdAt: t, readable, readers: [] }; state.claims.push(cl) }
       let warn = null
       if (ttl < 60) warn = 'short-lease: ttl=' + ttl + 's（<60s）; 请按时 heartbeat 续租，避免过期' + (own ? '；已并入你现有声明' : '')
       return { ok: true, changed: true, state, data: { claim: pub(cl), serverTime: t, merged: !!own, warning: warn } }
@@ -479,7 +492,18 @@ return {
         const agent = payload && payload.agent
         if (!agent || !agent.id) return
         const h = 'agent:' + String(agent.id)
-        mutate(s => { const rel = s.claims.filter(c => c.holderId === h); if (!rel.length) return { ok: true, changed: false, data: {} }; s.claims = s.claims.filter(c => c.holderId !== h); return { ok: true, changed: true, state: s, data: { released: rel.map(pub) } } }, String(agent.id), agent).catch(() => {})
+        // 与 collab-core/包形态的 dropHolder 同形：释放声明，并把它从所有 claim 的 readers 摘掉。
+        mutate(s => {
+          const rel = s.claims.filter(c => c.holderId === h)
+          let changed = rel.length > 0
+          if (rel.length) s.claims = s.claims.filter(c => c.holderId !== h)
+          for (const c of s.claims) {
+            if (!Array.isArray(c.readers) || !c.readers.includes(h)) continue
+            c.readers = c.readers.filter(x => x !== h); changed = true
+          }
+          if (!changed) return { ok: true, changed: false, data: {} }
+          return { ok: true, changed: true, state: s, data: { released: rel.map(pub) } }
+        }, String(agent.id), agent).catch(() => {})
       } catch (e) {}
     }, { global: true })
   }

@@ -24,6 +24,10 @@ class Claim:
     createdAt: int
     holderName: Optional[str] = None
     note: Optional[str] = None
+    # 0.8.0：可读性（默认 True；缺字段的老状态文件即"可读"）
+    readable: bool = True
+    # 0.8.0：读者反向注册（被本声明通知过的会话 holderId）
+    readers: List[str] = field(default_factory=list)
 
 @dataclass
 class Message:

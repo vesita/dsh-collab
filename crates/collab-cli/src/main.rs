@@ -27,6 +27,19 @@ pub struct Claim {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
     pub created_at: i64,
+    /// 可读性（0.8.0 功能 C）：true = 他人可读（默认），false = 他人读取也要先协商。
+    /// `default` 让 0.7.0 之前的状态文件照常解析成"可读"。
+    #[serde(default = "default_readable")]
+    pub readable: bool,
+    /// 读者（0.8.0 功能 D，反向注册）：被本声明通知过的会话 holderId。
+    /// **必须参与反序列化**，否则本 CLI 的一次 claim/release 回写就会静默抹掉全部读者的登记。
+    #[serde(default)]
+    pub readers: Vec<String>,
+}
+
+/// 缺省可读（与 TS 侧 `isReadable` 的归一一致）。
+fn default_readable() -> bool {
+    true
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -377,6 +390,8 @@ fn main() -> Result<()> {
                 expires_at: now + ttl * 1000,
                 note,
                 created_at: now,
+                readable: true,
+                readers: Vec::new(),
             };
             state.claims.push(claim.clone());
             save_state(&state_file, &state)?;
@@ -502,6 +517,44 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 0.8.0 回归：`readable` / `readers` 必须能读进来、也能写回去。
+    /// 反例（修复前）：struct 里没有这两个字段 ⇒ 解析时被丢弃 ⇒ 本 CLI 一次写回
+    /// 就把所有 claim 的读者登记与可读性抹掉（静默数据丢失）。
+    #[test]
+    fn test_readable_and_readers_round_trip() {
+        let raw = r#"{
+          "schemaVersion": 1,
+          "seq": 2,
+          "claims": [{
+            "claimId": "c_1", "holderId": "agent:a", "holderName": "A",
+            "paths": ["src/a/"], "mode": "exclusive", "ttlSec": 1800,
+            "expiresAt": 99999999999999, "note": "", "createdAt": 1,
+            "readable": false, "readers": ["agent:b", "agent:c"]
+          }],
+          "messages": [], "holders": []
+        }"#;
+        let doc: StateDocument = serde_json::from_str(raw).expect("state must parse");
+        assert_eq!(doc.claims[0].readable, false);
+        assert_eq!(doc.claims[0].readers, vec!["agent:b".to_string(), "agent:c".to_string()]);
+        let out = serde_json::to_string(&doc).expect("state must serialize");
+        assert!(out.contains("\"readable\":false"), "readable must survive a write-back: {out}");
+        assert!(out.contains("\"agent:b\""), "readers must survive a write-back: {out}");
+
+        // 老状态文件没有这两个字段 -> 解析成"可读 + 空读者"
+        let legacy = r#"{
+          "schemaVersion": 1, "seq": 1,
+          "claims": [{
+            "claimId": "c_1", "holderId": "agent:a", "paths": ["src/a/"],
+            "mode": "exclusive", "ttlSec": 1800, "expiresAt": 99999999999999,
+            "createdAt": 1
+          }],
+          "messages": [], "holders": []
+        }"#;
+        let old: StateDocument = serde_json::from_str(legacy).expect("legacy state must parse");
+        assert_eq!(old.claims[0].readable, true, "a missing readable field means readable");
+        assert!(old.claims[0].readers.is_empty(), "a missing readers field means no readers");
+    }
 
     #[test]
     fn test_expand_home_matches_ts_semantics() {

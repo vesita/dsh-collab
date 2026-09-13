@@ -24,6 +24,8 @@ export interface HolderInput {
 export interface ClaimInput {
   paths?: string[]
   mode?: Mode
+  /** 可读性（默认 true）。**只认显式 false**：其余取值（含缺省）都视为可读。 */
+  readable?: boolean
   ttlSec?: number
   note?: string
 }
@@ -91,6 +93,10 @@ export interface PublishedClaim {
   expiresAt: number
   note?: string
   createdAt: number
+  /** 可读性，已归一（缺字段的老状态文件输出 true）。 */
+  readable: boolean
+  /** 反向注册的读者 holderId 列表，已归一（缺字段的老状态文件输出 []）。 */
+  readers: string[]
 }
 
 /** 各 op 的 data 载荷结构互不相同，统一用宽松的 JSON 字典承载。 */
@@ -231,6 +237,15 @@ export function sweep(s: StateDocument, t: number, opts: SweepOptions = {}): Swe
   s.holders = s.holders.filter(h => active.has(h.holderId) || holderFresh(h.lastSeenAt, t, holderTtlMs))
   const prunedHolders = beforeHolders - s.holders.length
 
+  // readers **不在这里清理**（0.8.3 修掉的真缺陷）。
+  // 曾经的实现用 liveHolders 判据同时清 holders 与 readers，而宿主注入的判据是
+  // `agents.get(sessionId) !== undefined`：它对**已休眠但可唤回**的会话返回 undefined
+  // （实测活进程 agents.list() 只有 2 个 agent，而 sessionController.list() 有 224 个会话）。
+  // 结果是一个"只是空闲、并未结束"的读者会在下一次任意写路径上被悄悄删掉，
+  // 该 claim 释放时 readers 已空，通知谁也发不出去 —— 静默丢消息比不清理危险得多。
+  // 读者只由**真正的"自行结束"信号**移除：dropHolder()（host 侧的 agent/disposed 路径）。
+  // 有界性不需要额外的 TTL 或上限：readers 挂在 claim 上，claim 在 release 或
+  // 到期时被上面的 filter 移除，readers 随 claim 一起消亡 —— 天然有界。
   return { expiredClaims, droppedMessages, prunedHolders }
 }
 
@@ -297,9 +312,139 @@ export function renderDigest(claims: Claim[]): string {
   return '[dsh-collab] 同项目其他会话当前占用：' + parts.join('；') + more + '。改动这些路径前请先执行 collab_lock op=wait 或用 collab_board 协商。'
 }
 
+// ---- 访问路径判定（功能 A：访问时的旁路通知；功能 C：写保护的原生审批）----
+//
+// 这里只放**可单测的纯逻辑**；注册 ctx.on('tools/pre-execute'|'tools/post-execute')
+// 的宿主接线在 src/index.ts。两条判定的口径刻意不同，别把它们合并：
+//   - claimsForAccess（功能 A，**提示性**）沿用「同父目录的旁支及其后代」这一较宽的口径，
+//     目的是提醒"你正在访问的目录里还有别人在动别的东西"；
+//   - claimsCovering（功能 C，**强制性**）用严格的分段前缀覆盖，只认"别人的声明覆盖了
+//     你要动的这个路径"。本部署里 ask 等价于硬拒绝（审批提示被禁用），宽口径会造成
+//     假阳性硬拒绝（他人声明 src/a/2 却拦下我对 src/a/1 的写入），所以这里必须窄。
+
+/** 被访问路径的**父目录**：归一化、带尾 `/`。`src/a/1`→`src/a/`；`src/a/`→`src/`；`src`→`''`。 */
+export function accessScope(accessPath: string): string {
+  const n = norm(accessPath)
+  if (!n) return ''
+  const parts = seg(n)
+  parts.pop()
+  return parts.length ? parts.join('/') + '/' : ''
+}
+
+/**
+ * 把任意路径归一到**项目相对**形式：若它落在 cwd 之下就去掉 cwd 前缀。
+ * claim 的 paths 是项目相对的（工具文档："项目相对路径"），而工具入参可能是绝对路径
+ * （如 write 的 file_path 交给 fs 后端解析），不归一化就永远匹配不上。
+ */
+export function relToProject(p: string, cwd?: string | null): string {
+  const n = norm(p)
+  if (!n) return ''
+  const c = typeof cwd === 'string' && cwd ? norm(cwd) : null
+  if (!c) return n
+  const root = c.replace(/\/+$/, '')
+  if (!root) return n
+  if (n === root) return ''
+  if (n.startsWith(root + '/')) return n.slice(root.length + 1)
+  return n
+}
+
+/**
+ * 与访问 accessPath 相关的声明（功能 A 的判据）。
+ * C 被选中当且仅当 C 的某个路径 P 满足 `ov(P, accessScope(accessPath))`（同父目录的旁支
+ * 及其后代）**或** `ov(accessPath, P)`（P 是 accessPath 的祖先或自身）；过期声明排除。
+ * 例：访问 `src/a/1` 会命中声明 `src/a/2`、`src/a/2/A`、`src/a/`、`src/`，
+ * 不会命中 `src/b`、`other/`。
+ */
+export function claimsForAccess(claims: Claim[], accessPath: string, now: number): Claim[] {
+  const target = norm(accessPath)
+  if (!target) return []
+  const scope = accessScope(target)
+  return (Array.isArray(claims) ? claims : []).filter(c => c.expiresAt > now && c.paths.some(raw => {
+    const p = norm(raw)
+    if (!p) return false
+    return ov(p, scope) || ov(target, p)
+  }))
+}
+
+/**
+ * 覆盖 target 的声明（功能 C 的判据）：C 的某个路径 P 是 target 的祖先或自身
+ * （`ov(target, P)`，与 claim() 既有的冲突判据同源）。过期声明排除。
+ */
+export function claimsCovering(claims: Claim[], target: string, now: number): Claim[] {
+  const t = norm(target)
+  if (!t) return []
+  return (Array.isArray(claims) ? claims : []).filter(c => c.expiresAt > now && c.paths.some(raw => {
+    const p = norm(raw)
+    return !!p && ov(t, p)
+  }))
+}
+
+/** 可读性归一：缺省（含 0.7.0 之前写下的状态文件）视为**可读**。 */
+export function isReadable(c: Claim): boolean {
+  return !(c && (c as { readable?: unknown }).readable === false)
+}
+
+// ---- 功能 D：reader 反向注册的纯状态变换（纯逻辑，便于单测） ----
+
+/** 把 holderId 登记为 claimId 的读者（幂等；claim 不存在时什么都不做）。 */
+export function registerReader(state: StateDocument, claimId: string, holderId: string): OpResult {
+  const c = state.claims.find(x => x.claimId === claimId)
+  if (!c) return { ok: true, changed: false, data: { registered: false, reason: 'no-claim' } }
+  const list = readersOf(c)
+  if (list.includes(holderId)) return { ok: true, changed: false, data: { registered: false, reason: 'already' } }
+  c.readers = list.concat([holderId])
+  return { ok: true, changed: true, state, data: { registered: true, claimId, readers: c.readers.slice() } }
+}
+
+/** 会话退出：释放它的声明，并把它从**所有** claim 的 readers 里摘掉（同一次状态变更里完成）。 */
+export function dropHolder(state: StateDocument, holderId: string): OpResult {
+  const rel = state.claims.filter(c => c.holderId === holderId)
+  let changed = rel.length > 0
+  if (rel.length) state.claims = state.claims.filter(c => c.holderId !== holderId)
+  for (const c of state.claims) {
+    const list = readersOf(c)
+    if (!list.includes(holderId)) continue
+    c.readers = list.filter(x => x !== holderId)
+    changed = true
+  }
+  if (!changed) return { ok: true, changed: false, data: {} }
+  return { ok: true, changed: true, state, data: { released: rel.map(publish) } }
+}
+
+/** readers 归一：缺字段按 []，且**去重保序**（功能 D 要求不重复）。 */
+export function readersOf(c: Claim): string[] {
+  const raw = c && Array.isArray((c as { readers?: unknown }).readers) ? (c as { readers: unknown[] }).readers : []
+  const out: string[] = []
+  for (const x of raw) if (typeof x === 'string' && x && !out.includes(x)) out.push(x)
+  return out
+}
+
+/**
+ * 访问通知文本：紧凑、**时间稳定**。与 renderDigest 同源的约束（见上）：
+ * 只用**绝对 UTC** 起止时刻，绝不出现「剩 N 分」这类会随秒漂移的倒计时 ——
+ * 这份文本会作为 additionalContexts 进入上下文，漂移就会击穿快照去重。
+ * 与 renderDigest 一致，签名只有一个形参：没有时间参数，倒计时就无从加回来。
+ */
+export function renderAccessNotice(claims: Claim[]): string {
+  // 显式排序只为确定性：状态文件里的插入顺序不该让同一组声明渲染出不同文本。
+  const ordered = claims.slice().sort((a, b) =>
+    (a.expiresAt - b.expiresAt) || String(a.holderId).localeCompare(String(b.holderId)))
+  const parts = ordered.slice(0, 2).map(c => {
+    const mins = Math.max(1, Math.round((c.ttlSec || 0) / 60))
+    const paths = c.paths.slice(0, 2).join(' ') + (c.paths.length > 2 ? ' 等 ' + c.paths.length + ' 条' : '')
+    const start = clockUtc(typeof c.createdAt === 'number' ? c.createdAt : c.expiresAt - (c.ttlSec || 0) * 1000)
+    return (c.holderName || c.holderId) + '（' + c.mode + '，' + (isReadable(c) ? '可读' : '不可读') + '）占用 ' + paths +
+      '，租约 ' + mins + ' 分（' + start + '–' + clockUtc(c.expiresAt) + '）'
+  })
+  const more = ordered.length > 2 ? '；另有 ' + (ordered.length - 2) + ' 条' : ''
+  return '[dsh-collab] 你刚访问的路径处于其他会话的占用范围内：' + parts.join('；') + more +
+    '。改动这些路径前请先执行 collab_lock op=wait 或用 collab_board 协商。'
+}
+
 // 对外发出一条 claim 的公开视图（剥离内部字段）。
+// readable / readers 都归一后输出：老状态文件缺字段时输出 true / []，与 isReadable、readersOf 同源。
 export function publish(c: Claim): PublishedClaim {
-  return { claimId: c.claimId, holderId: c.holderId, holderName: c.holderName, paths: c.paths, mode: c.mode, ttlSec: c.ttlSec, expiresAt: c.expiresAt, note: c.note, createdAt: c.createdAt }
+  return { claimId: c.claimId, holderId: c.holderId, holderName: c.holderName, paths: c.paths, mode: c.mode, ttlSec: c.ttlSec, expiresAt: c.expiresAt, note: c.note, createdAt: c.createdAt, readable: isReadable(c), readers: readersOf(c) }
 }
 
 // 构造冲突错误（由调用方捕获）。标记 collabConflict 以便 mutate 识别。
@@ -334,6 +479,10 @@ export function claim(state: StateDocument, h: HolderInput, a: ClaimInput, tNow:
     return { ok: false, changed: false, tNow, data: { error: 'bad-request', message: 'mode must be one of exclusive | shared | read (got ' + String(rawMode) + ')' } }
   }
   const mode = requested as Mode
+  // 可读性（功能 C）：默认 true。兼容映射 —— read/exclusive/shared 在**未显式指定**时
+  // 一律默认可读；只有显式 readable:false 才关闭。该字段**不参与**下面的冲突扫描，
+  // 因此不会改变任何既有的冲突判定（只被写保护门控使用）。
+  const readable = a.readable === undefined || a.readable === null ? true : a.readable !== false
   const ttl = Math.max(5, Math.min(86400, Number(a.ttlSec) || 1800))
   const note = typeof a.note === 'string' ? a.note.slice(0, 500) : ''
   const t = tNow(), cs: ConflictInfo[] = []
@@ -369,9 +518,13 @@ export function claim(state: StateDocument, h: HolderInput, a: ClaimInput, tNow:
   let cl: Claim, merged = !!own
   if (own) {
     for (const p of paths) if (!own.paths.includes(p)) own.paths.push(p)
-    own.ttlSec = ttl; own.note = note || own.note; own.expiresAt = expiresAt; cl = own
+    own.ttlSec = ttl; own.note = note || own.note; own.expiresAt = expiresAt
+    // 只在**显式**给出时改写可读性，缺省不重置：否则一次不带 readable 的续声明会把
+    // 之前的 readable:false 静默翻回可读。readers 是反向注册的既成事实，合并时原样保留。
+    if (a.readable !== undefined && a.readable !== null) own.readable = readable
+    cl = own
   }
-  else { cl = { claimId: 'c_' + (++state.seq), holderId: h.holderId, holderName: h.name, paths, mode, ttlSec: ttl, expiresAt, note, createdAt: t }; state.claims.push(cl) }
+  else { cl = { claimId: 'c_' + (++state.seq), holderId: h.holderId, holderName: h.name, paths, mode, ttlSec: ttl, expiresAt, note, createdAt: t, readable, readers: [] }; state.claims.push(cl) }
   let warn: string | null = null
   if (ttl < 60) warn = 'short-lease: ttl=' + ttl + 's（<60s）; 请按时 heartbeat 续租，避免过期' + (merged ? '；已并入你现有声明' : '')
   return { ok: true, changed: true, state, tNow, data: { claim: publish(cl), serverTime: t, merged, warning: warn } }

@@ -14,6 +14,20 @@ export interface Claim {
   expiresAt: number;
   note?: string;
   createdAt: number;
+  /**
+   * 可读性（功能 C）：true = 他人可读这些路径（默认），false = 他人读取也要走审批。
+   * 可选字段是为了兼容 0.7.0 之前写下的状态文件 —— 缺省即**可读**（见 collab-core 的 isReadable）。
+   * 写入对**非持有者永远**要走审批，与 readable 无关。
+   */
+  readable?: boolean;
+  /**
+   * 读者（功能 D，反向注册）：被本声明通知过的会话 holderId 列表（形如 `agent:<id>`）。
+   * 可选字段同样为了兼容老状态文件 —— 缺省即 `[]`（见 collab-core 的 readersOf）。
+   * 只在**真正的会话结束**时移除：持有者释放、`agent/disposed`（dropHolder）。
+   * 0.8.3 起 sweep() 不再按 liveness 清理 —— `agents.get()` 对休眠但可唤回的会话
+   * 返回 undefined，按它清理会把只是空闲的读者删掉，静默丢掉释放通知。
+   */
+  readers?: string[];
 }
 
 export interface Message {
@@ -62,6 +76,7 @@ export interface CollabLockParams {
   paths?: string[];
   claimId?: string;
   mode?: Mode;
+  readable?: boolean;
   ttlSec?: number;
   timeoutMs?: number;
   note?: string;
