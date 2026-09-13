@@ -130,7 +130,7 @@ agents.currentInitiator()            → 正在装配的那个会话
 
 租约刻意用**绝对 UTC 起止时刻**表示，而不是「还剩几分钟」的倒计时：DSH 只在运行时上下文的文本逐字节变化时才提交新快照，时间无关的摘要因此不会因为过了几分钟而被重复注入。
 
-同项目暂无他人声明时，该上下文退化为一句通用协作规范。读盘走 15 秒 TTL 的后台缓存（`DSH_COLLAB_DIGEST_TTL_MS` 可调），provider 同步返回缓存，刷新失败时沿用上一份。
+同项目暂无他人声明时，该上下文退化为一句通用协作规范。读盘走 15 秒 TTL 的后台缓存（`DSH_COLLAB_DIGEST_TTL_MS` 可调），provider 同步返回缓存，刷新失败时沿用上一份。缓存里存的是**该 cwd 的原始活跃占用列表**，「排除自己」按**读取时的发起者**现场做——同一份缓存对所有会话都成立，只有「排除谁」因人而异（0.9.1 前存的是**刷新者视角**渲染好的文本，同 cwd 的父子会话会互相串台，见下）。
 
 关闭方式：包形态设置环境变量 `DSH_COLLAB_NO_PROMPT_HINT=1`。受限的动态宿主形态读不到 `process.env`，因此它**始终注入**；需要彻底关闭时请使用包形态。
 
@@ -178,6 +178,42 @@ agents.currentInitiator()            → 正在装配的那个会话
 插件的**动态宿主形态**（`hostCode` 字符串）刻意不注册该技能：受限动态环境没有包目录、也没有 `import`，无法定位 `<pkg>/skills/subagent-delegation/SKILL.md`。这是环境限制，不是遗漏。
 
 包形态的 `DSH_COLLAB_NO_PROMPT_HINT=1` 关掉**所有**运行时注入 —— 态势上下文、委托纪律文本、以及功能 A 的访问通知（后者也是运行时派生再注入进会话的内容）。它不影响技能注册。
+
+---
+
+## 0.9.4：提示词硬化：子代理禁止 client 平台 Inspect + 探索阶段默认先派
+
+**修的是真故障（实测定位）**：
+- **症状**：子代理执行 `cordis_inspect_query` 查询 `platform: 'client'`（如 `Slots` / `Theme`）会**永久挂起**。故障实测中子代理会话 `769c2e33` 调 `listSubTree` 空挂 344.8 秒直到被主 AI 中断；主会话做相同调用则瞬时返回。
+- **根因**：`@deepseek-ai/dsh-cordis-host-runner/lib/types/inspect-registry.js` 的 `queryClient` 只被拥有该 `agentId` 的浏览器页面应答 settle，子代理没有浏览器页面，因此永不 settle。
+- **现在的分工与硬化**：
+  1. **纪律文本注入**：`src/spec.ts` 的 `DELEGATION_DISCIPLINE_TEXT` 追加纪律，明文禁止子代理调用客户端检视；界面信息必须由主 AI 在主会话预查并写入委派背景。
+  2. **随包技能硬禁令**：`skills/subagent-delegation/SKILL.md` 新增 §10 硬禁令（含机制解释、反例、正例、以及 Slots/Theme/listSubTree 等危险信号清单），并在 §7 工具表格和 §9 踩坑速查中关联该禁令。
+  3. **探索阶段默认先派**：强化探索期先派子代理拿取事实的纪律，防止主会话上下文浪费。
+
+---
+
+## 0.9.1：修掉态势摘要的跨会话串台，纪律文本点名「探索阶段先派」
+
+**修的是真 bug（已实测复现）**：`dsh-collab/awareness` 的运行时候选摘要原先**只按 cwd 缓存「某个人视角
+渲染好的文本」**，而「排除自己」的过滤做在**刷新侧**。同 cwd 的多个会话（父会话与其子代理）各自刷新，
+后写覆盖先写；只要有一次刷新发生在 `id` 为空的 agent 上（`mine` 退化成 `human:console`，谁都不排除），
+之后同 cwd 的所有会话都会读到这份「含自己锁」的缓存——**持有者会在自己的态势里看到自己的占用**，
+误以为自己被挡着（正是这种误导会让人去 `wait`／`board` 协商一个不存在的竞争者）。
+
+**修法**：缓存改存**该 cwd 的原始活跃 claim 列表**（渲染与时间无关，按 cwd 缓存原始数据是安全的），
+「排除自己」挪到**读取侧**、按当次 `currentInitiator()` 现场过滤。**两形态同改**：
+`src/awareness.ts` 与 `src/collab-plugin.host.ts` 里的内联副本。
+
+**回归守卫**：新增 `tests/collab-awareness-cross-session.mjs`（已进 `npm test`）——两个会话同一 cwd、
+由 `id` 为空的会话先刷新缓存，然后断言三条：**持有者看不到自己的锁**（负向对照）、**他人占用照常显示**、
+claim 删除并强制刷新后双方都回落通用规范。修复前实测 `6 passed, 2 failed`（失败源唯一），修复后全绿。
+既有的 `collab-awareness.mjs` 抓不到这条：它的假 `agents.list()` 永远只有 1 个 agent、`timer.interval`
+被桩成 no-op，「同 cwd 两个会话互相覆盖缓存」这条路径从未被执行。
+
+**顺带（提示词）**：常驻委托纪律文本（`src/spec.ts` 的 `DELEGATION_DISCIPLINE_TEXT`）新增一条
+「探索阶段默认先派」，随包技能 `skills/subagent-delegation/SKILL.md` 新增 §1.1（探索期该派哪五类单元、
+哪三种探索才允许自己做）——目标是让「先摸清情况」默认发生在子代理里，而不是主会话里。
 
 ---
 

@@ -461,6 +461,11 @@ return {
     const systemPrompt = ctx.get('systemPrompt')
     const OPEN_HINT = '多会话协作（dsh-collab）：同一项目可能有其他 DSH 会话并行工作。改动文件前用 collab_lock op=claim 声明占用（目录以 / 结尾，如 src/backend/），并先 op=overview 查看他人占用；只读调研用 mode=read；完成后 op=release，长任务 op=heartbeat 续租；协商与交接走 collab_board。'
     const DIGEST_TTL_MS = 15000
+    // 缓存的是**原始活跃 claim 列表**，不是"某个人视角渲染好的文本"（0.9.1 修，与包形态同语义）。
+    // 原实现的"排除自己"做在刷新侧、缓存又只按 cwd 做键 ⇒ 同 cwd 的刷新互相覆盖：
+    // 只要有一次刷新发生在 id 为空的 agent 上（mine='human:console'，谁都不排除），
+    // 之后同 cwd 的所有会话都会读到这份"含自己锁"的缓存，持有者被自己的占用误导。
+    // 视角是**读取侧**的事：按当前发起者现场过滤（见下面的 text()）。
     const digestCache = new Map()
     const digestBusy = new Set()
     // 文本必须**时间稳定**：DSH 的 RuntimeContextProjection.project() 在 rendered === retained.text 时
@@ -493,9 +498,9 @@ return {
       try {
         const { state } = await load(id, agent)
         const t = now()
-        const mine = id ? 'agent:' + id : 'human:console'
-        const others = state.claims.filter(c => c.expiresAt > t && c.holderId !== mine)
-        digestCache.set(cwd, { text: others.length ? renderDigest(others) : '', at: t })
+        // 只按"是否过期"筛；**不**在这里按 holderId 筛（那是读取侧的事，见 digestCache 的注释）。
+        const active = state.claims.filter(c => c.expiresAt > t)
+        digestCache.set(cwd, { claims: active, at: t })
       } catch (e) {
         // 尽力而为：保留上一份缓存。
       } finally { digestBusy.delete(cwd) }
@@ -511,7 +516,11 @@ return {
             if (!init || typeof cwd !== 'string' || !cwd) return OPEN_HINT
             const hit = digestCache.get(cwd)
             if (!hit || now() - hit.at > DIGEST_TTL_MS) refreshDigest(init).catch(() => {})
-            return hit && hit.text ? hit.text : OPEN_HINT
+            // 视角过滤在**读取侧**：同一份 cwd 缓存对所有会话都成立，"排除谁"才因人而异。
+            const mine = init.id ? 'agent:' + String(init.id) : 'human:console'
+            const t = now()
+            const others = (hit ? hit.claims : []).filter(c => c.holderId !== mine && c.expiresAt > t)
+            return others.length ? renderDigest(others) : OPEN_HINT
           } catch (e) { return OPEN_HINT }
         }
       }))

@@ -7,6 +7,7 @@
 // （同一个 systemPrompt 服务、同一个总开关）。
 
 import { renderDigest } from './collab-core.js'
+import type { Claim } from './collab-core.js'
 import type { AgentLike, CollabContext, PromptContextService } from './contract.js'
 import type { StateStore } from './store.js'
 
@@ -33,7 +34,13 @@ export function installAwareness(ctx: CollabContext, store: StateStore): Awarene
   // 包形态的关闭开关：DSH_COLLAB_NO_PROMPT_HINT=1 时不注册态势上下文，也不起刷新定时器。
   const PROMPT_HINT_ENABLED = process.env.DSH_COLLAB_NO_PROMPT_HINT !== '1'
   const DIGEST_TTL_MS = Math.max(200, Number(process.env.DSH_COLLAB_DIGEST_TTL_MS) || 15000)
-  const digestCache = new Map<string, { text: string; at: number }>()
+  // 缓存的是**原始活跃 claim 列表**，不是"某个人视角渲染好的文本"（0.9.1 修）。
+  // 原实现的"排除自己"做在刷新侧、缓存又只按 cwd 做键，于是同 cwd 的刷新互相覆盖：
+  // 只要有一次刷新发生在 id 为空的 agent 上（mine='human:console'，谁都不排除），
+  // 之后同 cwd 的所有会话都会读到这份"含自己锁"的缓存 —— 持有者被自己的占用误导。
+  // 结论：**视角是读取侧的事**，按当前发起者现场过滤；渲染（renderDigest）与时间无关，
+  // 所以按 cwd 缓存原始列表是安全的（谁刷新都一样，不再有"后写覆盖先写"的语义）。
+  const digestCache = new Map<string, { claims: Claim[]; at: number }>()
   const digestBusy = new Set<string>()
 
   // 摘要文本必须**时间稳定**，否则会毁掉 DSH 自己的快照去重：
@@ -49,9 +56,9 @@ export function installAwareness(ctx: CollabContext, store: StateStore): Awarene
     try {
       const { state } = await store.load(id, agent)
       const t = store.now()
-      const mine = id ? 'agent:' + id : 'human:console'
-      const others = state.claims.filter(c => c.expiresAt > t && c.holderId !== mine)
-      digestCache.set(cwd, { text: others.length ? renderDigest(others) : '', at: t })
+      // 只按"是否过期"筛；**不**在这里按 holderId 筛（那是读取侧的事，见 digestCache 的注释）。
+      const active = state.claims.filter(c => c.expiresAt > t)
+      digestCache.set(cwd, { claims: active, at: t })
     } catch (e) {
       // 态势刷新是尽力而为：失败时保留上一份缓存，绝不打断任何模型步或工具调用。
     } finally {
@@ -70,7 +77,12 @@ export function installAwareness(ctx: CollabContext, store: StateStore): Awarene
           if (!init || typeof cwd !== 'string' || !cwd) return OPEN_HINT
           const hit = digestCache.get(cwd)
           if (!hit || store.now() - hit.at > DIGEST_TTL_MS) void refreshDigest(init)
-          return hit && hit.text ? hit.text : OPEN_HINT
+          // 视角过滤在**读取侧**做：同一份 cwd 缓存对所有会话都成立，"排除谁"才因人而异。
+          // （0.9.1 前这里直接返回 hit.text —— 那是"最后一次刷新者"的视角，会把持有者自己的锁报给自己。）
+          const mine = init.id ? 'agent:' + String(init.id) : 'human:console'
+          const t = store.now()
+          const others = (hit ? hit.claims : []).filter(c => c.holderId !== mine && c.expiresAt > t)
+          return others.length ? renderDigest(others) : OPEN_HINT
         } catch (e) {
           return OPEN_HINT
         }
