@@ -1,7 +1,7 @@
 import {
   norm, ov, hashProjectKey, projectStorageFileName, init, publish,
   expire, sweep, conflictError, holder, claim, release, heartbeat,
-  post, overview, related, filterMessages, blockers, cleanName, holderView
+  post, overview, related, filterMessages, blockers, cleanName, holderView, renderDigest
 } from './collab-core.js'
 import type {
   Claim, ConflictInfo, HolderInput, Mode, OpResult, PublishedClaim, StateDocument
@@ -443,16 +443,11 @@ export function apply(ctx: CollabContext): void {
   const digestCache = new Map<string, { text: string; at: number }>()
   const digestBusy = new Set<string>()
 
-  function renderDigest(others: Claim[], t: number): string {
-    const parts = others.slice(0, 3).map(c => {
-      const mins = Math.max(1, Math.ceil((c.expiresAt - t) / 60000))
-      const paths = c.paths.slice(0, 2).join(' ') + (c.paths.length > 2 ? ' 等 ' + c.paths.length + ' 条' : '')
-      return (c.holderName || c.holderId) + '（' + c.mode + '）占用 ' + paths + '，剩 ' + mins + ' 分'
-    })
-    const more = others.length > 3 ? '；另有 ' + (others.length - 3) + ' 条' : ''
-    return '[dsh-collab] 同项目其他会话当前占用：' + parts.join('；') + more + '。改动这些路径前请先执行 collab_lock op=wait 或用 collab_board 协商。'
-  }
-
+  // 摘要文本必须**时间稳定**，否则会毁掉 DSH 自己的快照去重：
+  // dsh-agent-loop 的 RuntimeContextProjection.project() 在 rendered === retained.text 时直接返回 undefined，
+  // 也就是"内容没变就不提交新快照"。而快照是**整块**提交的（沙箱策略 + 审批策略 + 本插件摘要一起重发），
+  // 所以「剩 N 分」这种相对倒计时每分钟都变，会让整块快照每分钟重发一次。
+  // 渲染本身已收进 collab-core 的 renderDigest（唯一事实源，签名不含时间参数），这里只留读盘缓存。
   async function refreshDigest(agent: AgentLike): Promise<void> {
     const id = agent && agent.id ? String(agent.id) : null
     const cwd = await cwdOf(id, agent)
@@ -463,7 +458,7 @@ export function apply(ctx: CollabContext): void {
       const t = now()
       const mine = id ? 'agent:' + id : 'human:console'
       const others = state.claims.filter(c => c.expiresAt > t && c.holderId !== mine)
-      digestCache.set(cwd, { text: others.length ? renderDigest(others, t) : '', at: t })
+      digestCache.set(cwd, { text: others.length ? renderDigest(others) : '', at: t })
     } catch (e) {
       // 态势刷新是尽力而为：失败时保留上一份缓存，绝不打断任何模型步或工具调用。
     } finally {

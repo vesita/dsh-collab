@@ -97,14 +97,18 @@ console.log('# no foreign claims -> generic collaboration guidance')
   store.set(statePath, JSON.stringify(s))
 }
 
-console.log('# foreign claim -> live digest with holder, path, remaining time and next action')
+console.log('# foreign claim -> live digest with holder, path, absolute lease window and next action')
 {
   capturedPromptContext.text()            // 触发一次异步刷新（fire-and-forget）
   await new Promise((r) => setTimeout(r, 80))
   const text = capturedPromptContext.text()
   ok(text.includes('Other Session'), 'digest names the other session', text)
   ok(text.includes('src/backend/'), 'digest names the claimed path', text)
-  ok(/剩 \d+ 分/.test(text), 'digest reports remaining lease minutes', text)
+  // 租约用**绝对 UTC 起止时刻**呈现，而不是「剩 N 分」倒计时：
+  // 文本时间无关，DSH 的运行时上下文快照去重（rendered === retained.text 即不提交）才能生效。
+  ok(/租约 \d+ 分（\d{2}-\d{2} \d{2}:\d{2}Z–\d{2}-\d{2} \d{2}:\d{2}Z）/.test(text),
+    'digest reports an absolute UTC lease window', text)
+  ok(!/剩 \d+ 分/.test(text), 'digest no longer prints a relative countdown', text)
   ok(text.includes('collab_lock') || text.includes('collab_board'), 'digest points at the negotiation tools', text)
   ok(!text.includes('src/mine/'), 'digest excludes the caller own claim', text)
 }

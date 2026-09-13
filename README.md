@@ -94,8 +94,10 @@ agents.currentInitiator()            → 正在装配的那个会话
 渲染结果形如：
 
 ```
-[dsh-collab] 同项目其他会话当前占用：Other Session（exclusive）占用 src/backend/，剩 25 分。改动这些路径前请先执行 collab_lock op=wait 或用 collab_board 协商。
+[dsh-collab] 同项目其他会话当前占用：Other Session（exclusive）占用 src/backend/，租约 30 分（09-13 06:35Z–09-13 07:05Z）。改动这些路径前请先执行 collab_lock op=wait 或用 collab_board 协商。
 ```
+
+租约刻意用**绝对 UTC 起止时刻**表示，而不是「还剩几分钟」的倒计时：DSH 只在运行时上下文的文本逐字节变化时才提交新快照，时间无关的摘要因此不会因为过了几分钟而被重复注入。
 
 同项目暂无他人声明时，该上下文退化为一句通用协作规范。读盘走 15 秒 TTL 的后台缓存（`DSH_COLLAB_DIGEST_TTL_MS` 可调），provider 同步返回缓存，刷新失败时沿用上一份。
 

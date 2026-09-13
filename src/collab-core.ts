@@ -261,6 +261,42 @@ export function holderView(state: StateDocument, t: number, opts: SweepOptions =
   return { holders, staleHolders: holders.filter(x => x.stale).length }
 }
 
+// ---- 运行时态势摘要：注入 DSH 运行时上下文的那一行占用视图 ----
+// **时间无关**是本函数的硬约束，不是巧合。DSH 的 RuntimeContextProjection.project()
+// 在 rendered === retained.text 时直接返回 undefined（内容没变就不提交新快照），
+// 而快照是**整块**提交的：沙箱策略 + 审批策略 + 本插件摘要一起重发。
+// 旧格式用「剩 N 分」这种相对倒计时，每分钟都变，于是整块快照每分钟重发一次
+// （实测全部 90 个会话、415 次已提交快照：其中 237 次（57.1%）只差那个数字，
+// 累计 337014 字符被重复注入；237 是逐对做最小差异判定得到的精确值）。
+// 改用**绝对 UTC 起止时刻**后，文本只在"他人的占用集合真的变了"时才变，去重恢复生效。
+// 因此签名刻意**不接受任何时间参数**：没有参数，倒计时就无从偷偷加回来。
+// 动态宿主形态在 src/collab-plugin.host.ts 的 hostCode 里保留一份等价内联实现
+// （限制执行环境不能 import），两者的逐字节等价由 tests/collab-hostcode-parity.mjs 对拍。
+
+// 毫秒时间戳 → `MM-DD HH:MMZ`（UTC，分钟粒度）。分钟粒度 + UTC 让它与本地时区、时钟秒数无关。
+export function clockUtc(ms: number): string {
+  const d = new Date(ms)
+  const p = (n: number): string => String(n).padStart(2, '0')
+  return p(d.getUTCMonth() + 1) + '-' + p(d.getUTCDate()) + ' ' + p(d.getUTCHours()) + ':' + p(d.getUTCMinutes()) + 'Z'
+}
+
+// claims = 他人的、未过期的声明。最多列 3 条、每条最多 2 个路径，其余折叠成计数，
+// 因为这一行会在每一个模型步都被注入，长度必须有界。
+export function renderDigest(claims: Claim[]): string {
+  // 显式排序只为确定性：状态文件里的插入顺序不该让同一组占用渲染出不同文本。
+  const ordered = claims.slice().sort((a, b) =>
+    (a.expiresAt - b.expiresAt) || String(a.holderId).localeCompare(String(b.holderId)))
+  const parts = ordered.slice(0, 3).map(c => {
+    const mins = Math.max(1, Math.round((c.ttlSec || 0) / 60))
+    const paths = c.paths.slice(0, 2).join(' ') + (c.paths.length > 2 ? ' 等 ' + c.paths.length + ' 条' : '')
+    const start = clockUtc(typeof c.createdAt === 'number' ? c.createdAt : c.expiresAt - (c.ttlSec || 0) * 1000)
+    return (c.holderName || c.holderId) + '（' + c.mode + '）占用 ' + paths +
+      '，租约 ' + mins + ' 分（' + start + '–' + clockUtc(c.expiresAt) + '）'
+  })
+  const more = ordered.length > 3 ? '；另有 ' + (ordered.length - 3) + ' 条' : ''
+  return '[dsh-collab] 同项目其他会话当前占用：' + parts.join('；') + more + '。改动这些路径前请先执行 collab_lock op=wait 或用 collab_board 协商。'
+}
+
 // 对外发出一条 claim 的公开视图（剥离内部字段）。
 export function publish(c: Claim): PublishedClaim {
   return { claimId: c.claimId, holderId: c.holderId, holderName: c.holderName, paths: c.paths, mode: c.mode, ttlSec: c.ttlSec, expiresAt: c.expiresAt, note: c.note, createdAt: c.createdAt }

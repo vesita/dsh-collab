@@ -413,13 +413,26 @@ return {
     const DIGEST_TTL_MS = 15000
     const digestCache = new Map()
     const digestBusy = new Set()
-    function renderDigest(others, t) {
-      const parts = others.slice(0, 3).map(c => {
-        const mins = Math.max(1, Math.ceil((c.expiresAt - t) / 60000))
+    // 文本必须**时间稳定**：DSH 的 RuntimeContextProjection.project() 在 rendered === retained.text 时
+    // 直接返回 undefined（内容没变就不提交新快照），而快照是整块提交的（沙箱策略 + 审批策略 + 本摘要）。
+    // 「剩 N 分」每分钟都变，会让整块快照每分钟重发一次；改用绝对起止时刻后只在占用集合真变时才变。
+    // 以下 clockUtc / renderDigest 与 collab-core.ts 的同名导出**逐字节等价**（受限执行环境不能 import，
+    // 只能内联）；二者的一致性由 tests/collab-hostcode-parity.mjs 逐字符对拍。
+    function clockUtc(ms) {
+      const d = new Date(ms)
+      const p = (n) => String(n).padStart(2, '0')
+      return p(d.getUTCMonth() + 1) + '-' + p(d.getUTCDate()) + ' ' + p(d.getUTCHours()) + ':' + p(d.getUTCMinutes()) + 'Z'
+    }
+    function renderDigest(others) {
+      // 显式排序只为确定性：状态文件里的插入顺序不该让同一组占用渲染出不同文本。
+      const ordered = others.slice().sort((a, b) => (a.expiresAt - b.expiresAt) || String(a.holderId).localeCompare(String(b.holderId)))
+      const parts = ordered.slice(0, 3).map(c => {
+        const mins = Math.max(1, Math.round((c.ttlSec || 0) / 60))
         const paths = c.paths.slice(0, 2).join(' ') + (c.paths.length > 2 ? ' 等 ' + c.paths.length + ' 条' : '')
-        return (c.holderName || c.holderId) + '（' + c.mode + '）占用 ' + paths + '，剩 ' + mins + ' 分'
+        const start = clockUtc(typeof c.createdAt === 'number' ? c.createdAt : c.expiresAt - (c.ttlSec || 0) * 1000)
+        return (c.holderName || c.holderId) + '（' + c.mode + '）占用 ' + paths + '，租约 ' + mins + ' 分（' + start + '–' + clockUtc(c.expiresAt) + '）'
       })
-      const more = others.length > 3 ? '；另有 ' + (others.length - 3) + ' 条' : ''
+      const more = ordered.length > 3 ? '；另有 ' + (ordered.length - 3) + ' 条' : ''
       return '[dsh-collab] 同项目其他会话当前占用：' + parts.join('；') + more + '。改动这些路径前请先执行 collab_lock op=wait 或用 collab_board 协商。'
     }
     async function refreshDigest(agent) {
@@ -432,7 +445,7 @@ return {
         const t = now()
         const mine = id ? 'agent:' + id : 'human:console'
         const others = state.claims.filter(c => c.expiresAt > t && c.holderId !== mine)
-        digestCache.set(cwd, { text: others.length ? renderDigest(others, t) : '', at: t })
+        digestCache.set(cwd, { text: others.length ? renderDigest(others) : '', at: t })
       } catch (e) {
         // 尽力而为：保留上一份缓存。
       } finally { digestBusy.delete(cwd) }
