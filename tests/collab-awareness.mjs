@@ -39,7 +39,9 @@ const ME = { id: 'agent-me', session: { header: { cwd: PROJECT_CWD } } }
 
 const store = new Map()
 const tools = []
-let capturedPromptContext = null
+// 按 name 索引：本插件现在会注册**多个** PromptContext（态势 + 委托纪律），
+// 只记住"最后一个"会让断言张冠李戴。
+const promptContexts = new Map()
 
 const ctx = new Context()
 for (const n of ['tools', 'timer', 'fs', 'sessions', 'sessionTitle', 'agents', 'systemPrompt']) ctx.provide(n)
@@ -60,13 +62,15 @@ ctx.set('sessions', { get: (id) => (id === ME.id ? ME.session : undefined) })
 ctx.set('sessionTitle', { get: () => ({ title: 'Awareness Worker' }) })
 ctx.set('agents', { currentInitiator: () => ME, list: () => [ME] })
 ctx.set('systemPrompt', {
-  context: (c) => { capturedPromptContext = c; return () => {} }
+  context: (c) => { promptContexts.set(c.name, c); return () => {} }
 })
 
 await ctx.plugin(collabPlugin)
 
+const capturedPromptContext = promptContexts.get('dsh-collab/awareness') || null
+
 console.log('# awareness prompt context is registered')
-ok(!!capturedPromptContext, 'plugin registers exactly one PromptContext')
+ok(!!capturedPromptContext, 'plugin registers the awareness PromptContext')
 ok(!!capturedPromptContext && capturedPromptContext.name === 'dsh-collab/awareness', 'context name is dsh-collab/awareness')
 ok(!!capturedPromptContext && capturedPromptContext.order === 130, 'context order is 130 (after sandbox/approval/subagent-delegation)')
 ok(!!capturedPromptContext && typeof capturedPromptContext.text === 'function', 'context text is a live provider function')
@@ -129,6 +133,7 @@ console.log('# opt-out: DSH_COLLAB_NO_PROMPT_HINT=1 registers no context')
 {
   process.env.DSH_COLLAB_NO_PROMPT_HINT = '1'
   let captured2 = null
+  const contexts2 = new Map()
   const ctx2 = new Context()
   for (const n of ['tools', 'timer', 'fs', 'sessions', 'sessionTitle', 'agents', 'systemPrompt']) ctx2.provide(n)
   ctx2.set('tools', { register: () => () => {} })
@@ -143,9 +148,11 @@ console.log('# opt-out: DSH_COLLAB_NO_PROMPT_HINT=1 registers no context')
   ctx2.set('sessions', { get: () => undefined })
   ctx2.set('sessionTitle', { get: () => undefined })
   ctx2.set('agents', { currentInitiator: () => ME, list: () => [ME] })
-  ctx2.set('systemPrompt', { context: (c) => { captured2 = c; return () => {} } })
+  ctx2.set('systemPrompt', { context: (c) => { contexts2.set(c.name, c); return () => {} } })
   await ctx2.plugin(collabPlugin)
+  captured2 = contexts2.get('dsh-collab/awareness') || null
   ok(captured2 === null, 'opt-out env var suppresses PromptContext registration', String(captured2 && captured2.name))
+  ok(contexts2.size === 0, 'opt-out env var suppresses every runtime PromptContext', [...contexts2.keys()].join(','))
   delete process.env.DSH_COLLAB_NO_PROMPT_HINT
 }
 

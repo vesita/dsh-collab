@@ -19,6 +19,9 @@ return {
     const fs = ctx.fs
     const sessions = ctx.get('sessions')
     const sessionTitle = ctx.get('sessionTitle')
+    // 注意：这里**故意不**注册随包 skill（skills.register / subagent-delegation）。
+    // 受限动态宿主里没有包目录、也没有 import，无法定位 <pkg>/skills/subagent-delegation/SKILL.md，
+    // 所以这是环境限制，不是遗漏。包形态见 src/index.ts：它按 import.meta.url 解析 ../skills/ 后注册。
     const LEGACY_FILE = '.dsh-collab.json'
     const now = () => Date.now()
     // 状态目录（**绝对路径**）惰性解析 + 闭包缓存：null=未解析/失败，string=成功。

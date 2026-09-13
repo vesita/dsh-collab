@@ -33,6 +33,7 @@
 │   └── simulate_collab.py        # Python (uv) 多 Agent 高并发冲突仿真与压测脚本
 ├── src/                          # TypeScript 源码（NodeNext 风格，import 写 ./x.js）
 │   ├── index.ts                  # 包入口：注册工具 + 注入协作态势
+│   ├── client.ts                 # 浏览器半边：Settings → Plugins 下的 dsh-collab 设置卡片
 │   ├── collab-core.ts            # 纯逻辑唯一事实源（可 import / 可测 / 供多语言对照）
 │   ├── collab-plugin.host.ts     # 自包含 Cordis Host 插件源码（导出 hostCode 字符串，可直接作为 code.host）
 │   ├── paths.ts                  # 状态目录的唯一路径事实源（绝对路径推导 + 历史落点）
@@ -41,6 +42,9 @@
 │   └── types/
 │       └── collab.d.ts           # TypeScript 类型定义（构建时复制到 lib/types/）
 ├── lib/                          # tsc 构建产物（git 忽略，随 npm 包发布）
+├── skills/
+│   └── subagent-delegation/
+│       └── SKILL.md              # 随包发布的委托与验收纪律技能
 └── tests/
     ├── collab-pure-logic.mjs        # 纯逻辑回归 + hostCode 内联副本漂移守护
     ├── collab-integration.mjs       # Cordis 插件端到端（fake ctx）
@@ -102,6 +106,43 @@ agents.currentInitiator()            → 正在装配的那个会话
 同项目暂无他人声明时，该上下文退化为一句通用协作规范。读盘走 15 秒 TTL 的后台缓存（`DSH_COLLAB_DIGEST_TTL_MS` 可调），provider 同步返回缓存，刷新失败时沿用上一份。
 
 关闭方式：包形态设置环境变量 `DSH_COLLAB_NO_PROMPT_HINT=1`。受限的动态宿主形态读不到 `process.env`，因此它**始终注入**；需要彻底关闭时请使用包形态。
+
+---
+
+## 委托纪律偏好与设置卡片
+
+运行时上下文除态势摘要外，还带一段常驻的**委托与验收纪律**；它同时决定随包的 `subagent-delegation` 技能是否注册。两者由包形态的一项设置控制，默认开启：
+
+| 项 | 值 |
+| --- | --- |
+| 设置命名空间 | `dsh-collab` |
+| 字段 | `exposeDelegationDiscipline` |
+| 类型 / 默认 | `boolean` / `true` |
+
+该命名空间经 `ctx.settings.installSection(...)` 注册（schema 由 `@deepseek-ai/schemastery` 描述），因此它出现在设置文档 `${DSH_HOME:-$HOME/.dsh}/settings.yaml` 与设置界面里。值是**活读**的：改完立即生效，无需重启 dsh。命名空间是可选服务，部署里没有 settings 服务时插件按 `true` 行事。
+
+开启（默认）时，插件多做两件事：
+
+1. 把随包发布的 `subagent-delegation` 技能注册进宿主技能注册表；
+2. 通过 `systemPrompt.context()` 注入段名 `dsh-collab/delegation`、`order=131` 的纪律文本。
+
+关闭时这两项都不注册。**中央注册锁与协作留言板不受影响**——它们是插件本体，始终在场。
+
+纪律文本是**纯常量**：没有时间戳、计数或任何会漂移的字符。DSH 的运行时上下文快照按整串相等去重，常量块因此每个会话只提交一次；一旦掺入随步变化的文本，整块快照就会被反复重发。
+
+### 设置界面里的那张卡片
+
+偏好能出现在 UI 里，靠的是插件带的浏览器半边 `lib/client.js`（`package.json` 声明 `dsh.client` 与 `exports["./client"]`）。原因很直接：设置页只**枚举**命名空间、从不解释它，一张卡片是由拥有该命名空间的插件按 `settings.plugin.item` 槽位、以命名空间为 key 注册进来的——**谁拥有设置，谁自带卡片**。
+
+打开 **设置 → 插件**（Settings → Plugins）即可看到 `dsh-collab` 的卡片：一个复选框加一行说明。复选框直接写 Host，勾选即保存；三种状态都如实呈现——命名空间尚未就绪时给一行加载占位，本部署没有 Host 半边时整张卡片不渲染，只读部署把控件置灰并说明原因。
+
+### 随包发布的委托技能
+
+`skills/subagent-delegation/SKILL.md` 随包发布。偏好开启时，插件把它注册进宿主技能注册表（`ctx.skills.register`），标注 `source: 'bundled'`、`provider: 'dsh-collab'`，技能目录里因此能看到它、来源也可辨。注册随 effect disposer 撤回，**可逆**：插件卸载或偏好关闭，该技能随之消失。
+
+插件的**动态宿主形态**（`hostCode` 字符串）刻意不注册该技能：受限动态环境没有包目录、也没有 `import`，无法定位 `<pkg>/skills/subagent-delegation/SKILL.md`。这是环境限制，不是遗漏。
+
+包形态的 `DSH_COLLAB_NO_PROMPT_HINT=1` 关掉**所有**运行时上下文注入，纪律文本一并关闭（它不影响技能注册）。
 
 ---
 

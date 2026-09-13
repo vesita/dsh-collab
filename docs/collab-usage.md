@@ -50,6 +50,12 @@ ${DSH_HOME:-$HOME/.dsh}/collab/projects/<项目名>-<哈希>.json
 
 早期版本使用过的落点（`<项目>/.dsh-collab.json`、相对 cwd 的 `.dsh/collab/projects/`、`<HOME>/~/.dsh/collab/projects/`）在目标文件不存在时会被只读扫描并一次性搬入正确位置（由包形态执行；动态形态直接读写正确落点，两者共享同一份状态）。
 
+### 1.4 委托纪律，以及在哪里关掉它
+
+除态势摘要外，插件还注入一段常驻的**委托与验收纪律**，并随包注册 `subagent-delegation` 技能，默认开启。它是包形态的一项设置：**设置 → 插件**（Settings → Plugins）里 `dsh-collab` 卡片上的复选框，对应字段 `exposeDelegationDiscipline`（`${DSH_HOME:-$HOME/.dsh}/settings.yaml`，布尔，默认 `true`）。
+
+取消勾选后，纪律文本与随包技能都不再注册，**中央注册锁与协作留言板照常可用**。设置是活读的，改完立即生效，无需重启 dsh。完整说明见 README 的「委托纪律偏好与设置卡片」。
+
 ---
 
 ## 2. `collab_lock`

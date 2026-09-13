@@ -1,3 +1,7 @@
+import { readFileSync } from 'node:fs'
+import { dirname } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import z from '@deepseek-ai/schemastery'
 import {
   norm, ov, hashProjectKey, projectStorageFileName, init, publish,
   expire, sweep, conflictError, holder, claim, release, heartbeat,
@@ -30,6 +34,137 @@ interface SessionLike { header?: { cwd?: string } }
 interface AgentLike { id?: string; session?: SessionLike }
 interface SessionsService { get(agentId: string): SessionLike | undefined }
 interface SessionTitleService { get(session: SessionLike): { title?: string } | undefined }
+
+/** 技能调用面：modelInvocable 进模型目录，userInvocable 进人工命令目录。 */
+export interface SkillInvocationPolicy {
+  readonly modelInvocable: boolean
+  readonly userInvocable: boolean
+}
+
+/** 技能正文相对资源的解析基址（目录形态用于引用同目录的附属文件）。 */
+export type SkillResourceBase =
+  | { kind: 'directory'; path: string }
+  | { kind: 'url'; url: string }
+  | { kind: 'opaque'; description: string }
+
+/** ctx.skills.register 的入参（invocation/provider 可缺省，缺省时由注册表定默认值）。 */
+export interface SkillRegistration {
+  name: string
+  description: string
+  whenToUse?: string
+  content: string
+  source: string
+  provider?: string
+  resourceBase?: SkillResourceBase
+  path?: string
+  metadata?: Record<string, unknown>
+  invocation?: SkillInvocationPolicy
+}
+
+/** ctx.skills 中本插件实际使用的最小接口；**可选服务**，缺失或不可用时静默跳过注册。 */
+export interface SkillsService { register(skill: SkillRegistration): () => void }
+
+/** 委托纪律偏好的解析值。 */
+export interface DelegationSettings { exposeDelegationDiscipline: boolean }
+
+/** ctx.settings.installSection 的 hooks：setSource 交出**实时**读取器，onChange 在值变化时回调。 */
+export interface SettingsSectionHooks {
+  setSource(source: () => DelegationSettings): void
+  onChange(): void
+  validate?(value: DelegationSettings): void
+}
+
+/** ctx.settings 中本插件实际使用的最小接口；**可选服务**。 */
+export interface SettingsService {
+  installSection(owner: unknown, ns: string, schema: unknown, entry: DelegationSettings, hooks: SettingsSectionHooks): void
+}
+
+/** 偏好设置命名空间。 */
+export const DELEGATION_SETTINGS_NAMESPACE = 'dsh-collab'
+
+/** 设置契约：默认**开启**——目标是让这套工作方式真的发生，开关是用来关掉它的。 */
+export const DELEGATION_SETTINGS_SCHEMA = z.object({
+  exposeDelegationDiscipline: z.boolean().default(true)
+})
+
+/** 组合默认值：settings 服务缺失（或 installSection 不可用）时，它就是生效值。 */
+export const DELEGATION_SETTINGS_ENTRY: DelegationSettings = { exposeDelegationDiscipline: true }
+
+/**
+ * 常驻委托纪律文本：**纯常量**，无时间戳、无计数、无任何会漂移的字符。
+ * DSH 的运行时上下文快照按整串相等去重（rendered === retained.text 即不提交），
+ * 所以常量块每个会话只提交一次，成本近似为零；一旦掺入变量就会击穿这个去重。
+ * 注意：正文里不能出现阿拉伯数字，否则测试里"无数字"的断言就没有意义。
+ */
+export const DELEGATION_DISCIPLINE_TEXT = [
+  '[dsh-collab] 委托与验收（默认工作方式）：主 AI 负责规划、下结论与验收；子代理负责探索、调研、测量、机械改造与独立复核。',
+  '派活前先过一遍判据：能用一段话写清规格、且能用一次检查判定对错，就委托；否则先想清楚规格再决定。',
+  '任务彼此独立就放在同一条消息里并行发起，一个子代理只回答一个完整问题。',
+  '验收永远留在主 AI：不外包结论，要求粘贴原始输出作为证据，别只看摘要。'
+].join('\n')
+
+/** 随包发布的 skill：正文与目录都来自 <pkg>/skills/subagent-delegation/。 */
+const BUNDLED_SKILL_FILE = '../skills/subagent-delegation/SKILL.md'
+
+interface BundledSkill {
+  name: string
+  description: string
+  whenToUse?: string
+  content: string
+  path: string
+}
+
+/**
+ * 极简 frontmatter 解析：只认文件开头的 `---` 块，只取 name/description/whenToUse 三个标量，
+ * 其余行（含 YAML 注释）忽略；正文是闭合 `---` 之后的全部原文，不做任何改写。
+ * 缺 frontmatter、缺 name、或整段不可解析时返回 null，由调用方静默降级。
+ */
+function parseSkillFrontmatter(text: string): { name: string; description?: string; whenToUse?: string; content: string } | null {
+  const m = /^\uFEFF?---[ \t]*\r?\n([\s\S]*?)\r?\n---[ \t]*(?:\r?\n|$)/.exec(text)
+  if (!m) return null
+  const meta: Record<string, string> = {}
+  for (const line of m[1].split(/\r?\n/)) {
+    const kv = /^([A-Za-z][A-Za-z0-9_-]*)[ \t]*:[ \t]*(.*)$/.exec(line)
+    if (!kv) continue
+    let v = kv[2].trim()
+    // 值两侧成对的引号剥掉即可，不追求完整 YAML（本文件只用裸标量）。
+    if (v.length >= 2 && ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'")))) v = v.slice(1, -1)
+    meta[kv[1]] = v
+  }
+  const name = (meta.name || '').trim()
+  if (!name) return null
+  const content = text.slice(m[0].length)
+  return {
+    name,
+    description: (meta.description || '').trim() || undefined,
+    whenToUse: (meta.whenToUse || '').trim() || undefined,
+    content
+  }
+}
+
+// 读盘结果（含失败）只算一次：prompt 装配路径绝不碰盘，apply 也只同步读一次。
+let bundledSkillCache: BundledSkill | null | undefined
+
+/** 读取并解析随包 skill；文件缺失/不可读/解析失败都返回 null（绝不抛）。 */
+function loadBundledSkill(): BundledSkill | null {
+  if (bundledSkillCache !== undefined) return bundledSkillCache
+  bundledSkillCache = null
+  try {
+    // 相对**构建产物**定位：lib/index.js -> <pkg>/skills/...，因此与安装位置无关。
+    const file = fileURLToPath(new URL(BUNDLED_SKILL_FILE, import.meta.url))
+    const parsed = parseSkillFrontmatter(readFileSync(file, 'utf8'))
+    if (parsed) {
+      bundledSkillCache = {
+        name: parsed.name,
+        description: parsed.description || '',
+        whenToUse: parsed.whenToUse,
+        content: parsed.content,
+        path: file
+      }
+    }
+  } catch (e) {}
+  return bundledSkillCache
+}
 
 /** 工具调用上下文（execute 的第二个参数），取 agent 作为 holder 身份及 cwd 来源。 */
 export interface ToolExecContext {
@@ -86,6 +221,8 @@ export interface CollabContext {
   effect(callback: () => void | (() => void)): void
   get(name: string): any
   on(event: string, handler: (payload: any) => void, options?: { global?: boolean; prepend?: boolean }): void
+  /** cordis 的动态依赖：deps 就绪时在子 fiber 里跑 callback；deferred 直到服务出现。 */
+  inject(deps: string[], callback: (ctx: CollabContext & { settings?: SettingsService }) => void): unknown
 }
 
 /** 单个 op 的处理函数签名。 */
@@ -509,6 +646,105 @@ export function apply(ctx: CollabContext): void {
       }, String(agent.id), agent).catch(() => {})
     } catch (e) {}
   }, { global: true })
+
+  // ---- 委托纪律：偏好在 settings（**可选服务**），默认开 ----
+  // 技能正文随包走（<pkg>/skills/subagent-delegation/SKILL.md），所以按构建产物的位置解析，
+  // 而不是猜用户 ~/.dsh/skills/ 的落点。锁与留言板是产品本体，纪律只是附加项：
+  // 服务缺失、文件缺失、解析失败一律**静默跳过**，绝不抛、也绝不阻断上面的工具注册。
+  //
+  // 关键约束：偏好的值必须**活读**。installSection 会把 setSource 换成返回注册表实时
+  // resolved 值的读取器，用户一改设置 onChange 就触发重新结算 —— 不需要重启进程。
+  // 这里缓存的只是"读取器"，不是值本身。
+  let readSettings: (() => DelegationSettings) | null = null
+  let skillStop: (() => void) | null = null
+  let disciplineStop: (() => void) | null = null
+
+  const delegationEnabled = (): boolean => {
+    try {
+      const value = readSettings ? readSettings() : DELEGATION_SETTINGS_ENTRY
+      return !value || value.exposeDelegationDiscipline !== false
+    } catch (e) {
+      return true // 读设置失败按默认开处理：附加能力不该因为读取异常而消失
+    }
+  }
+
+  // 按当前偏好结算两项交付物；开则注册，关则撤回。注册与撤回都走 effect disposer，可逆。
+  function reconcileDelegation(): void {
+    try {
+      const on = delegationEnabled()
+
+      // a) 随包 skill
+      if (on && !skillStop) {
+        const skills = ctx.get('skills') as SkillsService | undefined
+        const skill = skills && typeof skills.register === 'function' ? loadBundledSkill() : null
+        if (skills && skill) {
+          ctx.effect(() => {
+            const off = skills.register({
+              name: skill.name,
+              description: skill.description,
+              whenToUse: skill.whenToUse,
+              content: skill.content,
+              source: 'bundled',
+              provider: 'dsh-collab',
+              path: skill.path,
+              resourceBase: { kind: 'directory', path: dirname(skill.path) },
+              invocation: { modelInvocable: true, userInvocable: true }
+            })
+            let live = true
+            skillStop = () => { if (!live) return; live = false; skillStop = null; off() }
+            return () => { if (!live) return; live = false; skillStop = null; off() }
+          })
+        }
+      } else if (!on && skillStop) {
+        const stop = skillStop
+        skillStop = null
+        stop()
+      }
+
+      // b) 常驻纪律上下文：skill 是按需拉取的，而这段文本要的是"默认就发生"。
+      // DSH_COLLAB_NO_PROMPT_HINT=1 是包形态的总开关：它关掉**所有**运行时上下文注入，
+      // 所以这里一并遵守（该开关不管 skill 注册）。
+      if (on && PROMPT_HINT_ENABLED && !disciplineStop) {
+        if (systemPrompt && typeof systemPrompt.context === 'function') {
+          ctx.effect(() => {
+            const off = systemPrompt.context({
+              name: 'dsh-collab/delegation',
+              order: 131,
+              // 常量：每次装配返回同一个串，快照去重才能生效。
+              text: () => DELEGATION_DISCIPLINE_TEXT
+            })
+            let live = true
+            disciplineStop = () => { if (!live) return; live = false; disciplineStop = null; off() }
+            return () => { if (!live) return; live = false; disciplineStop = null; off() }
+          })
+        }
+      } else if ((!on || !PROMPT_HINT_ENABLED) && disciplineStop) {
+        const stop = disciplineStop
+        disciplineStop = null
+        stop()
+      }
+    } catch (e) {}
+  }
+
+  // settings 的接线：可选服务，缺失时保持默认值（开）。
+  // 若此刻 settings 已经可用，则**不**先按默认值落地，等 installSection 把实时读取器交上来
+  // 再由 onChange 结算 —— 否则"偏好为关"时会先注册再撤回，留下一次无谓的瞬时注册。
+  const settingsNow = ctx.get('settings') as SettingsService | undefined
+  const settingsUsable = !!(settingsNow && typeof settingsNow.installSection === 'function')
+  ctx.inject(['settings'], (settingsCtx) => {
+    try {
+      const settings = settingsCtx.settings
+      if (settings && typeof settings.installSection === 'function') {
+        settings.installSection(ctx, DELEGATION_SETTINGS_NAMESPACE, DELEGATION_SETTINGS_SCHEMA, DELEGATION_SETTINGS_ENTRY, {
+          setSource: (source) => { readSettings = () => source() },
+          onChange: () => { reconcileDelegation() }
+        })
+      }
+    } catch (e) {}
+    // 兜底：installSection 缺席或失败（例如命名空间被占用）时，仍按当时的可读值结算。
+    reconcileDelegation()
+  })
+  if (!settingsUsable) reconcileDelegation()
 }
 
 export default { name, inject, apply }
