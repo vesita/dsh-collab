@@ -23,7 +23,10 @@ export interface Claim {
   /**
    * 读者（功能 D，反向注册）：被本声明通知过的会话 holderId 列表（形如 `agent:<id>`）。
    * 可选字段同样为了兼容老状态文件 —— 缺省即 `[]`（见 collab-core 的 readersOf）。
-   * 只在**真正的会话结束**时移除：持有者释放、`agent/disposed`（dropHolder）。
+   * 移除时机只有两处：持有者 `op=release`（整条声明消失）、`agent/disposed`（dropHolder 摘登记，
+   * 它在**会话被 dispose 之后往往还会恢复**，所以措辞不用"真正的会话结束"）。
+   * **声明本身不因 dispose 而被回收**（W7）：claim 的生命周期只由租约 `expiresAt` 决定，
+   * dispose 只是摘掉 reader 登记、并回收该 holder 已过期的声明。
    * 0.8.3 起 sweep() 不再按 liveness 清理 —— `agents.get()` 对休眠但可唤回的会话
    * 返回 undefined，按它清理会把只是空闲的读者删掉，静默丢掉释放通知。
    */
@@ -71,13 +74,15 @@ export interface ConflictInfo {
 }
 
 export interface CollabLockParams {
-  op: 'claim' | 'release' | 'list' | 'overview' | 'status' | 'heartbeat' | 'wait';
+  op: 'claim' | 'release' | 'list' | 'overview' | 'status' | 'heartbeat' | 'wait' | 'reap';
   paths?: string[];
   claimId?: string;
   mode?: Mode;
   readable?: boolean;
   ttlSec?: number;
   timeoutMs?: number;
+  confirm?: boolean;
+  olderThanSec?: number;
   note?: string;
 }
 

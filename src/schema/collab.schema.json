@@ -28,7 +28,7 @@
         "note": { "type": "string", "maxLength": 500 },
         "createdAt": { "type": "integer", "description": "创建时刻（Unix 毫秒）。" },
         "readable": { "type": "boolean", "default": true, "description": "可读性（0.8.0 功能 C）：true = 他人可读（默认），false = 他人读取也要先协商；写入对非持有者始终要协商。可选字段，兼容 0.7.0 之前的状态文件（缺省即可读）。" },
-        "readers": { "type": "array", "items": { "type": "string" }, "default": [], "description": "读者（0.8.0 功能 D，反向注册）：被本声明通知过的会话 holderId（agent:<id>）。缺省 []；仅在持有者释放、agent-disposed（真正的会话结束）时移除。0.8.3 起 sweep() **不再**按 liveness 清理读者 —— agents.get() 对休眠但可唤回的会话返回 undefined，按它清理会静默丢掉通知。" }
+        "readers": { "type": "array", "items": { "type": "string" }, "default": [], "description": "读者（0.8.0 功能 D，反向注册）：被本声明通知过的会话 holderId（agent:<id>）。缺省 []；移除时机只有两处：持有者释放（整条声明消失）、agent/disposed（dropHolder 摘掉登记 —— 会话被 dispose 之后往往还会恢复，故不称「会话结束」）。声明本身不因 dispose 回收：claim 的生命周期只由租约 expiresAt 决定。0.8.3 起 sweep() **不再**按 liveness 清理读者 —— agents.get() 对休眠但可唤回的会话返回 undefined，按它清理会静默丢掉通知。" }
       }
     },
     "Message": {
@@ -92,13 +92,15 @@
       "additionalProperties": true,
       "required": ["op"],
       "properties": {
-        "op": { "type": "string", "enum": ["claim", "release", "list", "overview", "status", "heartbeat", "wait"] },
+        "op": { "type": "string", "enum": ["claim", "release", "list", "overview", "status", "heartbeat", "wait", "reap"] },
         "paths": { "type": "array", "items": { "$ref": "#/$defs/Path" } },
         "claimId": { "type": "string" },
         "mode": { "$ref": "#/$defs/Mode" },
         "readable": { "type": "boolean", "default": true, "description": "claim 用：他人是否可读这些路径（默认 true，只认显式 false）。" },
         "ttlSec": { "type": "integer", "minimum": 5, "maximum": 86400, "default": 1800 },
         "timeoutMs": { "type": "integer", "minimum": 0, "maximum": 120000, "default": 30000, "description": "wait 用，最多等待毫秒。" },
+        "confirm": { "type": "boolean", "default": false, "description": "reap 用（0.9.8）：默认 false = dry-run，只返回候选清单、绝不改状态；只有显式 true 才真正删除命中判据的僵尸声明。" },
+        "olderThanSec": { "type": "integer", "minimum": 0, "default": 600, "description": "reap 用：age 门槛（秒）。声明从创建至今必须严格大于它才算候选；缺省 600（保守值）。" },
         "note": { "type": "string", "maxLength": 500 }
       }
     },

@@ -34,7 +34,8 @@ export function installTools(ctx: CollabContext, store: StateStore, push: PushAp
     if (a.op === 'overview') return store.overviewOp(aId, agent)
     if (a.op === 'status') return store.status(a, aId, agent)
     if (a.op === 'wait') return store.waitFor(a, h, aId, agent)
-    return { ok: false, error: 'bad-request', message: 'unknown op: ' + String(a.op) }
+    if (a.op === 'reap') return reapWithNotify(a, h, aId, agent)
+    return { ok: false, error: 'bad-request', message: '未知操作：' + String(a.op) }
   })
 
   /**
@@ -67,27 +68,59 @@ export function installTools(ctx: CollabContext, store: StateStore, push: PushAp
     return res
   }
 
+  /**
+   * 显式 op=reap + 功能 D 的推送（0.9.8）。
+   *
+   * 复用 release 的同一条投递面（`notifyReaders` → `agent.inject` + `form:'notice'` 的显式来源消息），
+   * **不另造通道**，也**绝不**走进任何冒充用户（`kind:'user'`）的接口 —— AGENTS.md §1 的机械检查
+   * （tests/collab-message-provenance.mjs）同样扫到这条路径。
+   *
+   * 与 releaseWithNotify 的差异只有两点，都是语义要求：
+   *   1. 只在**真的回收到了**（`data.reaped` 非空）时才通知：dry-run 与"没有候选"都不该发通知
+   *      （没有发生回收事件）；
+   *   2. `action:'reap'` 让通知文案说"回收"而不是"释放"（回收者不是原持有者）。
+   */
+  async function reapWithNotify(a: CollabArgs, h: HolderInput, aId: string | null, agent?: AgentLike): Promise<ToolResult> {
+    const res = await store.reapOp(a, h, aId, agent)
+    try {
+      if (res && res.ok === true && res.data && Array.isArray(res.data.reaped) && res.data.reaped.length > 0) {
+        res.data.notify = await push.notifyReaders(res.data.reaped as PublishedClaim[], h.holderId, h.name || h.holderId, agent, 'reap')
+      }
+    } catch (e) {
+      // 推送失败不影响 reap 结果（reap 已经写盘成功）；但必须与"没有读者需要通知"可区分。
+      if (res && res.data) {
+        res.data.notify = {
+          readers: 0, pushed: [], pushedVia: [],
+          skipped: [{ sessionId: '', reason: 'internal', error: String((e && e.message) || e) }]
+        }
+      }
+    }
+    return res
+  }
+
   const boardHandler = exec((a, h, aId, agent) => {
     if (a.op === 'post') return store.mutate(s => post(s, h, a, store.now), aId, agent)
     if (a.op === 'read') return store.msgs(a, aId, agent)
-    return { ok: false, error: 'bad-request', message: 'unknown op: ' + String(a.op) }
+    return { ok: false, error: 'bad-request', message: '未知操作：' + String(a.op) }
   })
 
   const render = (args: CollabArgs, value: unknown) => [{ type: 'text', text: JSON.stringify(value, null, 2) }]
 
   const lockTool: ToolDefinition = {
     name: 'collab_lock',
-    description: '多智能体协作中央注册锁：开工前声明占用项目文件夹（目录以 / 结尾，如 src/backend/），查询他人占用，减少共同开发冲突。规范：动手改代码前先 claim；开工前和定期 list/overview；冲突时先 wait 等待或用 board 留言协商；完成即 release；长任务 heartbeat 续租。',
+    description: '多智能体协作中央注册锁：开工前声明占用项目文件夹（目录以 / 结尾，如 src/backend/），查询他人占用，减少共同开发冲突。规范：动手改代码前先 claim；开工前和定期 list/overview；冲突时先 wait 等待或用 board 留言协商；完成即 release；长任务 heartbeat 续租；被强杀的会话会留下僵尸声明，默认 dry-run 的 op=reap 可显式回收（先看候选，再 confirm:true）。',
     parameters: {
       type: 'object',
       properties: {
-        op: { type: 'string', enum: ['claim', 'release', 'list', 'overview', 'status', 'heartbeat', 'wait'], description: 'claim 声明 / release 释放 / list 全部 / overview 占用全景 / status 查路径 / heartbeat 续租 / wait 等待路径释放' },
+        op: { type: 'string', enum: ['claim', 'release', 'list', 'overview', 'status', 'heartbeat', 'wait', 'reap'], description: 'claim 声明 / release 释放 / list 全部 / overview 占用全景 / status 查路径 / heartbeat 续租 / wait 等待路径释放 / reap 显式回收僵尸声明（默认 dry-run）' },
         paths: { type: 'array', items: { type: 'string' }, description: '项目相对路径' },
         claimId: { type: 'string', description: 'claim id，release/heartbeat 用' },
         mode: { type: 'string', enum: ['exclusive', 'shared', 'read'], description: 'exclusive 独占（默认）；shared 声明共用但被独占挡住；read 只读观测，不排他也不被挡' },
         readable: { type: 'boolean', description: 'claim 用：他人是否可读这些路径，默认 true；false 表示他人读取也要先协商（写入对非持有者始终要协商）' },
         ttlSec: { type: 'number', description: '租约秒数（5-86400），默认 1800' },
         timeoutMs: { type: 'number', description: 'wait 用，最多等待毫秒，默认 30000' },
+        confirm: { type: 'boolean', description: 'reap 用：默认 false = dry-run，只列候选、绝不改状态；显式 true 才真正删除僵尸声明' },
+        olderThanSec: { type: 'number', description: 'reap 用：age 门槛（秒），声明创建至今必须严格大于它才算候选，默认 600' },
         note: { type: 'string', description: '占用说明' }
       },
       additionalProperties: true,

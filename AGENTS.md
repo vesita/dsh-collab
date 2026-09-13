@@ -12,6 +12,11 @@
 - ✗ **禁止**
   - `source.kind === 'user'`，或手写 `role: 'user'` —— 那会让消息在界面上与真人输入同形；
   - 投递**没有 `source`** 的消息 —— 来源无法追溯；
+  - **用 `sessionController.prompt({ content })` / `subagents.sendMessage(sender, id, content, …)`
+    跨会话投递通知** —— 这两个接口**收 content、不收 message**，消息由宿主代造且来源写死
+    `source: { kind: 'user', rpcId: 'dsh-collab-…' }`，在 GUI 里就是**用户气泡**（= 冒充用户）。
+    0.9.6 起本仓库已把这两条通道从 `src/push.ts` **整体删除**；它们此后只可作为**历史说明**
+    出现，且必须标注"已删除"；
   - **手抄构造函数副本**（自己实现 `createUserMessage` / `createMessage` / `freezeMessage` /
     `boundContextSummary`）—— 那是一份会腐烂的副本（见下）。
 - ✓ **允许**
@@ -24,9 +29,7 @@
     ```
   - 逐事件投递用 `agent.inject(msg)` —— 契约是 `send(msg, "next-step", wakeup=false)`
     （`dsh-agent/lib/types/runtime-types.d.ts:209`、实现 `dsh-agent-loop/lib/index.js:795`）：
-    进入下一步但**不唤醒** driver。
-  - 跨会话投递用 `sessionController.prompt({ content })` / `subagents.sendMessage(sender, id, content, …)`
-    —— 这两个收 **content**，由宿主构造消息；
+    进入下一步但**不唤醒** driver。这是跨会话通知的**唯一**投递面。
   - 常驻文本用 `systemPrompt.context` / `systemPrompt.section`（收 text）。
 
 **判据一句话**：**消息可以投，来源必须诚实。**
@@ -47,6 +50,14 @@
    **opaque** 行（`client.js:795-800`）。`summary` 用 `boundContextSummary`（120 字符上限，
    dsh-llm 导出，生态里 5 个包在用）。DSH 自家也有翻车的：`dsh-tool-cordis` 与 `dsh-tool-skill`
    声明了 `form:'instructions'` 却没给 `changes`，实际渲染成 opaque。
+4. **"收 content"的接口一定会冒充用户（实测）**。`sessionController.prompt` 与
+   `subagents.sendMessage` **都只收 `content`、不收 message**，消息由宿主代造并写死
+   `source: { kind: 'user', rpcId: 'dsh-collab-…' }` —— 实测转录里就是 `user/message` +
+   `kind:'user'`，客户端按 `source.kind` 分流后渲染成**用户气泡**
+   （`dsh-client-ui-chat/lib/client.js:6058`；落进 next-step 收件箱还会升级成 steering 气泡，
+   与真人输入共用同一个渲染器）。证据：本仓库 0.9.6 之前的 `src/push.ts` 注释与实测转录。
+   —— 所以"接口收 content ⇒ 来源可控"是错的：**来源由宿主盖章**，插件既改不了也看不见。
+   这也是 0.9.6 把这两条通道整体删掉、只留 `agent.inject` + 自造显式来源消息的原因。
 
 ### 载体怎么选（照 `dsh-tool-jobs` 的分法）
 
@@ -74,6 +85,9 @@
 - 凡有 `createUserMessage(` 的文件，必须同时有 `source:`、`plugin:`、`form:`；
   `form:'notice'` 还必须带 `summary:`；
 - 必须有 `from '@deepseek-ai/dsh-llm'` 的 import；
+- **不许**用 `sessionController.prompt` / `subagents.sendMessage` 投递通知 —— 这两个接口收
+  `content`、来源由宿主写死 `kind:'user'`，**必然冒充用户**；0.9.6 已把这两处调用从
+  `src/push.ts` 整体删除，故 **`src/` 里再出现这两处调用即为回归**（历史说明必须标注"已删除"）；
 - 访问通知必须经 `agent.inject` 逐事件投递，且 `src/access.ts` 里**不许**再出现 `systemPrompt`
   —— 防止悄悄退回"挤运行时上下文快照"的老载体；
 - 手抄副本 `src/plugin-message.ts` / `lib/plugin-message.js` 必须**不存在**（不许复活）。
@@ -87,8 +101,10 @@
 - 用 `systemPrompt.context` 的只有 3 个包，且都用于**运行时状态**（沙箱/审批/子代理委派）；
 - 用 `systemPrompt.section` 的约 21 个包目录 / 25 个文件；
 - `id` / `role` / 深冻结**全部由构造函数自动补**，40 处调用点没有一处自己生成 uuid；
-- 全部署**没有**"收纯 text 就能逐次注入历史"的接口（唯一收 content 且非用户气泡的是
-  `subagents.sendMessage`，但它限死邻接）。
+- 全部署**没有**"收纯 text 就能逐次注入历史"的接口（0.9.6 之前曾误以为
+  `subagents.sendMessage` 是"收 content 且非用户气泡"的例外 —— **实测同样由宿主写死
+  `kind:'user'`**，该通道已删除，见上「为什么」第 4 条；现在跨会话通知只有
+  `agent.inject` + 自造显式来源消息一条路）。
 
 所以本规范是"**与生态一致地构造、只是额外要求来源诚实**"，不是逆向选择。
 

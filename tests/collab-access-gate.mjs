@@ -127,8 +127,8 @@ console.log('# renderAccessNotice: 紧凑 + 时间稳定（无倒计时）')
   ok(sharedNoRead.includes('不可读') === false, 'shared + readable:false 不再谎报「不可读」', sharedNoRead)
   const readNoRead = renderAccessNotice([mkClaim({ claimId: 'c_rnr', paths: ['src/rnr/'], mode: 'read', readable: false })])
   ok(readNoRead.includes('不可读') === false, 'read + readable:false 不再谎报「不可读」（OPEN_HINT 推荐用法）', readNoRead)
-  ok(sharedNoRead.includes('（shared）') && readNoRead.includes('（read）'), '非 exclusive 仍点出 mode 本身', JSON.stringify([sharedNoRead, readNoRead]))
-  ok(renderAccessNotice([mkClaim({ claimId: 'c_ex', paths: ['src/ex/'], readable: false })]).includes('（exclusive，不可读）'),
+  ok(sharedNoRead.includes('（共享）') && readNoRead.includes('（只读）'), '非 exclusive 仍点出 mode 本身（渲染为中文标签）', JSON.stringify([sharedNoRead, readNoRead]))
+  ok(renderAccessNotice([mkClaim({ claimId: 'c_ex', paths: ['src/ex/'], readable: false })]).includes('（独占，不可读）'),
     'exclusive + readable:false 仍保留完整标注（门控真的生效）')
   const three = renderAccessNotice([A, B, C])
   ok(three.includes('；另有 1 条'), '超过 2 条折叠成计数', three)
@@ -467,6 +467,38 @@ console.log('# A: block 分支 / 无命中 / 无候选 / 绝对路径 / 自己�
   ok(injectLog.length === 0, '非路径自由文本 -> 不投递', 'injects=' + injectLog.length)
 }
 
+console.log('# A2: 占用管理工具 collab_lock 不算「访问路径」—— 查询/声明占用不通知也不登记')
+{
+  const foreign = mkClaim({ claimId: 'c_own', holderId: 'agent:other', holderName: 'Other Session', paths: ['src/own/2'], expiresAt: Date.now() + HOUR })
+  resetInject()
+  const h = await makeHarness({ claims: [foreign] })
+
+  // 负例①（实测缺陷的回归断言）：2026-09-13 23:47，主 AI 调 collab_lock op=status 只为
+  // **查询**谁占用，插件却注入了「你刚访问的路径…」并把它登记成 reader。
+  await h.post(execOf('collab_lock', { op: 'status', paths: ['src/own/1'] }))
+  ok(injectLog.length === 0, 'collab_lock op=status 不产生访问通知（查询占用 ≠ 访问路径）', 'injects=' + injectLog.length)
+  ok((h.readState().claims[0].readers || []).length === 0, 'op=status 也不把自己登记成 reader', JSON.stringify(h.readState().claims[0].readers))
+
+  // 负例②：collab_lock 的其它 op 同样整类跳过 —— 连带 paths 的 op=claim 也跳过
+  // （它那里的 paths 含义是"声明占用"，不是访问该路径），overview 更是一并跳过。
+  await h.post(execOf('collab_lock', { op: 'overview' }))
+  await h.post(execOf('collab_lock', { op: 'claim', paths: ['src/own/1'] }))
+  ok(injectLog.length === 0, 'collab_lock 的 overview / claim 都不产生通知（claim 的 paths 是声明占用，不是访问）', 'injects=' + injectLog.length)
+  // collab_board **不在**跳过集合里（理由见 src/access.ts 的 OCCUPANCY_TOOLS 常量注释）：
+  // board 的普通消息（op=read 没有 paths，op=post 的 body 是自由文本）本来就不含路径，
+  // 提取不到候选，因此自然不通知 —— 这是"无候选"，不是"被跳过"。
+  // 正因如此，board 的 mentions 里出现路径时仍照旧通知（见上面 # A 块那条用例）。
+  await h.post(execOf('collab_board', { op: 'read', channel: 'general' }))
+  ok(injectLog.length === 0, 'collab_board 的 op=read 参数不含路径 -> 无候选自然不通知（不是被跳过）', 'injects=' + injectLog.length)
+  ok((h.readState().claims[0].readers || []).length === 0, '它们也都不登记 reader', JSON.stringify(h.readState().claims[0].readers))
+
+  // 正例（**证明修复没有把功能整个关掉**）：真正的写触碰同一路径仍然通知 + 反向登记。
+  await h.post(execOf('write', { file_path: 'src/own/1' }))
+  ok(injectLog.length === 1, 'write 触碰同一路径仍然产生访问通知', 'injects=' + injectLog.length)
+  ok((h.readState().claims[0].readers || []).includes(ME_HOLDER), '并且仍然把自己反向登记为 reader', JSON.stringify(h.readState().claims[0].readers))
+  ok(noticeText(injectLog[0]).includes('src/own/2'), '通知点出的正是被占路径', JSON.stringify(noticeText(injectLog[0]).slice(0, 40)))
+}
+
 console.log('# A: 去重键是 per-agent 的 accessSignature —— 占用集合一变就再投一条（新载体没有 TTL）')
 {
   const a1 = mkClaim({ claimId: 'c_one', holderId: 'agent:other', holderName: 'Other Session', paths: ['src/a/2'], expiresAt: Date.now() + HOUR })
@@ -589,6 +621,7 @@ console.log('# C: 写/改被他人活跃声明覆盖时 ask')
   const reason = String(write.decision.reason || '')
   ok(reason.includes('Other Session'), 'reason 含持有者', reason)
   ok(reason.includes('src/a/1'), 'reason 含目标路径', reason)
+  ok(reason.includes('（独占）'), 'reason 用中文模式标签（W9 文案中文化；数据取值仍是 exclusive）', reason)
   ok(/\d{2}-\d{2} \d{2}:\d{2}Z–\d{2}-\d{2} \d{2}:\d{2}Z/.test(reason), 'reason 含绝对 UTC 租约窗口', reason)
   ok(!/剩\s*\d+\s*分/.test(reason), 'reason 不含倒计时', reason)
 

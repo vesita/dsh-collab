@@ -55,7 +55,7 @@
   `sessionIdOf()` 有解析能力，但只用于推送（`src/spec.ts:129`）。
 - **场景**：会话标题是提示词首段（子代理都是这样），或形如默认名时，去看 `list`/`overview` 决定找谁协商。
 - **一手**：本次会话的运行时提示字面渲染成
-  `…其他会话当前占用：你是一个子代理，在**隔离的 g（exclusive）占用 tests/ .github/…`
+  `…其他会话当前占用：你是一个子代理，在**隔离的 g（独占）占用 tests/ .github/…`
   —— 那个"名字"是子代理提示词的开头被截断的残段，**无法用于辨认是谁**。
 - **机制（已实测）**：`holderName` 来自**会话标题**，标题由 `@deepseek-ai/dsh-session-title-first-prompt-llm`
   从**首条人类消息**生成（DSH 配置：`targetCjkCharacters: 10` / `fallbackMaxBytes: 40` / `maxTitleBytes: 80`），
@@ -63,8 +63,8 @@
 - **已经可以缓解（零代码，实测有效）**：父 AI 把委派 prompt 的**第一行写成短标签**即可。
   对照实验（同一个路径，只改 prompt 首行）：
   ```
-  改前：你是一个子代理，在**主检出**（exclusive）占用 src/store.ts …
-  改后：【身份探针A7】 上面那一行（`（read）占用 dsh-collab/ …
+  改前：你是一个子代理，在**主检出**（独占）占用 src/store.ts …
+  改后：【身份探针A7】 上面那一行（`（只读）占用 dsh-collab/ …
   ```
   `claim` / `overview` / `release` **三条路径返回的 `holderName` 完全一致**，均为 `【身份探针A7】 …`。
   已写进 skill（§3.4）：标签 ≤ 约 40 字节（CJK ≈ 13 字），带括号以便看出截断边界。
@@ -141,8 +141,9 @@
 
 ### 2.12 通知可达性只对释放者透明，对读者完全不可见【实测】
 
-- **依据**：`notify` 汇总是给释放者的（`src/push.ts:289`）；`not-live` 绝不唤醒（`:1201-1204`）；
-  `not-adjacent`（`:1232`）；`agents` 服务缺失时 `isLiveSession` 恒 false ⇒ 落 `prompt-failed/no-session-controller`（`:595-599`）。
+- **依据**：`notify` 汇总是给释放者的（`src/push.ts:196`）；`not-live` 绝不唤醒（`:231-234`）；
+  `agents` 服务缺失时整条通道不可用 ⇒ 落 `inject-failed/no-agents-service`（`:217-226`）；
+  0.9.6 起投递面只有 `agent.inject` 一条，解析不到读者记 `agent-not-resolvable`（`:146-163`、`:255-260`）。
 - **后果**：读者永远不知道自己**没被通知到**（README 明说冷会话直接丢弃）。这是刻意设计，
   但读者侧没有任何「我可能收不到」的提示。
 - **优化方向**：在 claim / 访问通知的返回里说明这条订阅是 best-effort，并建议用 `collab_board` 留一手。
@@ -182,13 +183,13 @@
 ### 2.17 `collab_board` 漏传 `op` 时，报错读不出「你漏了 op」【实测·已复现于 0.9.0】
 
 - **依据**：`src/tools.ts` 的 `boardHandler` 在 `op` 既非 `'read'` 也非 `'post'` 时返回
-  `bad-request` + `unknown op: <值>`。而 `op` 是 schema 的 `required: ["op"]`。
+  `bad-request` + `未知操作：<值>`。而 `op` 是 schema 的 `required: ["op"]`。
 - **复现（0.9.0，隔离副本）**：
   ```
   board.parameters.required = ["op"]
-  {"ok":false,"error":"bad-request","message":"unknown op: undefined"}
+  {"ok":false,"error":"bad-request","message":"未知操作：undefined"}
   ```
-- **后果**：错误信息**不含"缺 op"**这个事实；调用方（模型）看到 `unknown op: undefined` 很难反推
+- **后果**：错误信息**不含"缺 op"**这个事实；调用方（模型）看到 `未知操作：undefined` 很难反推
   是漏了参数还是传错了值。会话记录里有 2 次（占全部 81 次调用的 2.5%）因此**把几百字正文重发了一遍**。
 - **优化方向**：`op` 缺失时单独给一条 `missing op (one of: post, read)`，与"传了非法值"区分开。
 
@@ -204,6 +205,28 @@
   真实出现（`released: []` 且 `ok` 为真），随后该会话又手写重试了一次。
 - **优化方向**：`released` 为空时给 `ok: true` 但带 `warning`（或改判 `not-found`），并在文案里
   指出「没有任何声明匹配这些路径」。
+
+### 2.19 僵尸声明只能等租约（最长 24h）或手工清状态文件【实测·0.9.8 已解决】
+
+- **原始实测记录（2026-09-13 深夜，保留不改）**：一个子代理会话（W10）被**强杀**（dsh 重启），
+  它持有的 `src/` + `tests/` exclusive 声明**留了下来**。尝试由其他会话回收时得到：
+  ```
+  collab_lock op=release (paths=[...])
+  -> {"ok":false,"error":"forbidden","message":"only holder can release"}
+  ```
+  而租约 `ttlSec` 最长可到 `86400` 秒 ⇒ **最长 24 小时内，任何其他会话对这些路径的写入都会被
+  写门控硬拒绝**（本部署审批被禁用，`ask` 即 `deny`）。当时主 AI 只能**手工改状态文件**
+  （`~/.dsh/collab/projects/*.json`）才解开。
+- **为什么不能自动清**：`agents.get()/agents.list()` 对**休眠但可唤回**的会话同样返回
+  undefined/缺席（实测活进程 `agents.list()` 只有 2 个 agent，`sessionController.list()` 有 224 个
+  会话）。按它自动回收 = 把"只是空闲"判成"已死"，而 0.8.2 已经因此静默丢过通知、W7 又禁止
+  `agent/disposed` 提前释放未到期声明。运行时注册表**无法区分**"休眠可唤回"与"真死"。
+- **解决（0.9.8）**：新增**显式** `collab_lock op=reap`，默认 dry-run（只列候选、绝不改状态），
+  `confirm: true` 才删除；候选须同时满足「未过期 / holder 不在 `agents.list()` / 不是自己 /
+  age 严格大于 `olderThanSec`（默认 600s）」并可 `paths` 限定；`human:console` 无活体信号一律不收；
+  活体检查跑不成时一个也不收。**绝不自动触发**（不进 `sweep()`/读路径/定时器/`agent/disposed`）。
+  回收后复用功能 D 的 `notifyReaders` 通知读者。负向对照见 `tests/collab-reap.mjs`：
+  临时去掉活体检查一行 → 「活着的 holder 的声明被误删」立即红。
 
 ---
 
@@ -285,17 +308,18 @@
 | 取舍 | 依据 | 使用者应知道 |
 |---|---|---|
 | 锁是**建议性**的，不是强制隔离 | 只有模型工具走门控 | 别把它当沙箱 |
-| **绝不唤醒冷会话** | `src/push.ts:330-331` | 释放通知可能永远送不到；`notify.skipped` 会如实记录 |
+| **绝不唤醒冷会话** | `src/push.ts:231-239` | 释放通知可能永远送不到；`notify.skipped` 会如实记录（`not-live` / `agent-not-resolvable`） |
 | `read`/`shared` 不参与门控 | `src/gate.ts:62` | 想真保护就用 `exclusive` |
-| 子代理投递要求**邻接** | `src/push.ts:185` | 跨父会话的子代理读者收不到，记 `not-adjacent` |
-| `agent/disposed` 自动释放**不通知**子代理读者 | 该时刻没有活着的 sender | 依赖它兜底的人可能一直等 |
+| （0.9.6 已删）子代理投递**邻接**约束 | 旧 `src/push.ts` 的 `subagents.sendMessage` 回退通道（已整体删除） | 0.9.6 起投递面只有 `agent.inject`：跨父会话的子代理读者只要能解析到**自己的活 agent** 就收到，**不再要求邻接**；解析不到记 `agent-not-resolvable` |
+| **`agent/disposed` 不再提前释放未到期声明** | 0.9.6 起租约 `expiresAt` 是声明生命周期的唯一权威 | 会话死亡后声明会占用到租约到期，期间他人只能 `wait` 或 `board` 协商；`heartbeat` 是唯一续租方式。被回收的**已过期**声明仍会走 `notify`（旧行为是 dispose 即释放，且当时没有活着的 sender 就不通知子代理读者） |
+| **僵尸声明回收只由显式 `op=reap` 驱动，绝不自动** | 0.9.8；`agents.list()` 无法区分"休眠可唤回"与"真死"（0.8.2/W7 的教训），误杀代价不对称 | 被强杀的会话留下的未到期声明不会自己消失：先 `op=reap` 看候选（dry-run），确认后用 `confirm:true` 回收。要自己死后的锁立刻释放，仍应在结束前显式 `release` |
 | 本部署 `ask` = 硬拒绝 | 审批提示被禁用 | `ask` 决策在这里等价于 `deny` |
 | **访问通知依赖 `agent.inject`，拿不到带 `inject` 的 Agent 就不投递** | `src/access.ts`；`inject` 的契约见 `dsh-agent/lib/types/runtime-types.d.ts:209` | 受限宿主里访问通知会静默消失（写保护仍在）。**绝不退回"自己造一条消息"** —— 那是规范要挡的 |
 | **`dsh-persona` 的 `includeRuntimeContext=false` 会让态势摘要与纪律块消失** | 该开关调 `systemPrompt.suppressRuntimeContext()`（`dsh-persona/lib/index.js:47`），对所有 scope 的所有 context 段生效 | 关掉它等于关掉协作**可见性**（访问通知不受影响 —— 它是消息，不是上下文段）；插件侧无法绕过 |
 | **态势段（order 130）与纪律段（order 131）是我们自选的号，不在 DSH 注册表里** | DSH 的 `CONTEXT_ORDERS` 只有 `SANDBOX_POLICY=110 / APPROVAL_POLICY=115 / SUBAGENT_DELEGATION=120`（`dsh-system-prompt/lib/index.js:43-47`），别的插件都走 `getContextOrder(名)` | 排序冲突无人仲裁：DSH 若新增段占用 130 区段，会出现顺序不确定。**自选 order 是权宜**，DSH 一旦给出登记入口就该改过去 |
 | **`DSH_COLLAB_NO_PROMPT_HINT=1` 也关掉访问通知** | `src/access.ts` 的 `NOTICE_ENABLED`；契约见 `src/awareness.ts:34` 与 `src/delegation.ts:90` | 这是**有意**的：总开关的契约是"关掉所有运行时注入的内容"，而访问通知正是运行时状态派生再注入进会话的。只关投递，读者反向登记（功能 D）照常。换载体（上下文段 → `agent.inject`）时**特意保留**了这条语义，没有顺手改掉 |
 | **`form:'notice'` 必须带非空 `summary`，否则渲染退化成 opaque** | `dsh-client-ui-chat/lib/client.js:795-800`（`case "notice"` 先算 `noticeSummary`，为 null 即 opaque） | 我们这条由 `boundContextSummary` 保证；但**DSH 自家有翻车的**：`dsh-tool-cordis` 与 `dsh-tool-skill` 声明 `form:'instructions'` 却没给 `changes`，实际是 opaque 行 |
-| **释放推送在 GUI 里以"用户气泡"呈现**，与真人输入不可区分 | `sessionController.prompt` 由 **DSH** 把消息落库为 `source{kind:'user', rpcId}`（`dsh-api-session-controller`），客户端第一道判据是 `source.kind !== 'user' → context 节点`，否则按 `steering`/`user` 渲染（`dsh-client-ui-chat/lib/client.js:6047-6070`）。**实测**：本会话 42 条 `kind:'user'` 里有 1 条是 `[dsh-collab] …已释放…` | 插件**无法改变**：这条消息不是它构造的，来源是 DSH 盖的 `kind:'user'`；跨会话又只有 `sessionController.prompt`（就是它盖的）与 `subagents.sendMessage`（只认邻接）两条路。`subagents.sendMessage` 走 `agent-message/relay`，渲染成 relay 行 —— 但它只认邻接，不能当通用主通道。⇒ 想要观感一致，得 DSH 在 UI 侧按 `rpcId` 区分来源 |
+| **释放推送在 GUI 里以"用户气泡"呈现**（旧 `sessionController.prompt` 通道）—— **0.9.6 已解决** | 旧通道由 **DSH** 把消息落库为 `source{kind:'user', rpcId}`（`dsh-api-session-controller`），客户端第一道判据是 `source.kind !== 'user' → context 节点`，否则按 `steering`/`user` 渲染（`dsh-client-ui-chat/lib/client.js:6047-6070`）。**实测**：本会话 42 条 `kind:'user'` 里有 1 条是 `[dsh-collab] …已释放…` | **0.9.6 起插件自造消息 + `agent.inject`**：`createUserMessage({ source: { kind:'plugin', plugin:'dsh-collab', form:'notice', summary: boundContextSummary(…) } })`，来源显式 `plugin/notice`，GUI 里渲染成**独立 notice 行、不是气泡**（`client.js:6058` 的 `source.kind` 分流、`:795-800` 的 `form:'notice'`）。旧结论"插件**无法改变**来源、得 DSH 在 UI 侧按 rpcId 区分"已被推翻 —— 不再需要 DSH 侧改动 |
 
 ---
 

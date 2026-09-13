@@ -5,7 +5,7 @@
 // prefs.enforceWriteLockEnabled() 每次调用都重新结算，用户在设置里一改即可生效。
 // 门控自身故障一律放行（插件的问题不该锁死整个工具面）。
 
-import { claimsCovering, relToProject, isReadable, clockUtc } from './collab-core.js'
+import { claimsCovering, relToProject, isReadable, clockUtc, modeLabel } from './collab-core.js'
 import type { Claim } from './collab-core.js'
 import { pathArgsFor } from './spec.js'
 import type { CollabContext } from './contract.js'
@@ -24,7 +24,7 @@ export function installGate(ctx: CollabContext, store: StateStore, prefs: GatePr
     const start = clockUtc(typeof c.createdAt === 'number' ? c.createdAt : c.expiresAt - (c.ttlSec || 0) * 1000)
     const who = c.holderName || c.holderId
     const what = kind === 'write' ? '写入' : '读取（对方已声明不可读）'
-    return '[dsh-collab] ' + target + ' 由 ' + who + ' 占用（' + c.mode + '）：非持有者' + what +
+    return '[dsh-collab] ' + target + ' 由 ' + who + ' 占用（' + modeLabel(c.mode) + '）：非持有者' + what +
       '需要先协商。租约 ' + start + '–' + clockUtc(c.expiresAt) + '。先 collab_lock op=wait 或 collab_board 协商，或改用其他路径。'
   }
 

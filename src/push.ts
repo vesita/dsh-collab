@@ -1,40 +1,62 @@
 // src/push.ts
-// **功能 D：释放后的原生推送**（sessionController.prompt）**与子代理投递回退通道**
-// （subagents.sendMessage，0.8.4），以及"会话结束即摘除读者"的生命周期钩子。
+// **功能 D：释放后的通知投递 —— 逐事件经 `agent.inject` 投一条显式来源的 notice**，
+// 以及"会话结束即摘除读者"的生命周期钩子。
+//
+// 为什么换掉旧通道（0.8.4 的 `sessionController.prompt` 与 `subagents.sendMessage` 已删除）：
+//   两个 API 都**只收 content**，消息由宿主代造，宿主写死 `source: { kind: 'user', rpcId: 'dsh-collab-…' }`
+//   —— 实测转录里就是 `user/message` + `kind:'user'`，在 GUI 里渲染成**用户气泡**
+//   （落进 next-step 收件箱还会升级成 steering 气泡，与真人输入共用同一个 UserStyleBubble 渲染器）。
+//   这直接违反 AGENTS.md §1「严禁冒充用户」。旧注释里"插件无法改变来源"的结论是错的：
+//   自己构造消息（来源显式非 user）再 `agent.inject` 就能既投出去又不冒充。
+//
+// 现在的投递面**只有一个**：
+//   1) 在**本进程内**解析目标 agent —— `ctx.get('agents')` 的 `get(id: SessionId): Agent | undefined`；
+//   2) 解析到就 `agent.inject(msg)`（契约 `inject(message: UserMessage): void`，
+//      `dsh-agent/lib/types/runtime-types.d.ts:209`；实现是
+//      `send(message, "next-step", wakeup=false)`，`dsh-agent-loop/lib/index.js:795`
+//      —— 进入下一步但**不唤醒** driver，不打断对方回合）；
+//   3) 解析不到就**如实跳过**（`skipped.reason = 'agent-not-resolvable'`），
+//      **绝不回退**到任何会冒充用户的通道。
+//
+// 消息由**真实的** `@deepseek-ai/dsh-llm`（peer + dev 依赖）构造，source 显式非 user：
+//   { kind: 'plugin', plugin: 'dsh-collab', form: 'notice', summary: boundContextSummary(…) }
+// 客户端的分流**只看 `source.kind`**，且发生在收件箱分类**之前**
+// （`dsh-client-ui-chat/lib/client.js:6058`）：`kind==='plugin'` + `form:'notice'` + **非空 summary**
+// ⇒ 渲染成独立可折叠的 `ContextInjectionRow`，**无论投进哪个收件箱都不是气泡**。
+// `summary` 必须非空，否则会退化成 opaque 行（`client.js:795-800`）；120 字符上限由
+// `boundContextSummary` 保证。**不许**手抄构造函数副本（AGENTS.md 明令）。
 //
 // 依赖：状态存取面（store）—— 存活闸门 livenessOf / 状态改写 mutate / 显示名 hname。
 // 对外只暴露 notifyReaders：tools.ts 在 release 后调用它，agent/disposed 钩子也在本模块内。
 
-import { randomUUID } from 'node:crypto'
-import { readersOf, dropHolder } from './collab-core.js'
+import { boundContextSummary, createUserMessage } from '@deepseek-ai/dsh-llm'
+import { readersOf, dropHolder, modeLabel } from './collab-core.js'
 import type { PublishedClaim } from './collab-core.js'
-import { sessionIdOf, SUBAGENT_ROUTING_REASON, SUBAGENT_ROUTING_MESSAGES } from './spec.js'
+import { sessionIdOf } from './spec.js'
 import type {
-  AgentLike, CollabContext, NotifyOutcome, PushChannel, PushOutcome,
-  SessionControllerService, SubagentSenderLike, SubagentsService
+  AgentLike, AgentsLookupService, CollabContext, NotifyOutcome, PushChannel, PushOutcome
 } from './contract.js'
 import type { StateStore } from './store.js'
 
 /** 推送面：installPush() 对外暴露的东西（tools.ts 用它挂 release 后的通知）。 */
 export interface PushApi {
-  /** 向受影响的读者推送"锁已释放"，并把结果带回来（绝不抛）。 */
+  /** 向受影响的读者推送"锁已释放"（或 op=reap 的"占用已被回收"），并把结果带回来（绝不抛）。 */
   notifyReaders(
     released: PublishedClaim[],
     releaserHolderId: string,
     releaserName: string,
-    releaserAgent?: AgentLike
+    releaserAgent?: AgentLike,
+    action?: 'release' | 'reap'
   ): Promise<NotifyOutcome>
 }
 
 export function installPush(ctx: CollabContext, store: StateStore): PushApi {
-  // ---- 功能 D：释放后的原生推送（sessionController.prompt） ----
-  //      0.8.4 追加**子代理投递回退通道**（subagents.sendMessage）：当读者是"由 subagent
-  //      路由托管的会话"时，原生 prompt 会被 DSH 结构性地拒绝，而 DSH 自己在错误里
-  //      指示"改用 subagent 投递"（见 isSubagentRoutingRejection 的三条源码依据）。
+  // ---- 功能 D：释放后的通知投递（agent.inject + form:'notice'）----
+  // 0.8.4 的两条通道（sessionController.prompt / subagents.sendMessage）**整体删除**：
+  // 它们是"宿主代造消息"的接口，来源由宿主写成 kind:'user'，冒充真人输入。
 
-  // 0.8.4：通道名（notify.pushedVia[].channel 用）。
-  const CHANNEL_PROMPT: PushChannel = 'session-controller'
-  const CHANNEL_SUBAGENT: PushChannel = 'subagents'
+  // 通道名（notify.pushedVia[].channel 用）：**只剩一个**，投递面就是 agent.inject。
+  const CHANNEL_INJECT: PushChannel = 'inject'
 
   // 同一 (claimId, reader) 只推一次。
   // 用 claimId -> Set<reader> 的两级结构，**不**把两者拼成一个字符串：claimId 由插件生成、
@@ -45,7 +67,6 @@ export function installPush(ctx: CollabContext, store: StateStore): PushApi {
   const pushedPairs = new Map<string, Set<string>>()
   const pushedOrder: Array<{ claimId: string; reader: string }> = []
   const PUSH_DEDUPE_MAX = 2000
-  const PUSH_TIMEOUT_MS = 3000
 
   /** 标记"这一对已推过"；返回 false 表示已经推过，跳过。 */
   function markPushed(claimId: string, reader: string): boolean {
@@ -68,56 +89,88 @@ export function installPush(ctx: CollabContext, store: StateStore): PushApi {
     return true
   }
 
-  /** 释放通知文案（一次性推送，不需要时间稳定性，故不掺时刻）。 */
-  function releaseNotice(c: PublishedClaim, releaserName: string): string {
+  /**
+   * 释放通知的**两段文案**（一次性推送，不需要时间稳定性，故不掺时刻）：
+   *   - `text`    = 模型可见全文（进 content）；
+   *   - `summary` = 折叠态的一句话账目（进 source.summary，**非空**是硬要求）。
+   * 两者同源，绝不各写一份 —— summary 与正文漂移就等于折叠态在说谎。
+   *
+   * `action`（0.9.8）：op=reap 复用同一条投递面时，文案必须说**回收**而不是"释放"——
+   * 回收者并不是被回收声明的持有者，照抄"X 已释放"会让读者以为 X 才是锁的主人（来源诚实
+   * 不止 `source.kind`，正文也不能替数据撒谎）。两条文案共用同一个 `shown/mode` 组装。
+   */
+  function releaseNoticeParts(c: PublishedClaim, releaserName: string, action: 'release' | 'reap' = 'release'): { text: string; summary: string } {
     const paths = Array.isArray(c.paths) ? c.paths : []
     const shown = paths.slice(0, 3).join(' ') + (paths.length > 3 ? ' 等 ' + paths.length + ' 条' : '')
-    return '[dsh-collab] ' + releaserName + ' 已释放 ' + shown + '（' + c.mode + '）。' +
+    if (action === 'reap') {
+      const holder = c.holderName || c.holderId
+      const text = '[dsh-collab] 会话 ' + releaserName + ' 回收了 ' + holder + ' 的僵尸声明 ' + shown +
+        '（' + modeLabel(c.mode) + '）。你此前被登记为它的读者，这些路径不再由该会话占用。'
+      const summary = boundContextSummary('collab 锁已回收 · ' + shown)
+      return { text, summary }
+    }
+    const text = '[dsh-collab] ' + releaserName + ' 已释放 ' + shown + '（' + modeLabel(c.mode) + '）。' +
       '你此前被登记为它的读者，这些路径不再由该会话占用。'
+    // boundContextSummary 截到 120 字符（CONTEXT_SUMMARY_MAX_CHARS，dsh-llm/lib/index.js:15-22）。
+    const summary = boundContextSummary('collab 锁已释放 · ' + releaserName + ' · ' + shown)
+    return { text, summary }
   }
 
-  /** 单条推送：mode 由"会话是否在跑"决定（SessionSummary.running），判定不了就用 'queue'。 */
-  async function pushOne(controller: SessionControllerService, sessionId: string, text: string): Promise<PushOutcome> {
-    let mode: 'queue' | 'steer' = 'queue'
-    try {
-      if (typeof controller.list === 'function') {
-        const ac = new AbortController()
-        const listed = await controller.list({}, ac.signal)
-        const row = listed && Array.isArray(listed.items) ? listed.items.find(x => x && x.sessionId === sessionId) : null
-        if (row && row.running === true) mode = 'steer'
+  /**
+   * 释放通知消息：**显式标注来源的 notice**（AGENTS.md §1 允许且要求的形态）。
+   * `form: 'notice'` 必须带非空 `summary`，否则客户端会把它退化成 opaque 行
+   * （`dsh-client-ui-chat/lib/client.js:795-800` 的 `case "notice"` 先算 `noticeSummary`）。
+   * role / id / 深冻结全部由真实的构造函数补，本仓库不自造。
+   */
+  function releaseNoticeMessage(parts: { text: string; summary: string }) {
+    return createUserMessage({
+      content: [{ type: 'text' as const, text: parts.text }],
+      source: {
+        kind: 'plugin' as const,
+        plugin: 'dsh-collab',
+        form: 'notice' as const,
+        summary: parts.summary
       }
-    } catch (e) {
-      mode = 'queue' // 判定不确定 → queue（安全侧：不会打断对方当前回合）
-    }
-    const ac = new AbortController()
-    // 把**真实结果**带回来：0.8.2 用 `.then(() => undefined, () => undefined)` 抹平了错误，
-    // 于是"没有人需要通知"和"通知通道坏了"在返回值上长得一模一样（这正是本次要修的观测盲区）。
-    const attempt = Promise.resolve()
-      .then(() => controller.prompt({
-        requestId: 'dsh-collab-' + randomUUID(),
-        sessionId,
-        mode,
-        content: [{ type: 'text', text }]
-      }, ac.signal))
-      .then(
-        () => ({ ok: true }) as PushOutcome,
-        (e) => {
-          // 0.8.4：在**这里**就把"子代理路由托管"这个结构化判据留在返回值上，
-          // 调用方（notifyReaders）据此决定要不要走回退 —— 不需要再去解析 error 文本。
-          const fail: { ok: false; error: string; subagentRouting?: true } = { ok: false, error: describeError(e) }
-          if (isSubagentRoutingRejection(e)) fail.subagentRouting = true
-          return fail as PushOutcome
-        }
-      )
-    // 超时与"prompt 真的返回失败"必须可区分：超时用 error === 'timeout' 标记。
-    const guard = ctx.timer.timeout(PUSH_TIMEOUT_MS).then(() => {
-      try { ac.abort() } catch (e) {}
-      return { ok: false, error: 'timeout' } as PushOutcome
     })
+  }
+
+  /**
+   * 单条投递（0.9.6）：**先在进程内解析目标 agent**，解析到就 inject 一条显式来源的 notice。
+   *
+   * 返回**真实结果**，绝不抛（推送失败只影响通知本身）：
+   *   - `{ ok: false, error: 'agent-not-resolvable' }` = 存活判据说"活着"，但此刻
+   *     `agents.get(sessionId)` 已经解析不到（两判据之间的 TOCTOU 竞态，或宿主换了注册表）
+   *     —— **如实跳过**，这里**没有**任何回退通道（旧实现会掉头去 prompt / sendMessage，
+   *     那正是冒充用户的来源）；
+   *   - `{ ok: false, error: 'agent-has-no-inject' }` = 解析到的对象没有 inject 面
+   *     （受限宿主）；同样只跳过，不另找通道；
+   *   - 其它文本 = `agents.get` 或 `inject` 自己抛出的真实错误（不抹平成 undefined）。
+   *
+   * **为什么没有"超时"这一态**：`inject` 的契约是**同步**的
+   * （`dsh-agent/lib/types/runtime-types.d.ts:209` 的 `inject(message: UserMessage): void`；
+   *  实现 `dsh-agent-loop/lib/index.js:795` 只是把消息 splice 进收件箱并返回），
+   * 同步调用要么正常返回、要么当场抛 —— 不存在"永不 resolve"的窗口，故不再有超时护栏，
+   * 也不再用 `() => undefined` 之类抹平错误的写法。失败与成功仍**必须**从返回值上可区分。
+   *
+   * AgentLike.inject 的形参在 contract 里写 `unknown`（不让 contract 依赖 dsh-llm 的类型），
+   * 这里传的是货真价实的 `UserMessage`。
+   */
+  function pushOne(agents: AgentsLookupService, sessionId: string, parts: { text: string; summary: string }): PushOutcome {
+    let agent: AgentLike | undefined
     try {
-      return await Promise.race([attempt, guard])
+      agent = agents.get(sessionId)
     } catch (e) {
-      return { ok: false, error: describeError(e) } // 绝不冒泡：推送失败只影响通知本身
+      return { ok: false, error: describeError(e) }
+    }
+    if (!agent) return { ok: false, error: 'agent-not-resolvable', notResolvable: true }
+    try {
+      // 取一次 inject 面并当场校验：受限宿主可能给不出它（只跳过，不另找通道）。
+      const inject = agent.inject
+      if (typeof inject !== 'function') return { ok: false, error: 'agent-has-no-inject' }
+      agent.inject(releaseNoticeMessage(parts))
+      return { ok: true }
+    } catch (e) {
+      return { ok: false, error: describeError(e) }
     }
   }
 
@@ -132,159 +185,26 @@ export function installPush(ctx: CollabContext, store: StateStore): PushApi {
     }
   }
 
-  /** 结构化读一个抛出物的 code / message / details.reason（跨 realm 也不依赖 instanceof）。 */
-  function errorFields(e: unknown): { code: string; message: string; reason: string } {
-    const err = (e && typeof e === 'object' ? e : null) as
-      | { code?: unknown; message?: unknown; details?: unknown }
-      | null
-    const code = err && typeof err.code === 'string' ? err.code : ''
-    const message = err && typeof err.message === 'string' ? err.message : ''
-    let reason = ''
-    try {
-      const d = err && err.details
-      if (d && typeof d === 'object' && typeof (d as { reason?: unknown }).reason === 'string') {
-        reason = (d as { reason: string }).reason
-      }
-    } catch (e2) {}
-    return { code, message, reason }
-  }
-
   /**
-   * "该会话由子代理路由托管"这一条的**稳定判据**（0.8.4）。
-   *
-   * 为什么不能只看 `code === 'session/agent-busy'`：这个 code 在 DSH 里**不止一处**抛出，
-   * 逐条源码依据（/usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-api-session-controller/lib/index.js）：
-   *   - :137  `session "…" is owned by subagent routing`
-   *            details { reason: 'use subagent delivery for this child session' }  ← 本插件要认的那条
-   *   - :785  `prompt rejected`，details { reason: String(error) }
-   *            ← **普通投递失败**也复用了同一个 code，这时走回退毫无意义（目标根本不是子代理子会话）
-   *   - :1578 `subagent Sessions require their durable parent address`
-   *            details { reason: 'use subagent delivery for this child session' }  ← 同属路由托管，回退同样正确
-   * 而 `RemoteErrorDetailsMap['session/agent-busy'] = { readonly reason: string }`
-   * （dsh-typert-protocol/lib/types/remote-error.d.ts 生成物，见 :1637 的声明串），
-   * 所以判据做成**结构优先的两段式**：
-   *   1) code === 'session/agent-busy'（结构化，绝不解析裸字符串当主判据）；
-   *   2) details.reason === 'use subagent delivery for this child session'（结构化、稳定、由 DSH 自己给出）。
-   * details 若在某个边界上丢失（宿主内它随实例重建，见 remote-error.js 的构造函数），
-   * 再退一步比对 message 里两条**由 DSH 自己写死**的诊断串；两者都不会被普通
-   * 'prompt rejected' 命中 —— 于是"别处也可能出现的 session/agent-busy"被安全排除：
-   * 认不出就**不回退**（宁可少一次回退，也不把无关错误拿去做一次语义不同的投递）。
-   */
-  function isSubagentRoutingRejection(e: unknown): boolean {
-    try {
-      const { code, message, reason } = errorFields(e)
-      if (code !== 'session/agent-busy') return false
-      if (reason === SUBAGENT_ROUTING_REASON) return true
-      return SUBAGENT_ROUTING_MESSAGES.some(s => message.includes(s))
-    } catch (e2) {
-      return false
-    }
-  }
-
-  /**
-   * 回退失败的分类（0.8.4）：只有**邻接前提不成立**才算 not-adjacent。
-   * 依据 @deepseek-ai/dsh-subagent/lib/index.js 抛出的 SubagentError.code（HarnessError，code 是普通字段）：
-   *   - :1742 UNAUTHORIZED `agent "X" is not a resident continuable child and cannot send to parent "Y"`
-   *   - :967/:968 UNAUTHORIZED `… delivery requires the exact live parent agent` /
-   *              `… belongs to another parent session`（:1887 coldResume → authorizeLineage 也走这里）
-   *   - :1834/:1844 PARENT_UNAVAILABLE 直接父会话不活
-   *   - :1883/:1889 NOT_RESUMABLE 目标不是可续子会话
-   * **刻意排除** :1735 的 UNAUTHORIZED `message delivery requires the exact live sender agent`
-   * —— 那是"发送者已不是活 Agent"，不是邻接问题，谎报成 not-adjacent 会误导排查方向，
-   * 归入泛化的 subagent-failed。
-   */
-  function isNonAdjacentRejection(e: unknown): boolean {
-    try {
-      const { code, message } = errorFields(e)
-      if (code === 'PARENT_UNAVAILABLE' || code === 'NOT_RESUMABLE') return true
-      if (code !== 'UNAUTHORIZED') return false
-      if (message.includes('not a resident continuable child')) return true
-      if (message.includes('belongs to another parent session')) return true
-      if (message.includes('delivery requires the exact live parent agent')) return true
-      return false
-    } catch (e2) {
-      return false
-    }
-  }
-
-  /**
-   * 回退通道本身（0.8.4）：把同一条通知经 `ctx.subagents.sendMessage` 投给读者。
-   * 契约（Inspect 实查 + 源码核对，见 SubagentsService 注释）：
-   *   - sender 必须是该会话的**活 Agent**（这里是释放者的 `exec.agent`，**原对象**，不重建）；
-   *   - 只能投给 sender 的直接父会话或直接可续子会话 —— 邻接是硬约束；
-   *   - `signal` 用自建 AbortController；超时护栏与 prompt 通道同一套（PUSH_TIMEOUT_MS）。
-   * 与 pushOne 一样绝不抛出：失败只体现为 skipped 里的 reason/error。
-   */
-  async function pushViaSubagents(
-    subagents: SubagentsService,
-    sender: SubagentSenderLike,
-    sessionId: string,
-    text: string
-  ): Promise<PushOutcome> {
-    const ac = new AbortController()
-    const attempt = Promise.resolve()
-      .then(() => subagents.sendMessage(sender, sessionId, [{ type: 'text', text }], { signal: ac.signal }))
-      .then(
-        () => ({ ok: true }) as PushOutcome,
-        (e) => {
-          const fail: { ok: false; error: string; notAdjacent?: true } = { ok: false, error: describeError(e) }
-          if (isNonAdjacentRejection(e)) fail.notAdjacent = true
-          return fail as PushOutcome
-        }
-      )
-    const guard = ctx.timer.timeout(PUSH_TIMEOUT_MS).then(() => {
-      try { ac.abort() } catch (e) {}
-      return { ok: false, error: 'timeout' } as PushOutcome
-    })
-    try {
-      return await Promise.race([attempt, guard])
-    } catch (e) {
-      return { ok: false, error: describeError(e) }
-    }
-  }
-
-  /**
-   * 回退通道的**前置闸**：拿不到释放者的活 Agent、或 `subagents` 服务不可用时，
-   * 一次 `sendMessage` 都不发，直接以失败返回（调用方按 skipped 记账）。
-   * 理由：`sendMessage` 的 sender 必须是 "exact live Agent"，用一个来路不明的 sender
-   * 去尝试投递既不会成功，也可能命中"不存在的直接子会话 → cold-resume"那条副作用路径。
-   * 安全侧：能不投就不投。
-   */
-  async function pushViaSubagentsIfPossible(
-    subagents: SubagentsService | undefined,
-    sender: SubagentSenderLike | undefined,
-    sessionId: string,
-    text: string
-  ): Promise<PushOutcome> {
-    if (!subagents || typeof subagents.sendMessage !== 'function') {
-      return { ok: false, error: 'no-subagents-service' }
-    }
-    if (!sender) return { ok: false, error: 'no-live-sender-agent' }
-    return pushViaSubagents(subagents, sender, sessionId, text)
-  }
-
-  /**
-   * 向受影响的读者推送"锁已释放"，并**把结果带回来**（0.8.3 的可观测性修复）。
-   * 硬约束（安全，全部保留，0.8.4 的回退通道**一条都没有放宽**）：
-   *   - 只推给 `agents.get(sessionId)` 此刻**活着**的会话；冷会话**直接丢弃**，
-   *     因为 prompt 的文档写明它会 "explicitly resuming its Session"，唤醒冷会话是不可接受的副作用；
-   *     回退通道（`subagents.sendMessage`）的文档同样写明 "an absent direct child cold-resumes
-   *     from persistence"，所以这道闸门**在两个通道之前**统一判定，回退一次都不会绕过它；
-   *   - 排除释放者自己；同一 (claimId, reader) 只推一次（幂等键不变，回退成功也照样记账）；
+   * 向受影响的读者推送"锁已释放"，并**把结果带回来**（0.8.3 起的可观测性约定）。
+   * 硬约束（安全）：
+   *   - 只推给 `agents.get(sessionId)` 此刻**活着**的会话；冷会话**直接丢弃**；
+   *     `agent.inject` 对未加载的会话**不可能**投递（注册表里根本没有它，解析即失败），
+   *     所以"不唤醒冷会话"这条在**通道本身**上就成立了 —— 不再依赖旧 prompt 的文档约束；
+   *   - 排除释放者自己；同一 (claimId, reader) 只推一次（幂等键不变）；
    *   - 全部 best-effort：本函数绝不抛，任何失败也不改变 release 的返回。
-   * 返回：每个候选读者要么进 pushed（pushedVia 里带上通道），要么带 reason 进 skipped，于是
-   * "没有人需要通知"与"通知通道坏了"从结果上就能分辨，回退过没过也能分辨。
+   * 返回：每个候选读者要么进 pushed（pushedVia 里带上真实通道 `'inject'`），要么带 reason 进
+   * skipped，于是"没有人需要通知"与"通知通道坏了"从结果上就能分辨。
    *
-   * `releaserAgent`（0.8.4）必须是**释放者的那个活 Agent 对象本身**（工具处理器里的 `exec.agent`）：
-   * 回退通道用它当 sender，而 DSH 用 `ctx.agents.get(sender.id) !== sender` 做**对象同一性**判定
-   * （dsh-subagent/lib/index.js:1735），所以这里只做**类型收窄**，绝不重建对象。
-   * 拿不到它（例如 `agent/disposed` 路径上那个正在销毁的 agent）就**不回退**，如实记 skipped。
+   * `releaserAgent`（第 4 参）：0.8.4 曾是子代理回退通道的 sender；该通道删除后**不再使用**。
+   * 形参保留只为**不让 tools.ts 的调用点跟着改签名**（发布面兼容），值本身不参与任何判定。
    */
   async function notifyReaders(
     released: PublishedClaim[],
     releaserHolderId: string,
     releaserName: string,
-    releaserAgent?: AgentLike
+    releaserAgent?: AgentLike,
+    action: 'release' | 'reap' = 'release'
   ): Promise<NotifyOutcome> {
     const out: NotifyOutcome = { readers: 0, pushed: [], skipped: [], pushedVia: [] }
     // 候选读者 = released 各 claim 上、能解析出 sessionId 且不是释放者的 (claim, reader)。
@@ -294,14 +214,9 @@ export function installPush(ctx: CollabContext, store: StateStore): PushApi {
     const distinct = new Set<string>()
     let currentSessionId = ''
     try {
-      const controller = ctx.get('sessionController') as SessionControllerService | undefined
-      // 回退通道是**可选**服务：拿不到就不回退（不回退 ≠ 报错，见 pushViaSubagentsIfPossible）。
-      const subagents = ctx.get('subagents') as SubagentsService | undefined
-      // **原对象**，不是 { id } 的副本 —— 见上面的对象同一性说明。
-      const sender: SubagentSenderLike | undefined =
-        releaserAgent && typeof releaserAgent.id === 'string' && releaserAgent.id
-          ? (releaserAgent as unknown as SubagentSenderLike)
-          : undefined
+      // 投递面**只有一个**：进程内的 agents 注册表。拿不到它就没有任何诚实通道可投
+      // （绝不回退到 prompt / sendMessage —— 那两个会让宿主把来源写成 kind:'user'）。
+      const agents = ctx.get('agents') as AgentsLookupService | undefined
       for (const c of released) {
         for (const reader of readersOf(c)) {
           if (!reader || reader === releaserHolderId) continue
@@ -312,18 +227,17 @@ export function installPush(ctx: CollabContext, store: StateStore): PushApi {
         }
       }
       out.readers = distinct.size
-      const canPush = !!controller && typeof controller.prompt === 'function'
+      const canPush = !!agents && typeof agents.get === 'function'
       for (const job of jobs) {
         // 兜底 catch 用它在 skipped 里指出"抛在哪条候选上"。
         currentSessionId = job.sessionId
         if (!canPush) {
           // 通道整个缺失：这**不是**"没人需要通知"，必须留在 skipped 里（0.8.2 是静默 return）。
-          // 0.8.4 刻意**不**因为"prompt 通道缺失"就改走回退：那会把"原生通道整个不在"
-          // 这件基础设施问题伪装成一次正常的旁路投递。缺失照旧如实报。
-          out.skipped.push({ sessionId: job.sessionId, reason: 'prompt-failed', error: 'no-session-controller' })
+          // 也**不许**回退到任何别的通道（AGENTS.md §1：没有诚实通道就不投）。
+          out.skipped.push({ sessionId: job.sessionId, reason: 'inject-failed', error: 'no-agents-service' })
           continue
         }
-        // 安全闸门：对**两个通道**统一生效，且在任何投递之前（冷会话绝不被唤醒 / cold-resume）。
+        // 安全闸门：在任何投递之前（冷会话绝不被唤醒 / cold-resume）。
         // 三态：'not-live' = 读者没在线（刻意不唤醒）；'failed' = 存活判据自己坏了（基础设施故障）。
         // 后者**不许**折叠成前者 —— 那会把"agents 服务或它的 get() 崩了"说成"读者没在线"，
         // 排查方向直接被带偏。如实记 distinct 的 reason。
@@ -336,39 +250,27 @@ export function installPush(ctx: CollabContext, store: StateStore): PushApi {
           out.skipped.push({ sessionId: job.sessionId, reason: 'liveness-check-failed', error: liveness.error })
           continue
         }
-        // 幂等键 (claimId, reader) 仍然**先**记账：回退成功/失败都不再重投。
+        // 幂等键 (claimId, reader) 仍然**先**记账：投递成功/失败都不再重投。
         if (!markPushed(job.claim.claimId, job.reader)) {
           out.skipped.push({ sessionId: job.sessionId, reason: 'already-pushed' })
           continue
         }
-        const text = releaseNotice(job.claim, releaserName)
-        const r = await pushOne(controller as SessionControllerService, job.sessionId, text)
+        const parts = releaseNoticeParts(job.claim, releaserName, action)
+        const r = pushOne(agents as AgentsLookupService, job.sessionId, parts)
         if (r.ok) {
           out.pushed.push(job.sessionId)
-          out.pushedVia.push({ sessionId: job.sessionId, channel: CHANNEL_PROMPT })
+          out.pushedVia.push({ sessionId: job.sessionId, channel: CHANNEL_INJECT })
           continue
         }
         // 本仓库 tsconfig 是 strict:false，联合类型在属性访问处不做收窄（既有代码同样用 cast），
         // 所以这里显式取失败分支的字段。
-        const rf = r as { error?: string; subagentRouting?: true }
-        // 0.8.4 回退：**只**在结构化确认为"子代理路由托管"时尝试（普通 prompt 失败不走这里）。
-        if (rf.subagentRouting === true) {
-          const f = await pushViaSubagentsIfPossible(subagents, sender, job.sessionId, text)
-          if (f.ok) {
-            out.pushed.push(job.sessionId)
-            out.pushedVia.push({ sessionId: job.sessionId, channel: CHANNEL_SUBAGENT })
-          } else {
-            const ff = f as { error?: string; notAdjacent?: true }
-            out.skipped.push({
-              sessionId: job.sessionId,
-              // 邻接不成立是**诊断**（跨父会话的子代理），泛化回退失败是**通道**问题，分开记。
-              reason: ff.notAdjacent === true ? 'not-adjacent' : 'subagent-failed',
-              error: ff.error
-            })
-          }
-          continue
-        }
-        out.skipped.push({ sessionId: job.sessionId, reason: 'prompt-failed', error: rf.error })
+        const rf = r as { error?: string; notResolvable?: true }
+        // 解析不到目标 agent 是**如实跳过**（不用别的通道顶替）；inject 抛错是通道故障 —— 分开记。
+        out.skipped.push({
+          sessionId: job.sessionId,
+          reason: rf.notResolvable === true ? 'agent-not-resolvable' : 'inject-failed',
+          error: rf.error
+        })
       }
     } catch (e) {
       // 整体兜底：推送链路的任何意外都不得影响 release 的返回；已收集到的部分照常返回。
@@ -395,21 +297,22 @@ export function installPush(ctx: CollabContext, store: StateStore): PushApi {
       const agent = payload && payload.agent
       if (!agent || !agent.id) return
       const h = 'agent:' + String(agent.id)
-      // 功能 D：会话退出时既要释放它的声明，也要把它从**所有** claim 的 readers 里摘掉
-      // （否则会向一个已经死掉的会话推送）。两件事在同一次 mutate 里完成。
+      // 功能 D：会话退出时把它从**所有** claim 的 readers 里摘掉（否则会向一个已经死掉的会话推送）。
+      // W7 起**不再释放它的声明**：声明生命周期只由租约 expiresAt 决定，dispose 不是释放信号
+      // （dispose 后的会话常常恢复并继续干活，提前删声明会让别人看到"路径空闲"）。
+      // 因此 data.released 正常为空 ⇒ 这条路径正常情况下不产生"锁已释放"通知（那才是实话）。
       const holderId = h
       let releaserName = holderId
       try {
         releaserName = store.hname({ holderId, sessionId: String(agent.id), agent: agent as AgentLike }) || holderId
       } catch (e) {}
-      store.mutate(s => dropHolder(s, holderId), String(agent.id), agent as AgentLike)
+      store.mutate(s => dropHolder(s, holderId, Date.now()), String(agent.id), agent as AgentLike)
         .then(res => {
           if (res && res.ok === true && res.data && Array.isArray(res.data.released)) {
-            // 0.8.4：这里**刻意不传第 4 个参数**（sender）。事件里的 agent 正在 disposed，
-            // 不是回退契约要求的 "exact live Agent" —— 拿它当 sender 只会得到一次
-            // UNAUTHORIZED，而且违背"拿不到活 Agent 就不回退"的约定。
-            // 于是这条路径上的子代理读者会如实落到 skipped（prompt-failed / subagent-*），
-            // 这一点由 notifyReaders 自己的记账保证（不是靠下面的兜底 catch 保证）。
+            // 0.9.6：这条路径**不需要**"活 Agent 当 sender"了（子代理回退通道已删）——
+            // 投递面是进程内解析每个读者自己的 agent 再 inject，与释放者是否还在无关。
+            // 新通道下这里**照常如实投递**；解析不到的读者由 notifyReaders 自己记
+            // skipped.reason='agent-not-resolvable'（不是靠下面的兜底 catch 保证）。
             return notifyReaders(res.data.released as PublishedClaim[], holderId, releaserName)
           }
         })

@@ -41,6 +41,26 @@ export interface HeartbeatInput {
   claimId?: string
 }
 
+/** reap（僵尸声明显式回收，0.9.8）的输入参数。 */
+export interface ReapInput {
+  /**
+   * 默认 false = **dry-run**：只把候选列出来，绝不改动任何状态。
+   * 只有显式 `confirm: true` 才真正删除命中判据的声明。
+   */
+  confirm?: boolean
+  /** age 门槛（秒）：`now - createdAt` 必须**严格大于**它才算候选。缺省取保守的 600 秒。 */
+  olderThanSec?: number
+  /** 只看与这些路径相交的声明（可选；不给就是全部）。 */
+  paths?: string[]
+}
+
+/**
+ * reap 的默认 age 门槛（秒）。刻意保守：刚崩溃的会话可能在几秒内被重新拉起，
+ * 太小的门槛会把"正在重启"的活会话判成僵尸。调用方可以显式传更大/更小的值，
+ * 但默认值必须偏保守 —— 漏收只是维持现状，误杀会让持有者以为自己还有锁。
+ */
+export const REAP_DEFAULT_OLDER_THAN_SEC: number = 600
+
 /** board post 操作的输入参数。 */
 export interface PostInput {
   body?: string
@@ -243,7 +263,8 @@ export function sweep(s: StateDocument, t: number, opts: SweepOptions = {}): Swe
   // （实测活进程 agents.list() 只有 2 个 agent，而 sessionController.list() 有 224 个会话）。
   // 结果是一个"只是空闲、并未结束"的读者会在下一次任意写路径上被悄悄删掉，
   // 该 claim 释放时 readers 已空，通知谁也发不出去 —— 静默丢消息比不清理危险得多。
-  // 读者只由**真正的"自行结束"信号**移除：dropHolder()（host 侧的 agent/disposed 路径）。
+  // 读者的移除只走 dropHolder()（host 侧的 agent/disposed 路径）：它只摘 reader 登记，
+  // **不**回收未过期的声明（W7：租约是声明回收的**唯一**机制，dispose 不是释放信号）。
   // 有界性不需要额外的 TTL 或上限：readers 挂在 claim 上，claim 在 release 或
   // 到期时被上面的 filter 移除，readers 随 claim 一起消亡 —— 天然有界。
   return { expiredClaims, droppedMessages, prunedHolders }
@@ -295,6 +316,15 @@ export function clockUtc(ms: number): string {
   return p(d.getUTCMonth() + 1) + '-' + p(d.getUTCDate()) + ' ' + p(d.getUTCHours()) + ':' + p(d.getUTCMinutes()) + 'Z'
 }
 
+// 模式名 → 渲染给人看的标签（W9 文案中文化）。
+// **只用于渲染文本**：mode 的**取值与契约**在 JSON 返回、schema、类型枚举、参数校验里
+// 仍是 'exclusive' | 'shared' | 'read'（见 MODES / tools.ts 的 enum），绝不因文案改动而变。
+// 未知取值原样回退（不吞错、不猜），保证渲染层永不对数据撒谎。
+export const MODE_LABELS: Readonly<Record<Mode, string>> = { exclusive: '独占', shared: '共享', read: '只读' }
+export function modeLabel(mode: Mode | string): string {
+  return MODE_LABELS[mode as Mode] || String(mode)
+}
+
 // claims = 他人的、未过期的声明。最多列 3 条、每条最多 2 个路径，其余折叠成计数，
 // 因为这一行会在每一个模型步都被注入，长度必须有界。
 export function renderDigest(claims: Claim[]): string {
@@ -305,7 +335,7 @@ export function renderDigest(claims: Claim[]): string {
     const mins = Math.max(1, Math.round((c.ttlSec || 0) / 60))
     const paths = c.paths.slice(0, 2).join(' ') + (c.paths.length > 2 ? ' 等 ' + c.paths.length + ' 条' : '')
     const start = clockUtc(typeof c.createdAt === 'number' ? c.createdAt : c.expiresAt - (c.ttlSec || 0) * 1000)
-    return (c.holderName || c.holderId) + '（' + c.mode + '）占用 ' + paths +
+    return (c.holderName || c.holderId) + '（' + modeLabel(c.mode) + '）占用 ' + paths +
       '，租约 ' + mins + ' 分（' + start + '–' + clockUtc(c.expiresAt) + '）'
   })
   const more = ordered.length > 3 ? '；另有 ' + (ordered.length - 3) + ' 条' : ''
@@ -396,11 +426,29 @@ export function registerReader(state: StateDocument, claimId: string, holderId: 
   return { ok: true, changed: true, state, data: { registered: true, claimId, readers: c.readers.slice() } }
 }
 
-/** 会话退出：释放它的声明，并把它从**所有** claim 的 readers 里摘掉（同一次状态变更里完成）。 */
-export function dropHolder(state: StateDocument, holderId: string): OpResult {
-  const rel = state.claims.filter(c => c.holderId === holderId)
+/**
+ * 会话退出（dispose）时的状态变换：把这个 holderId 从**所有**剩余 claim 的 readers 里摘掉，
+ * 并回收它**已经过期**的声明 —— 两件事在同一次状态变更里完成。
+ *
+ * 为什么不是「释放它的全部声明」（W7 实测过的锁安全缺陷）：
+ * 会话被 dispose 后**常常恢复并继续干活**，它的对话历史里仍然"记得"自己持有这个路径。
+ * 旧实现只按 holderId 过滤、完全不看 expiresAt，于是声明被提前删掉 ⇒ 其他会话 `op=overview`
+ * 看到路径空闲，两边都以为可以写；而且 `released` 通知还说了一件没发生的事。
+ *
+ * 因此**声明（claim）的生命周期只由租约 `expiresAt` 决定**：dispose **不是**释放信号。
+ * 未过期的声明原样保留（连同它自己的 readers 列表），到点由 sweep() 回收 ——
+ * 租约是**唯一**的回收机制。安全侧后果：会话死亡后它的声明会一直占用到租约到期，
+ * 期间别的会话必须 `op=wait` 或协商；`op=heartbeat` 仍是唯一的续租方式。
+ *
+ * `t` **必填**（不许隐式读 `Date.now()`）：纯逻辑模块要保持可确定性、可对拍。
+ * `data.released` 只含**真正被删掉**的声明 ⇒ 正常情况为空，agent/disposed 路径
+ * 也就不再产生"锁已释放"通知（那是实话：没有发生释放事件）。
+ */
+export function dropHolder(state: StateDocument, holderId: string, t: number): OpResult {
+  const expired = (c: Claim): boolean => c.holderId === holderId && c.expiresAt <= t
+  const rel = state.claims.filter(expired)
   let changed = rel.length > 0
-  if (rel.length) state.claims = state.claims.filter(c => c.holderId !== holderId)
+  if (rel.length) state.claims = state.claims.filter(c => !expired(c))
   for (const c of state.claims) {
     const list = readersOf(c)
     if (!list.includes(holderId)) continue
@@ -438,7 +486,7 @@ export function renderAccessNotice(claims: Claim[]): string {
     // 「不可读」是句假话，读根本不会被拦。而 OPEN_HINT 恰好推荐"只读调研用 mode=read"，
     // 一个只读声明却被通知写成「不可读」，误导概率最高。
     const readableTag = c.mode === 'exclusive' ? '，' + (isReadable(c) ? '可读' : '不可读') : ''
-    return (c.holderName || c.holderId) + '（' + c.mode + readableTag + '）占用 ' + paths +
+    return (c.holderName || c.holderId) + '（' + modeLabel(c.mode) + readableTag + '）占用 ' + paths +
       '，租约 ' + mins + ' 分（' + start + '–' + clockUtc(c.expiresAt) + '）'
   })
   const more = ordered.length > 2 ? '；另有 ' + (ordered.length - 2) + ' 条' : ''
@@ -551,6 +599,79 @@ export function release(state: StateDocument, h: HolderInput, a: ReleaseInput, t
     state.claims = state.claims.filter(c => !rel.includes(c))
   }
   return { ok: true, changed: true, state, tNow, data: { released: rel.map(publish), serverTime: t } }
+}
+
+// ---- 僵尸声明显式回收（0.9.8，op=reap）----
+//
+// **只由显式 op 驱动，绝不自动触发。**不能把它接进 sweep() 或任何读路径，原因如实写在这里：
+// 判据是「holder 不在 `agents.list()` 里 + age 超过门槛」，而 `agents.list()` 只包含
+// **本进程此刻加载着的** agent —— 一个只是空闲、但可以随时被唤回的休眠会话同样不在里面
+// （0.8.2 就是按这个判据清 readers，静默丢了通知；W7 又确认 `agent/disposed` 不得提前
+// 释放未到期声明）。换句话说：**从运行时注册表无法区分"休眠可唤回"与"真死"**。
+// 误杀的代价不对称 —— 被回收的会话恢复后仍按对话历史以为自己持有锁，另一边却看到路径空闲，
+// 于是两边同时以为可以写（W7 的锁安全缺陷）。
+//
+// 所以这套判据只作为**候选清单**交给调用方，由人/模型显式 `confirm`；默认 dry-run，
+// 且只回收**未过期**的声明（过期的归 sweep()，不需要 reap；reap 抢着干只会让"僵尸"口径
+// 与租约口径分叉）。age 门槛与活体检查都只是**降低误杀概率**，不是"证明它死了"。
+//
+// 形态：reap(state, holderInput, args, liveHolderIds, now) -> { ok, changed, state, data }
+//   - liveHolderIds = 活体检查的结果（`'agent:' + a.id` 列表）；
+//     **null = 活体检查没跑成**（agents.list 不可用/抛错）⇒ 一个也不收 —— 拿不到名单时
+//     "不在名单里"没有信息量，这正是 `agents.get()` 对休眠会话返回 undefined 的同一个坑。
+//   - 返回 data 里逐条候选带上 reasons（每条判据一个标签）与 ageSec / remainingSec，
+//     让"为什么它算僵尸"可以从返回值本身复述，而不是靠调用方猜。
+export function reap(s: StateDocument, h: HolderInput, a: ReapInput, liveHolderIds: string[] | null, t: number): OpResult {
+  const raw = Number(a && a.olderThanSec)
+  const olderThanSec = Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : REAP_DEFAULT_OLDER_THAN_SEC
+  // 只认显式 true：`confirm: 'yes'` / 1 / 缺省一律按 dry-run（fail-safe 的方向是"不改状态"）。
+  const confirm = !!(a && a.confirm === true)
+  const paths = (Array.isArray(a && a.paths) ? a.paths : []).map(norm).filter(Boolean)
+  const unknown = liveHolderIds === null || liveHolderIds === undefined
+  const live = new Set(Array.isArray(liveHolderIds) ? liveHolderIds : [])
+  const hits: Claim[] = []
+  if (!unknown) {
+    for (const c of s.claims) {
+      // 已过期的不算僵尸（那是 sweep() 的活），所以这里只保留 expiresAt > t。
+      if (!(c.expiresAt > t)) continue
+      // 自己的声明用 op=release：reap 不替调用方清自己的锁（否则一次 confirm 会连带
+      // 把调用方正在做的活的占用一起抹掉）。
+      if (c.holderId === h.holderId) continue
+      // 只对**有活体信号的 holder**（agent:<id>）判僵尸。`human:console` 从来不在
+      // agents.list() 里，"不在名单"对它没有任何信息量 —— 按它回收等于纯按 age 回收。
+      if (typeof c.holderId !== 'string' || !c.holderId.startsWith('agent:')) continue
+      // 活体检查：名单里有的，无论多老都不碰。
+      if (live.has(c.holderId)) continue
+      const createdAt = typeof c.createdAt === 'number' ? c.createdAt : c.expiresAt - (c.ttlSec || 0) * 1000
+      const ageSec = Math.max(0, Math.floor((t - createdAt) / 1000))
+      // 严格大于：等于门槛不收（避免"刚好 600s"这种边界上的口角）。
+      if (!(ageSec > olderThanSec)) continue
+      // paths 限定：只考虑与给定路径相交的声明（与 release/blockers 同一套前缀重叠判据）。
+      if (paths.length && !c.paths.some(cp => paths.some(p => ov(p, cp)))) continue
+      hits.push(c)
+    }
+  }
+  const entries = hits.map(c => {
+    const createdAt = typeof c.createdAt === 'number' ? c.createdAt : c.expiresAt - (c.ttlSec || 0) * 1000
+    const reasons = ['unexpired', 'agent-holder', 'not-self', 'holder-not-in-agents-list', 'age-over-threshold']
+    if (paths.length) reasons.push('paths-intersect')
+    return Object.assign(publish(c), {
+      ageSec: Math.max(0, Math.floor((t - createdAt) / 1000)),
+      remainingSec: Math.max(0, Math.ceil((c.expiresAt - t) / 1000)),
+      olderThanSec,
+      reasons
+    })
+  })
+  const base = { olderThanSec, serverTime: t, livenessCheck: unknown ? 'unavailable' : 'ok' }
+  if (!confirm) {
+    // dry-run：**绝不改状态**（changed:false 让上层不会写盘）。
+    return { ok: true, changed: false, state: s, data: Object.assign({ dryRun: true }, base, { candidates: entries }) }
+  }
+  if (!hits.length) {
+    return { ok: true, changed: false, state: s, data: Object.assign({ dryRun: false }, base, { reaped: [] }) }
+  }
+  s.claims = s.claims.filter(c => !hits.includes(c))
+  return { ok: true, changed: true, state: s, data: Object.assign({ dryRun: false }, base, { reaped: entries }) }
 }
 
 // 续租。a = {claimId}。

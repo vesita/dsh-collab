@@ -4,7 +4,10 @@
 // 规范的内核不是"禁止一切消息构造"，而是三条：
 //   ① 不许造出 `source.kind === 'user'` 的消息（那是冒充真人输入）；
 //   ② 不许在没有显式来源（`source` + `plugin` + `form`）的情况下投递消息；
-//   ③ 不许在仓库里手抄构造函数副本 —— 必须用真实的 `@deepseek-ai/dsh-llm`。
+//   ③ 不许在仓库里手抄构造函数副本 —— 必须用真实的 `@deepseek-ai/dsh-llm`；
+//   ④ 不许用「收 content、来源由宿主盖章」的通道投递（`sessionController.prompt` /
+//      `subagents.sendMessage`）—— 实测宿主把来源写死成 `kind: 'user'`，GUI 里就是**用户气泡**。
+//      0.9.6 已把这两条通道从 `src/push.ts` 整体删除，此处把它钉成一次命令可判定的规则。
 // 允许的是：经真实构造链、且**来源显式非 user** 的 notice 消息（例如访问通知），
 // 由 `agent.inject` 逐事件投递 —— 客户端按 `source.kind !== 'user'` 把它渲染成 notice 行。
 //
@@ -70,6 +73,20 @@ const FORBIDDEN = [
   { re: /kind\s*:\s*['"]user['"]/, why: "source.kind='user' 会让消息渲染成用户气泡（冒充）" }
 ]
 
+/**
+ * ④ 宿主代造消息的通道（0.9.6 整体删除）：这两个 API **收 content、不收 message**，
+ *    消息由宿主构造并写死 `source: { kind: 'user', rpcId: 'dsh-collab-…' }` —— 实测转录里就是
+ *    `user/message` + `kind:'user'`，客户端按 `source.kind` 分流后渲染成**用户气泡**（冒充真人输入，
+ *    落进 next-step 收件箱还会升级成 steering 气泡）。它们的失败还曾在 `notify` 里留下
+ *    `prompt-failed` / `not-adjacent` / `subagent-failed` 三个取值，随通道一起删除。
+ *    现在跨会话通知只有一条路：自造显式来源消息 + `agent.inject`。
+ *    这两个名字**只允许出现在注释里** —— `stripComments` 之后一命中即违规。
+ */
+const HOST_STAMPED_CHANNELS = [
+  { re: /\.sendMessage\s*\(/, why: "subagents.sendMessage 由宿主盖章 kind:'user' ⇒ 用户气泡（冒充）" },
+  { re: /\bsessionController\b/, why: "sessionController.prompt 由宿主盖章 kind:'user' ⇒ 用户气泡（冒充）" }
+]
+
 /** ③ 手抄副本：只禁**定义**，不禁调用。 */
 const REPLICA_DEFS = [
   { re: /(?:function|const|let|var)\s+createUserMessage\b/, name: 'createUserMessage' },
@@ -114,6 +131,13 @@ for (const dir of SCAN_DIRS) {
       const line = text.slice(0, m.index).split('\n').length
       check(`${dir}/${f} 不得冒充用户`, false, `${why}（剥注释后第 ${line} 行）`)
     }
+    // ④ 宿主代造消息的通道：剥注释后一命中即违规（注释里允许解释为什么不用它）。
+    for (const { re, why } of HOST_STAMPED_CHANNELS) {
+      const m = re.exec(text)
+      if (!m) continue
+      const line = text.slice(0, m.index).split('\n').length
+      check(`${dir}/${f} 不得经宿主代造消息的通道投递`, false, `${why}（剥注释后第 ${line} 行）`)
+    }
     // ③ 只在源码里禁副本定义；lib/ 是产物，副本定义会以同样形态出现，故一并扫。
     for (const { re, name } of REPLICA_DEFS) {
       if (re.test(text)) check(`${dir}/${f} 不得自定义 ${name}（手抄副本）`, false, '必须用真实的 @deepseek-ai/dsh-llm')
@@ -145,6 +169,15 @@ const access = readFileSync(join(ROOT, 'src/access.ts'), 'utf8')
 check('访问通知经 agent.inject 逐事件投递', /\.inject\s*\(/.test(access), 'src/access.ts 里找不到 agent.inject')
 check('访问通知不再注册 systemPrompt 上下文段', !/systemPrompt/.test(access), 'src/access.ts 里仍有 systemPrompt —— 载体又变了')
 check('访问通知的 source 标注为 dsh-collab', /plugin:\s*'dsh-collab'/.test(access), "source.plugin 不是 'dsh-collab'")
+
+// 跨会话通知（释放推送）与访问通知同载体：0.9.6 起 src/push.ts 是唯一的投递面，
+// 必须是「自造显式来源消息 + agent.inject」，且代码里不再出现任何宿主代造通道。
+const pushCode = stripComments(readFileSync(join(ROOT, 'src/push.ts'), 'utf8'))
+check('释放通知经 agent.inject 逐事件投递', /\.inject\s*\(/.test(pushCode), 'src/push.ts 里找不到 agent.inject')
+check('释放通知自造显式来源消息', /createUserMessage\s*\(/.test(pushCode)
+  && /from\s+['"]@deepseek-ai\/dsh-llm['"]/.test(pushCode), 'src/push.ts 没有用真身构造消息')
+check('释放通知没有回退通道（代码里不出现被删的两条通道）',
+  !HOST_STAMPED_CHANNELS.some(({ re }) => re.test(pushCode)), 'src/push.ts 里仍有宿主代造通道')
 
 check('手抄的消息副本 src/plugin-message.ts 已删除',
   !existsSync(join(ROOT, 'src/plugin-message.ts')), 'src/plugin-message.ts 仍然存在')

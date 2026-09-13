@@ -78,12 +78,25 @@ const readRes = await boardTool.execute({ op: 'read', channel: 'general' }, exec
 if (!readRes.ok || readRes.data.messages.length !== 1) throw new Error('read failed')
 
 // 5. agent-1 disposed
+//    W7（**改了语义**）：dispose **不是**释放信号 —— 声明的生命周期只由租约 expiresAt 决定。
+//    原断言是 `claims.length !== 0 → throw 'disposed claims not cleaned'`，它编码的是
+//    "dispose 释放声明"，与 W7 决策直接冲突。这里改成如实断言**新**语义（强度不降：
+//    既钉住"未过期声明必须留下"，也钉住"它仍属于 agent-1"）。
 ctx.emit('agent/disposed', { agent: { id: 'agent-1' } })
 await new Promise(r => setTimeout(r, 60))
 
-// 6. check list after dispose
+// 6. check list after dispose：未到期的声明必须还在（dispose 不缩短租约）
 const listRes = await lockTool.execute({ op: 'list' }, exec2)
-if (!listRes.ok || listRes.data.claims.length !== 0) throw new Error('disposed claims not cleaned')
+if (!listRes.ok || listRes.data.claims.length !== 1) {
+  throw new Error('dispose must NOT release an unexpired claim (W7: the lease is the only reclamation), got ' + JSON.stringify(listRes.data.claims))
+}
+if (listRes.data.claims[0].holderId !== 'agent:agent-1') {
+  throw new Error('the surviving claim must still belong to agent-1, got ' + listRes.data.claims[0].holderId)
+}
+// 后续步骤沿用旧版"此时已无占用"的前置条件 —— 用**显式 release** 腾出路径
+// （agent-1 即便已被 dispose，仍按 holderId 匹配，这正是"dispose 不改变持有关系"的体现）。
+const relRes = await lockTool.execute({ op: 'release', claimId: listRes.data.claims[0].claimId }, exec1)
+if (!relRes.ok) throw new Error('explicit release after dispose failed, got ' + JSON.stringify(relRes))
 
 // 7. unified error envelope: failures carry a top-level error code
 const badRelease = await lockTool.execute({ op: 'release' }, exec2)
@@ -121,7 +134,7 @@ const corruptKey = projectStateFile('/test/workspace')
 stateStore.set(corruptKey, 'not-json{{{')
 const healed = await lockTool.execute({ op: 'list' }, exec2)
 if (!healed.ok) throw new Error('corrupt state must self-heal, got ' + JSON.stringify(healed))
-if (!String(healed.data.warning || '').includes('corrupted')) throw new Error('self-heal must surface a warning')
+if (!String(healed.data.warning || '').includes('状态文件损坏')) throw new Error('self-heal must surface a warning')
 
 // 10. A/B 组：损坏自愈与旧落点迁移的失败必须**如实**（不得谎报备份/重置成功、不得静默丢迁移失败）
 //     手法统一：起一个**独立 ctx**（installStore 在 apply 时捕获 ctx，故每个案例各自实例化），
@@ -172,12 +185,12 @@ const listWarning = async (lock, agentId) => {
   const map = new Map([[key, 'not-json{{{']])
   const lock = await bootWithFs(healFs(map, { failAllWrites: true }), cwd)
   const w = await listWarning(lock, 'agent-a1')
-  ok('item 1/A1: 损坏必须仍然被报出来', w.includes('corrupted'), JSON.stringify(w))
+  ok('item 1/A1: 损坏必须仍然被报出来', w.includes('状态文件损坏'), JSON.stringify(w))
   ok('item 1/A1: 备份失败时不得宣称"已备份到 <路径>"', !/;\s*backup:\s/.test(w), JSON.stringify(w))
-  ok('item 1/A1: warning 必须如实说明备份失败及其原因', /backup failed: disk on fire/.test(w), JSON.stringify(w))
-  ok('item 1/A1: 必须交代原始损坏内容的下落（证据链）', /original corrupt content left on disk/.test(w), JSON.stringify(w))
-  ok('item 2/A1: 重置失败时不得宣称"已重新初始化"', !/reinitialized/.test(w), JSON.stringify(w))
-  ok('item 2/A1: warning 必须如实说明重置失败及其原因', /reinitialize failed: disk on fire/.test(w), JSON.stringify(w))
+  ok('item 1/A1: warning 必须如实说明备份失败及其原因', /备份失败：disk on fire/.test(w), JSON.stringify(w))
+  ok('item 1/A1: 必须交代原始损坏内容的下落（证据链）', /原始损坏内容仍留在磁盘上/.test(w), JSON.stringify(w))
+  ok('item 2/A1: 重置失败时不得宣称"已重新初始化"', !w.includes('已重新初始化'), JSON.stringify(w))
+  ok('item 2/A1: warning 必须如实说明重置失败及其原因', /重新初始化失败：disk on fire/.test(w), JSON.stringify(w))
   ok('item 2/A1: 重置失败时原始损坏内容必须原样留在磁盘上', map.get(key) === 'not-json{{{', JSON.stringify(map.get(key)))
 }
 
@@ -191,10 +204,10 @@ const listWarning = async (lock, agentId) => {
   const backupKeys = [...map.keys()].filter((k) => k.includes('.corrupt-'))
   ok('item 2/A2: 备份必须真的写出原始损坏内容', backupKeys.length === 1 && map.get(backupKeys[0]) === 'not-json{{{',
     JSON.stringify({ backupKeys, content: map.get(backupKeys[0]) }))
-  ok('item 1/A2: 备份成功时 warning 必须给出真实备份路径', w.includes('backup: ' + backupKeys[0]), JSON.stringify(w))
-  ok('item 2/A2: warning 必须如实说明重置失败', /reinitialize failed: reset exploded/.test(w), JSON.stringify(w))
-  ok('item 2/A2: 重置失败却宣称"已重新初始化"（谎报）', !/reinitialized/.test(w), JSON.stringify(w))
-  ok('item 2/A2: 重置失败时损坏内容仍在磁盘上，warning 必须这么写', /original corrupt content left on disk/.test(w), JSON.stringify(w))
+  ok('item 1/A2: 备份成功时 warning 必须给出真实备份路径', w.includes('备份：' + backupKeys[0]), JSON.stringify(w))
+  ok('item 2/A2: warning 必须如实说明重置失败', /重新初始化失败：reset exploded/.test(w), JSON.stringify(w))
+  ok('item 2/A2: 重置失败却宣称"已重新初始化"（谎报）', !w.includes('已重新初始化'), JSON.stringify(w))
+  ok('item 2/A2: 重置失败时损坏内容仍在磁盘上，warning 必须这么写', /原始损坏内容仍留在磁盘上/.test(w), JSON.stringify(w))
   ok('item 2/A2: 重置失败后主文件必须保持原样（证据仍在）', map.get(key) === 'not-json{{{', JSON.stringify(map.get(key)))
 }
 
@@ -206,9 +219,9 @@ const listWarning = async (lock, agentId) => {
   const lock = await bootWithFs(healFs(map), cwd)
   const w = await listWarning(lock, 'agent-a3')
   const backupKeys = [...map.keys()].filter((k) => k.includes('.corrupt-'))
-  ok('item 1+2/10c: 全成功时的 warning 仍是 "state corrupted; reinitialized; backup: <路径>"',
-    /^state corrupted; reinitialized; backup: /.test(w) && w.includes('backup: ' + backupKeys[0]), JSON.stringify(w))
-  ok('item 1+2/10c: 全成功时不得出现任何失败措辞', !/failed/.test(w), JSON.stringify(w))
+  ok('item 1+2/10c: 全成功时的 warning 是「状态文件损坏；已重新初始化；备份：<路径>」',
+    /^状态文件损坏；已重新初始化；备份：/.test(w) && w.includes('备份：' + backupKeys[0]), JSON.stringify(w))
+  ok('item 1+2/10c: 全成功时不得出现任何失败措辞', !w.includes('失败'), JSON.stringify(w))
 }
 
 // 10d. B（item 3）：旧落点（项目内 .dsh-collab.json）迁移写入失败必须留痕，且不阻断工具
@@ -226,8 +239,8 @@ const listWarning = async (lock, agentId) => {
   }
   const lock = await bootWithFs(fsImpl, cwd)
   const w = await listWarning(lock, 'agent-b1')
-  ok('item 3/B: 迁移失败必须在 warning 里留痕（legacy migrate failed: <原因>）',
-    /legacy migrate failed: migrate write exploded/.test(w), JSON.stringify(w))
+  ok('item 3/B: 迁移失败必须在 warning 里留痕（旧落点迁移失败：<原因>）',
+    /旧落点迁移失败：migrate write exploded/.test(w), JSON.stringify(w))
   ok('item 3/B: 迁移失败不得动到旧文件本身', map.get(legacyPath) === legacyDoc)
 }
 

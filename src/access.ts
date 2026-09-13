@@ -24,6 +24,18 @@ import { collectPathCandidates, accessSignature } from './spec.js'
 import type { AgentLike, CollabContext } from './contract.js'
 import type { StateStore } from './store.js'
 
+/**
+ * 占用**管理**工具（插件自己的）：功能 A（访问通知 + reader 反向注册）必须整类跳过它。
+ * 它的 `paths` 参数含义是"声明 / 查询某路径的占用情况"，**不是**读写该路径。
+ *
+ * 为什么**只**跳 `collab_lock`、不跳 `collab_board`：
+ *   - 实测误报只出现在 `collab_lock`（见 `tools/post-execute` 里的缺陷说明）；
+ *   - `collab_board` 的 `mentions` 这类字符串数组里出现路径，是既有测试**故意**守护的性质
+ *     （`tests/collab-access-gate.mjs` 的「mentions 字符串数组里的路径也参与候选提取」用例），
+ *     即候选提取与工具无关；board 没有实测误报，不该顺手改掉那条性质。
+ */
+const OCCUPANCY_TOOLS: ReadonlySet<string> = new Set(['collab_lock'])
+
 export function installAccess(ctx: CollabContext, store: StateStore): void {
   // 包形态的关闭开关，与 awareness(130) / delegation(131) **同一个总开关**：
   // `DSH_COLLAB_NO_PROMPT_HINT=1` 的契约是"关掉**所有**运行时注入的内容"。
@@ -115,6 +127,13 @@ export function installAccess(ctx: CollabContext, store: StateStore): void {
   // 注册走 ctx.on(...)，listener 作为 ctx 作用域的 effect 注册，随插件卸载自动回收。
   ctx.on('tools/post-execute', async (execCtx: any, _result: any, next: () => Promise<any>) => {
     const downstream = await next()
+    // 占用管理工具（collab_lock）不算"访问路径"：它的 paths 参数是在**声明或查询占用**，
+    // 不是读写该路径。实测缺陷（2026-09-13 23:47）：主 AI 调 `collab_lock op=status` 只为
+    // 查询谁占用 `src/collab-probe2/`，插件却给它注入了一条「你刚访问的路径处于其他会话的
+    // 占用范围内」——**措辞不实**（它没碰文件），还把它登记成该 claim 的 reader。
+    // 功能 A 只对真正的读写触碰负责，故在这里整类跳过（不含 collab_board，理由见常量注释）。
+    const ownToolName = execCtx && typeof execCtx.name === 'string' ? execCtx.name : ''
+    if (OCCUPANCY_TOOLS.has(ownToolName)) return downstream
     try {
       const found = await accessEntries(execCtx)
       // 全部是重复 → 不再通知（与旧载体的去重语义一致）。

@@ -8,7 +8,7 @@
 
 import {
   init, sweep, publish, overview, related, filterMessages, blockers, holderView,
-  expire, cleanName, norm, projectStorageFileName
+  expire, cleanName, norm, projectStorageFileName, reap
 } from './collab-core.js'
 import type { Claim, HolderInput, OpResult, PublishedClaim, StateDocument } from './collab-core.js'
 import { LEGACY_PROJECT_FILE, collabDir, projectStateFile, legacyCollabDirs } from './paths.js'
@@ -32,6 +32,8 @@ export interface StateStore {
   overviewOp(agentId: string | null, agent?: AgentLike): Promise<ToolResult>
   status(a: CollabArgs, agentId: string | null, agent?: AgentLike): Promise<ToolResult>
   msgs(a: CollabArgs, agentId: string | null, agent?: AgentLike): Promise<ToolResult>
+  /** op=reap（0.9.8）：僵尸声明的**显式**回收。默认 dry-run，见 collab-core.ts 的 reap 注释。 */
+  reapOp(a: CollabArgs, h: HolderInput, agentId: string | null, agent?: AgentLike): Promise<ToolResult>
   waitFor(a: CollabArgs, h: HolderInput, agentId: string | null, agent?: AgentLike): Promise<ToolResult>
 }
 
@@ -72,7 +74,8 @@ export function installStore(ctx: CollabContext): StateStore {
    *  （判据实现见上面的 livenessOf：三态，基础设施故障与"没在线"分开报。）
    *  0.8.2 曾在 mutate() 里把它注入 sweep()，于是"只是空闲、并未结束"的读者
    *  （agents.get(sessionId) 对休眠会话返回 undefined）会在下一次任意写路径上被删掉，
-   *  该 claim 释放时已无人可推 —— 静默丢通知。读者的移除只走 dropHolder()（agent/disposed）。
+   *  该 claim 释放时已无人可推 —— 静默丢通知。读者的移除只走 dropHolder()（agent/disposed）；
+   *  它**只摘 reader 登记 + 回收该 holder 已过期的声明**，不释放未过期声明（W7：租约是唯一回收机制）。
    *  判据本身仍是 push 前的安全闸：拿不到 agents 服务时一律不推，
    *  因为推送会 resume 冷会话，宁可少推也不能唤醒。 */
   /**
@@ -89,6 +92,29 @@ export function installStore(ctx: CollabContext): StateStore {
       return svc.get(sessionId) ? { state: 'live' } : { state: 'not-live' }
     } catch (e) {
       return { state: 'failed', error: describeError(e) }
+    }
+  }
+
+  /**
+   * op=reap 的活体检查（0.9.8）：`agents.list()` 的 holderId 列表（`'agent:' + a.id`）。
+   * 返回 **null** 表示检查**没跑成**（服务/方法缺失或抛错）—— 与"名单为空"是两件事：
+   * 前者必须一个也不收（拿不到名单时"不在名单里"没有信息量），后者是"此刻确实没有活着的 agent"。
+   * 该区别由 collab-core.ts 的 reap() 用 `liveHolderIds === null` 承载（两形态同形）。
+   */
+  const liveAgentHolderIds = (): string[] | null => {
+    try {
+      const svc = ctx.get('agents') as AgentsLookupService | undefined
+      if (!svc || typeof svc.list !== 'function') return null
+      const arr = svc.list()
+      if (!Array.isArray(arr)) return null
+      const out: string[] = []
+      for (const a of arr) {
+        const id = a && a.id ? String(a.id) : null
+        if (id) out.push('agent:' + id)
+      }
+      return out
+    } catch (e) {
+      return null
     }
   }
 
@@ -119,7 +145,7 @@ export function installStore(ctx: CollabContext): StateStore {
 
   async function load(agentId: string | null, agent?: AgentLike): Promise<LoadResult> {
     const { cwd, target, stateDir, fileName } = await targetFor(agentId, agent)
-    const warn = cwd ? null : 'state-file at default location (no session cwd); per-project isolation disabled'
+    const warn = cwd ? null : '状态文件落在默认位置（本会话没有 cwd），按项目隔离已失效'
     // 迁移失败**不再静默**：旧落点搬不过来 = 这个项目凭空退回空状态（用户级故障，且极难自查）。
     // 复用 load() 已有的 warn 通道逐条追加 'legacy migrate failed: <原因>'；
     // 即使 warn 本身为 null（有 cwd 的正常情形）也要能把它带出来，故统一走 mergeWarn()。
@@ -143,7 +169,7 @@ export function installStore(ctx: CollabContext): StateStore {
           info = await fs.stat(target)
         }
       } catch (e) {
-        migrateNotes.push('legacy migrate failed: ' + describeError(e))
+        migrateNotes.push('旧落点迁移失败：' + describeError(e))
       }
     }
     // 第二代错误落点：旧版相对进程 cwd 的 .dsh/collab/projects，以及 `~` 未展开的
@@ -160,7 +186,7 @@ export function installStore(ctx: CollabContext): StateStore {
           info = await fs.stat(target)
           if (info) break
         } catch (e) {
-          migrateNotes.push('legacy migrate failed: ' + describeError(e))
+          migrateNotes.push('旧落点迁移失败：' + describeError(e))
         }
       }
     }
@@ -192,12 +218,12 @@ export function installStore(ctx: CollabContext): StateStore {
         resetFailure = describeError(resetError)
       }
       // 证据链：如实交代原始损坏内容此刻的下落（已备份 / 被重置覆盖 / 仍原样留在磁盘上）。
-      const corruptWarn = 'state corrupted'
-        + (resetOk ? '; reinitialized' : '; reinitialize failed: ' + resetFailure)
-        + (backupPath ? '; backup: ' + backupPath : '')
-        + (backupFailure ? '; backup failed: ' + backupFailure : '')
-        + (resetOk ? '' : '; original corrupt content left on disk')
-        + (backupFailure && resetOk ? '; original corrupt content overwritten by the reset' : '')
+      const corruptWarn = '状态文件损坏'
+        + (resetOk ? '；已重新初始化' : '；重新初始化失败：' + resetFailure)
+        + (backupPath ? '；备份：' + backupPath : '')
+        + (backupFailure ? '；备份失败：' + backupFailure : '')
+        + (resetOk ? '' : '；原始损坏内容仍留在磁盘上')
+        + (backupFailure && resetOk ? '；原始损坏内容已被重置覆盖' : '')
       return { state: init(), version: null, target, stateDir, warn: mergeWarn(corruptWarn) }
     }
     s.claims = Array.isArray(s.claims) ? s.claims : []
@@ -327,6 +353,21 @@ export function installStore(ctx: CollabContext): StateStore {
     return { ok: true, data: filterMessages(state, a) }
   }
 
+  /**
+   * op=reap（0.9.8）：把 collab-core 的纯函数 reap() 接到状态存取层上。
+   *
+   * 只在这里做一件纯逻辑之外的事：**取活体名单**（ctx.get('agents').list()）。拿不到就传 null，
+   * 由 reap() 自己如实标 `livenessCheck: 'unavailable'` 且**一个也不收**。
+   *
+   * dry-run 时 reap() 返回 `changed:false`，于是 mutate() 直接返回、**不写盘** ——
+   * "默认不改状态"由状态层自身的写入门槛保证，不是靠这里多写一个 if。
+   * 本 op **只在工具 handler 显式调用时**发生；没有被 sweep()/读路径/定时器引用（见 tests/collab-reap.mjs 的静态断言）。
+   */
+  async function reapOp(a: CollabArgs, h: HolderInput, agentId: string | null, agent?: AgentLike): Promise<ToolResult> {
+    const live = liveAgentHolderIds()
+    return mutate(s => reap(s, h, a, live, now()), agentId, agent)
+  }
+
   async function waitFor(a: CollabArgs, h: HolderInput, agentId: string | null, agent?: AgentLike): Promise<ToolResult> {
     const timeoutMs = Math.max(0, Math.min(120000, Number(a.timeoutMs) || 30000))
     const paths = (Array.isArray(a.paths) ? a.paths : []).map(norm).filter(Boolean)
@@ -345,6 +386,6 @@ export function installStore(ctx: CollabContext): StateStore {
 
   return {
     fs, now, livenessOf, cwdOf, load, mutate, holderOf, hname,
-    list, overviewOp, status, msgs, waitFor
+    list, overviewOp, status, msgs, reapOp, waitFor
   }
 }

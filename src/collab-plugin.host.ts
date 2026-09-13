@@ -130,9 +130,9 @@ return {
     }
     async function load(agentId, agent) {
       const { cwd, target, stateDir, degraded } = await targetFor(agentId, agent)
-      let warn = cwd ? null : 'state-file at default location (no session cwd); per-project isolation disabled'
+      let warn = cwd ? null : '状态文件落在默认位置（本会话没有 cwd），按项目隔离已失效'
       if (degraded) {
-        const degradedWarn = 'cannot resolve DSH user dir (settings.prepareDocument unavailable or invalid); state lives in project-local .dsh-collab/ and is NOT shared with other launcher forms'
+        const degradedWarn = '无法解析 DSH 用户目录（settings.prepareDocument 不可用或无效）；状态文件落在项目本地的 .dsh-collab/ 下，且不与其他启动形态共享'
         warn = warn ? warn + '; ' + degradedWarn : degradedWarn
       }
       // 迁移失败**不再静默**（与包形态 store.ts 同方向）：旧落点搬不过来 = 项目凭空退回空状态。
@@ -156,7 +156,7 @@ return {
             info = await fs.stat(target)
           }
         } catch (e) {
-          migrateNotes.push('legacy migrate failed: ' + describeError(e))
+          migrateNotes.push('旧落点迁移失败：' + describeError(e))
         }
       }
       if (!info) return { state: init(), version: null, target: target, stateDir: stateDir, warn: mergeWarn(null) }
@@ -179,12 +179,12 @@ return {
           resetOk = true
         } catch (resetError) { resetFailure = describeError(resetError) }
         // 证据链：如实交代原始损坏内容此刻的下落。
-        const corruptWarn = 'state corrupted'
-          + (resetOk ? '; reinitialized' : '; reinitialize failed: ' + resetFailure)
-          + (backupPath ? '; backup: ' + backupPath : '')
-          + (backupFailure ? '; backup failed: ' + backupFailure : '')
-          + (resetOk ? '' : '; original corrupt content left on disk')
-          + (backupFailure && resetOk ? '; original corrupt content overwritten by the reset' : '')
+        const corruptWarn = '状态文件损坏'
+          + (resetOk ? '；已重新初始化' : '；重新初始化失败：' + resetFailure)
+          + (backupPath ? '；备份：' + backupPath : '')
+          + (backupFailure ? '；备份失败：' + backupFailure : '')
+          + (resetOk ? '' : '；原始损坏内容仍留在磁盘上')
+          + (backupFailure && resetOk ? '；原始损坏内容已被重置覆盖' : '')
         return { state: init(), version: null, target: target, stateDir: stateDir, warn: mergeWarn(corruptWarn) }
       }
       s.claims = Array.isArray(s.claims) ? s.claims : []
@@ -202,8 +202,9 @@ return {
       s.holders = s.holders.filter(h => active.has(h.holderId) || holderFresh(h.lastSeenAt, t))
       // 与 collab-core 的 sweep 同形：**reader 不在这里清理**（0.8.3 修掉的真缺陷）。
       // 曾经的 liveHolders 判据（agents.get(sessionId) !== undefined）会把只是空闲、
-      // 并未结束的读者一并删掉 —— 该 claim 释放时已无人可通知。读者只由真正的结束
-      // 信号移除（dropHolder / agent-disposed）；有界性由 claim 的 release/到期保证。
+      // 并未结束的读者一并删掉 —— 该 claim 释放时已无人可通知。读者只由 dropHolder
+      // （agent/disposed）摘掉，且它**只摘 reader 登记、不回收未过期声明**（W7：
+      // 租约是声明回收的唯一机制）；有界性由 claim 的 release/到期保证。
       return { expiredClaims, droppedMessages, prunedHolders: hb - s.holders.length }
     }
     function expire(s, t) { return sweep(s, t).expiredClaims }
@@ -326,6 +327,69 @@ return {
       }
       return { ok: true, changed: true, state, data: { released: rel.map(pub), serverTime: t } }
     }
+    // 僵尸声明显式回收（0.9.8，op=reap）——与 collab-core.ts 的 reap() **同形同名**，
+    // 由 tests/collab-inline-parity.mjs 逐输出对拍。**只由显式 op 调用，绝不自动触发**：
+    // 判据是「holder 不在 agents.list() 里 + age 超门槛」，而 agents.list() 只含本进程此刻
+    // 加载着的 agent —— 休眠但可唤回的会话同样不在里面（0.8.2 按它清 readers 静默丢通知、
+    // W7 确认 dispose 不得提前释放未过期声明），运行时注册表**无法区分**"休眠可唤回"与"真死"。
+    // 所以默认 dry-run，只把候选交给调用方确认；误杀的代价是持有者恢复后以为自己仍有锁。
+    // liveHolderIds = null 表示活体检查没跑成 ⇒ 一个也不收（拿不到名单时"不在名单里"没有信息量）。
+    function reap(s, h, a, liveHolderIds, t) {
+      const raw = Number(a && a.olderThanSec)
+      const olderThanSec = Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : 600
+      const confirm = !!(a && a.confirm === true)
+      const paths = (Array.isArray(a && a.paths) ? a.paths : []).map(norm).filter(Boolean)
+      const unknown = liveHolderIds === null || liveHolderIds === undefined
+      const live = new Set(Array.isArray(liveHolderIds) ? liveHolderIds : [])
+      const hits = []
+      if (!unknown) {
+        for (const c of s.claims) {
+          if (!(c.expiresAt > t)) continue
+          if (c.holderId === h.holderId) continue
+          if (typeof c.holderId !== 'string' || !c.holderId.startsWith('agent:')) continue
+          if (live.has(c.holderId)) continue
+          const createdAt = typeof c.createdAt === 'number' ? c.createdAt : c.expiresAt - (c.ttlSec || 0) * 1000
+          const ageSec = Math.max(0, Math.floor((t - createdAt) / 1000))
+          if (!(ageSec > olderThanSec)) continue
+          if (paths.length && !c.paths.some(cp => paths.some(p => ov(p, cp)))) continue
+          hits.push(c)
+        }
+      }
+      const entries = hits.map(c => {
+        const createdAt = typeof c.createdAt === 'number' ? c.createdAt : c.expiresAt - (c.ttlSec || 0) * 1000
+        const reasons = ['unexpired', 'agent-holder', 'not-self', 'holder-not-in-agents-list', 'age-over-threshold']
+        if (paths.length) reasons.push('paths-intersect')
+        return Object.assign(pub(c), {
+          ageSec: Math.max(0, Math.floor((t - createdAt) / 1000)),
+          remainingSec: Math.max(0, Math.ceil((c.expiresAt - t) / 1000)),
+          olderThanSec,
+          reasons
+        })
+      })
+      const base = { olderThanSec, serverTime: t, livenessCheck: unknown ? 'unavailable' : 'ok' }
+      if (!confirm) return { ok: true, changed: false, state: s, data: Object.assign({ dryRun: true }, base, { candidates: entries }) }
+      if (!hits.length) return { ok: true, changed: false, state: s, data: Object.assign({ dryRun: false }, base, { reaped: [] }) }
+      s.claims = s.claims.filter(c => !hits.includes(c))
+      return { ok: true, changed: true, state: s, data: Object.assign({ dryRun: false }, base, { reaped: entries }) }
+    }
+    // 与 collab-core/包形态的 dropHolder **同形**（同名同签名，由 tests/collab-inline-parity.mjs
+    // 逐输出对拍）：把这个已消失的 holder 从所有剩余 claim 的 readers 摘掉，并**只回收它已经过期**的
+    // 声明。租约（expiresAt）是声明回收的**唯一**机制 —— dispose 不是释放信号：会话被 dispose 后
+    // 往往会恢复并继续干活，提前删掉声明会让别的会话在 overview 里看到路径空闲（W7 锁安全缺陷）。
+    // t 由调用方显式传入（纯逻辑，不隐式读时钟）。
+    function dropHolder(s, h, t) {
+      const isExpired = c => c.holderId === h && c.expiresAt <= t
+      const rel = s.claims.filter(isExpired)
+      let changed = rel.length > 0
+      if (rel.length) s.claims = s.claims.filter(c => !isExpired(c))
+      for (const c of s.claims) {
+        const list = hostReaders(c)
+        if (!list.includes(h)) continue
+        c.readers = list.filter(x => x !== h); changed = true
+      }
+      if (!changed) return { ok: true, changed: false, data: {} }
+      return { ok: true, changed: true, state: s, data: { released: rel.map(pub) } }
+    }
     function heartbeat(state, h, a) {
       const c = state.claims.find(x => x.claimId === a.claimId)
       if (!c) return { ok: false, changed: false, data: { error: 'not-found', message: 'no claim ' + a.claimId } }
@@ -393,6 +457,20 @@ return {
       }
       return { ok: false, error: 'timeout', message: 'paths still claimed', paths, blockers: blockers.map(pub), waitedMs: timeoutMs }
     }
+    // op=reap 的活体检查：agents.list() 的 holderId 列表（'agent:' + a.id）。
+    // 返回 **null** = 检查没跑成（服务/方法缺失或抛错）—— 与"名单为空"是两件事：
+    // 前者一个也不收（拿不到名单时"不在名单里"没有信息量），后者是"此刻确实没有活着的 agent"。
+    function liveAgentHolderIds() {
+      try {
+        const svc = ctx.get('agents')
+        if (!svc || typeof svc.list !== 'function') return null
+        const arr = svc.list()
+        if (!Array.isArray(arr)) return null
+        const out = []
+        for (const a of arr) { const id = a && a.id ? String(a.id) : null; if (id) out.push('agent:' + id) }
+        return out
+      } catch (e) { return null }
+    }
     const exec = (fn) => async (args, e) => { args = args || {}; const h = holderOf(e); const name = hname(h); const aId = h.sessionId || null; try { return await fn(args, h, name, aId, h.agent) } catch (err) { return { ok: false, error: 'internal', message: String((err && err.message) || err) } } }
     const lock = exec((a, h, name, aId, agent) => {
       if (a.op === 'claim') return mutate(s => claim(s, h, name, a), aId, agent)
@@ -402,6 +480,7 @@ return {
       if (a.op === 'overview') return overview(aId, agent)
       if (a.op === 'status') return status(a, aId, agent)
       if (a.op === 'wait') return waitFor(a, h, aId, agent)
+      if (a.op === 'reap') return mutate(s => reap(s, h, a, liveAgentHolderIds(), now()), aId, agent)
       return { ok: false, error: 'bad-request', message: 'unknown op: ' + String(a.op) }
     })
     const board = exec((a, h, name, aId, agent) => {
@@ -412,17 +491,19 @@ return {
     const render = (args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }]
     const lockTool = harness.defineTool({
       name: 'collab_lock',
-      description: '多智能体协作中央注册锁：开工前声明占用项目文件夹（目录以 / 结尾，如 src/backend/），查询他人占用，减少共同开发冲突。规范：动手改代码前先 claim；开工前和定期 list/overview；冲突时先 wait 等待或用 board 留言协商；完成即 release；长任务 heartbeat 续租。',
+      description: '多智能体协作中央注册锁：开工前声明占用项目文件夹（目录以 / 结尾，如 src/backend/），查询他人占用，减少共同开发冲突。规范：动手改代码前先 claim；开工前和定期 list/overview；冲突时先 wait 等待或用 board 留言协商；完成即 release；长任务 heartbeat 续租；被强杀的会话会留下僵尸声明，默认 dry-run 的 op=reap 可显式回收（先看候选，再 confirm:true）。',
       parameters: {
         type: 'object',
         additionalProperties: true,
         properties: {
-          op: { type: 'string', enum: ['claim', 'release', 'list', 'overview', 'status', 'heartbeat', 'wait'], description: 'claim 声明 / release 释放 / list 全部 / overview 占用全景 / status 查路径 / heartbeat 续租 / wait 等待路径释放' },
+          op: { type: 'string', enum: ['claim', 'release', 'list', 'overview', 'status', 'heartbeat', 'wait', 'reap'], description: 'claim 声明 / release 释放 / list 全部 / overview 占用全景 / status 查路径 / heartbeat 续租 / wait 等待路径释放 / reap 显式回收僵尸声明（默认 dry-run）' },
           paths: { type: 'array', items: { type: 'string' }, description: '项目相对路径' },
           claimId: { type: 'string', description: 'claim id，release/heartbeat 用' },
           mode: { type: 'string', enum: ['exclusive', 'shared', 'read'], description: 'exclusive 独占（默认）；shared 声明共用但被独占挡住；read 只读观测，不排他也不被挡' },
           ttlSec: { type: 'number', description: '租约秒数（5-86400），默认 1800' },
           timeoutMs: { type: 'number', description: 'wait 用，最多等待毫秒，默认 30000' },
+          confirm: { type: 'boolean', description: 'reap 用：默认 false = dry-run，只列候选、绝不改状态；显式 true 才真正删除僵尸声明' },
+          olderThanSec: { type: 'number', description: 'reap 用：age 门槛（秒），声明创建至今必须严格大于它才算候选，默认 600' },
           note: { type: 'string', description: '占用说明' }
         },
         required: ['op']
@@ -473,6 +554,12 @@ return {
     // 「剩 N 分」每分钟都变，会让整块快照每分钟重发一次；改用绝对起止时刻后只在占用集合真变时才变。
     // 以下 clockUtc / renderDigest 与 collab-core.ts 的同名导出**逐字节等价**（受限执行环境不能 import，
     // 只能内联）；二者的一致性由 tests/collab-hostcode-parity.mjs 逐字符对拍。
+    // 模式名 → 渲染给人看的标签（W9 文案中文化），与 collab-core.ts 的 MODE_LABELS / modeLabel
+    // **同形同值**。只用于渲染文本：mode 的取值与契约仍是 'exclusive' | 'shared' | 'read'。
+    const MODE_LABELS = { exclusive: '独占', shared: '共享', read: '只读' }
+    function modeLabel(mode) {
+      return MODE_LABELS[mode] || String(mode)
+    }
     function clockUtc(ms) {
       const d = new Date(ms)
       const p = (n) => String(n).padStart(2, '0')
@@ -485,7 +572,7 @@ return {
         const mins = Math.max(1, Math.round((c.ttlSec || 0) / 60))
         const paths = c.paths.slice(0, 2).join(' ') + (c.paths.length > 2 ? ' 等 ' + c.paths.length + ' 条' : '')
         const start = clockUtc(typeof c.createdAt === 'number' ? c.createdAt : c.expiresAt - (c.ttlSec || 0) * 1000)
-        return (c.holderName || c.holderId) + '（' + c.mode + '）占用 ' + paths + '，租约 ' + mins + ' 分（' + start + '–' + clockUtc(c.expiresAt) + '）'
+        return (c.holderName || c.holderId) + '（' + modeLabel(c.mode) + '）占用 ' + paths + '，租约 ' + mins + ' 分（' + start + '–' + clockUtc(c.expiresAt) + '）'
       })
       const more = ordered.length > 3 ? '；另有 ' + (ordered.length - 3) + ' 条' : ''
       return '[dsh-collab] 同项目其他会话当前占用：' + parts.join('；') + more + '。改动这些路径前请先执行 collab_lock op=wait 或用 collab_board 协商。'
@@ -535,18 +622,9 @@ return {
         const agent = payload && payload.agent
         if (!agent || !agent.id) return
         const h = 'agent:' + String(agent.id)
-        // 与 collab-core/包形态的 dropHolder 同形：释放声明，并把它从所有 claim 的 readers 摘掉。
-        mutate(s => {
-          const rel = s.claims.filter(c => c.holderId === h)
-          let changed = rel.length > 0
-          if (rel.length) s.claims = s.claims.filter(c => c.holderId !== h)
-          for (const c of s.claims) {
-            if (!Array.isArray(c.readers) || !c.readers.includes(h)) continue
-            c.readers = c.readers.filter(x => x !== h); changed = true
-          }
-          if (!changed) return { ok: true, changed: false, data: {} }
-          return { ok: true, changed: true, state: s, data: { released: rel.map(pub) } }
-        }, String(agent.id), agent).catch(() => {})
+        // 与 collab-core/包形态的 dropHolder 同形：只回收**已过期**的声明，并把这个已消失的
+        // holder 从所有剩余 claim 的 readers 摘掉。租约是唯一的回收机制 —— dispose 不缩短租约。
+        mutate(s => dropHolder(s, h, now()), String(agent.id), agent).catch(() => {})
       } catch (e) {}
     }, { global: true })
   }

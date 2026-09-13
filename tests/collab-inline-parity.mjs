@@ -15,7 +15,7 @@
 // 与 tests/collab-hostcode-parity.mjs 的分工（互补，不要合并）
 //   · collab-hostcode-parity.mjs 把 hostCode 整体装进 fake ctx **跑起来**，走
 //     "注册工具 → 路径解析 → 锁语义 → awareness 注入文本"的端到端链路，
-//     但它逐输出对拍的只有 clockUtc / renderDigest 两个函数。
+//     但它逐输出对拍的只有 clockUtc / renderDigest / modeLabel 三个函数。
 //   · 本文件不跑插件，只做"抽函数体 → 逐函数语料对拍"，覆盖同名集合里的每一个函数，
 //     并守护"同名集合本身"（漏接对拍会红）。抽取思路照抄旧测试第 258-266 行的先例，
 //     但改用括号配对扫描（旧正则抓不到单行箭头，也会把 `ov` 吃到后面的 `norm` 里去）。
@@ -242,11 +242,11 @@ if (!hostCode || typeof hostCode !== 'string') {
 }
 
 // ---------------------------------------------------------------- 期望集合
-// 17 个"逐输出对拍"的同名函数。
+// 20 个"逐输出对拍"的同名函数。
 const EXPECTED_PARITY = [
-  'claim', 'cleanName', 'clockUtc', 'expire', 'hashProjectKey', 'heartbeat', 'holder',
-  'holderFresh', 'holderView', 'init', 'norm', 'ov', 'post', 'release', 'renderDigest',
-  'seg', 'sweep'
+  'claim', 'cleanName', 'clockUtc', 'dropHolder', 'expire', 'hashProjectKey', 'heartbeat',
+  'holder', 'holderFresh', 'holderView', 'init', 'modeLabel', 'norm', 'ov', 'post', 'reap',
+  'release', 'renderDigest', 'seg', 'sweep'
 ].sort()
 // 同名但**不同形**：宿主的 overview(agentId) 是 async 的 I/O op（load→expire→聚合），
 // core 的 overview(state) 是纯状态变换。两者不是同一形状的函数，不能逐参对拍；
@@ -259,6 +259,13 @@ const T0 = Date.UTC(2026, 0, 2, 3, 4, 37)
 const fixedNow = () => T0
 const host = {}
 const extractErrors = []
+// 宿主内联的 MODE_LABELS 从真实源码里抽出来（不手抄副本），再注入 modeLabel 抽取。
+let hostModeLabels = {}
+try {
+  const m = /const MODE_LABELS = \{([^}]*)\}/.exec(hostCode)
+  if (!m) throw new Error('hostCode 缺少 MODE_LABELS 对象')
+  hostModeLabels = new Function('return {' + m[1] + '}')()
+} catch (e) { extractErrors.push('MODE_LABELS: ' + String((e && e.message) || e)) }
 const tryExtract = (name, scope) => {
   try { host[name] = extractFrom(hostCode, name, scope) }
   catch (e) { extractErrors.push(name + ': ' + String((e && e.message) || e)) }
@@ -274,7 +281,8 @@ tryExtract('sweep', { holderFresh: host.holderFresh })
 tryExtract('expire', { sweep: host.sweep })
 tryExtract('holderView', { holderFresh: host.holderFresh })
 tryExtract('clockUtc')
-tryExtract('renderDigest', { clockUtc: host.clockUtc })
+tryExtract('modeLabel', { MODE_LABELS: hostModeLabels })
+tryExtract('renderDigest', { clockUtc: host.clockUtc, modeLabel: host.modeLabel })
 tryExtract('holder', { now: fixedNow })
 tryExtract('hostReaders')
 tryExtract('pub', { hostReaders: host.hostReaders })
@@ -282,6 +290,10 @@ tryExtract('conflict')
 tryExtract('withWarn')
 tryExtract('claim', { now: fixedNow, norm: host.norm, ov: host.ov, holder: host.holder, pub: host.pub, conflict: host.conflict })
 tryExtract('release', { now: fixedNow, norm: host.norm, ov: host.ov, pub: host.pub })
+// reap（0.9.8）：纯函数 reap(s, h, a, liveHolderIds, t)。宿主内联的默认 age 门槛写成字面量 600，
+// 与 core 的 REAP_DEFAULT_OLDER_THAN_SEC 是否一致由下面的语料守护（含一个不传 olderThanSec 的用例）。
+tryExtract('reap', { norm: host.norm, ov: host.ov, pub: host.pub })
+tryExtract('dropHolder', { pub: host.pub, hostReaders: host.hostReaders })
 tryExtract('heartbeat', { now: fixedNow })
 tryExtract('post', { now: fixedNow, holder: host.holder })
 let overviewLoad = async () => ({ state: null, target: { path: '/fake/collab/state.json' }, stateDir: '/tmp', warn: null })
@@ -475,6 +487,17 @@ group('clockUtc', '毫秒 → MM-DD HH:MMZ（UTC 分钟粒度，秒被截掉）'
   ]
   for (const [label, v] of inputs) pureCase('clockUtc', label, [v], [v])
 }
+// ---------------------------------------------------------------- modeLabel
+group('modeLabel', '模式名 → 中文标签（渲染专用；数据取值仍是 exclusive/shared/read）')
+{
+  for (const m of ['exclusive', 'shared', 'read']) {
+    cmp('modeLabel · ' + m, run(host.modeLabel, [m]), run(coreFns.modeLabel, [m]))
+  }
+  ok(coreFns.modeLabel('exclusive') === '独占' && coreFns.modeLabel('shared') === '共享' && coreFns.modeLabel('read') === '只读',
+    '三档中文标签固定为 独占/共享/只读',
+    JSON.stringify([coreFns.modeLabel('exclusive'), coreFns.modeLabel('shared'), coreFns.modeLabel('read')]))
+  cmp('modeLabel · 未知取值原样回退', run(host.modeLabel, ['weird']), run(coreFns.modeLabel, ['weird']))
+}
 // ---------------------------------------------------------------- renderDigest
 group('renderDigest', '占用摘要文本：逐字节等价 + 顺序无关')
 {
@@ -495,8 +518,11 @@ group('renderDigest', '占用摘要文本：逐字节等价 + 顺序无关')
   ok(host.renderDigest([c3, c1, c2]) === host.renderDigest([c1, c2, c3]), 'host 形态顺序无关')
   ok(coreFns.renderDigest([c3, c1, c2]) === coreFns.renderDigest([c1, c2, c3]), 'core 形态顺序无关')
   const sample = coreFns.renderDigest([c1, c2])
-  ok(sample.includes('One（exclusive）占用 src/one/，租约 30 分（01-02 03:04Z–01-02 03:34Z）'),
+  ok(sample.includes('One（独占）占用 src/one/，租约 30 分（01-02 03:04Z–01-02 03:34Z）'),
     'core 渲染出文档化的绝对 UTC 窗口文案（证明比的是真实文本）', sample)
+  ok(sample.includes('Two（共享）占用 src/two/'), 'core 渲染 shared → 共享', sample)
+  const readOnly = coreFns.renderDigest([c3])
+  ok(readOnly.includes('Three（只读）占用 src/three/'), 'core 渲染 read → 只读', readOnly)
 }
 // ---------------------------------------------------------------- holderFresh
 group('holderFresh', '新鲜度判据：24h 回收边界 + 5min 未来偏移容忍')
@@ -749,6 +775,109 @@ group('release', '释放：claimId 优先 / forbidden / not-found / 按路径前
   })
   R('空状态按路径释放', { state: () => ({}), a: () => ({ paths: ['src/a/'] }) })
 }
+// ---------------------------------------------------------------- reap
+// 0.9.8：僵尸声明显式回收。两形态必须逐输出等价 —— 尤其 confirm 缺省必须两边都**不改状态**，
+// 活体名单里有的人无论多老都不碰，age 门槛与 paths 限定的边界完全一致。
+group('reap', '僵尸声明显式回收：默认 dry-run / 活体检查 / age 门槛 / 未过期 / 不含自己（0.9.8）')
+{
+  const at = T0
+  const zombie = (id, paths, holderId) => mkClaimRec({ claimId: id, holderId: holderId || 'agent:DEAD', holderName: 'Dead Worker', paths, mode: 'exclusive', createdAt: T0 - 1000 * 1000, expiresAt: T0 + 600 * 1000, readers: ['agent:READER'] })
+  const fresh = () => mkClaimRec({ claimId: 'c_f', holderId: 'agent:DEAD', paths: ['src/f/'], createdAt: T0 - 100 * 1000, expiresAt: T0 + 600 * 1000 })
+  const alive = () => mkClaimRec({ claimId: 'c_a', holderId: 'agent:LIVE', paths: ['src/a/'], createdAt: T0 - 1000 * 1000, expiresAt: T0 + 600 * 1000 })
+  const expired = () => mkClaimRec({ claimId: 'c_e', holderId: 'agent:DEAD', paths: ['src/e/'], createdAt: T0 - 1000 * 1000, expiresAt: T0 - 1 })
+  const mine = () => mkClaimRec({ claimId: 'c_m', holderId: HOLDER_A.holderId, paths: ['src/m/'], createdAt: T0 - 1000 * 1000, expiresAt: T0 + 600 * 1000 })
+  const human = () => mkClaimRec({ claimId: 'c_h', holderId: 'human:console', paths: ['src/h/'], createdAt: T0 - 1000 * 1000, expiresAt: T0 + 600 * 1000 })
+  const RP = (label, claims, a, live, h) => pairCase('reap', label, () => {
+    const state = mkState({ claims: claims.map(c => Object.assign({}, c, { paths: c.paths.slice(), readers: (c.readers || []).slice() })) })
+    const liveCopy = live === undefined ? ['agent:LIVE'] : (live === null ? null : live.slice())
+    return { hostArgs: [state, h || HOLDER_A, a, liveCopy, at], coreArgs: [state, h || HOLDER_A, a, liveCopy, at], state }
+  })
+  RP('dry-run（缺 confirm）：列候选、状态零变化', [zombie('c_z', ['src/z/']), alive(), mine()], {}, ['agent:LIVE'])
+  RP('confirm:false 仍不改状态（只有显式 true 才动手）', [zombie('c_z', ['src/z/'])], { confirm: false }, [])
+  RP('confirm:true 只删不在活体名单里的', [zombie('c_z', ['src/z/']), alive()], { confirm: true }, ['agent:LIVE'])
+  RP('confirm:true 不碰自己的声明（自己用 op=release）', [zombie('c_z', ['src/z/']), mine()], { confirm: true }, [])
+  RP('已过期声明不由 reap 处理（那是 sweep 的活）', [expired()], { confirm: true }, [])
+  RP('age 未超默认门槛不动', [fresh()], { confirm: true }, [])
+  RP('显式更小 olderThanSec 时才回收', [fresh()], { confirm: true, olderThanSec: 10 }, [])
+  RP('paths 限定：只回收与给定路径相交的', [zombie('c_z', ['src/z/']), zombie('c_o', ['other/x/'], 'agent:DEAD2')], { confirm: true, paths: ['other/'] }, [])
+  RP('活体检查不可用（null）⇒ 一个也不收', [zombie('c_z', ['src/z/'])], { confirm: true }, null)
+  RP('human:console 无活体信号，不收（按 age 收它等于纯按 age 回收）', [human()], { confirm: true }, [])
+  RP('olderThanSec 非法值回退保守默认 600', [zombie('c_z', ['src/z/'])], { confirm: true, olderThanSec: -5 }, [])
+  RP('空状态：ok 且无候选', [], { confirm: true }, [])
+}
+// ---------------------------------------------------------------- dropHolder
+// W7：声明（claim）的生命周期**只由租约 expiresAt 决定** —— dispose 不是释放信号。
+// 两形态都必须：只回收该 holder **已过期**的声明，未过期的原样保留（连同它的 readers），
+// 并把 holderId 从所有**剩余** claim 的 readers 里摘掉。
+group('dropHolder', '会话退出：只回收已过期声明 + 从所有剩余 claim 摘 reader（W7）')
+{
+  // 真实负载同构：一个还活着的 holder（未到期声明）+ 一个到期时刻已知的已过期声明。
+  const live = mkClaimRec({ claimId: 'c_live', holderId: 'agent:X', paths: ['src/x/'], expiresAt: T0 + 60000 })
+  const dead = mkClaimRec({ claimId: 'c_dead', holderId: 'agent:X', paths: ['src/y/'], expiresAt: T0 - 1 })
+  const atT = mkClaimRec({ claimId: 'c_bd', holderId: 'agent:X', paths: ['src/z/'], expiresAt: T0 })
+  const byOther = mkClaimRec({ claimId: 'c_o', holderId: 'agent:Y', paths: ['src/o/'], readers: ['agent:X', 'agent:Z'] })
+  const dirty = mkClaimRec({ claimId: 'c_d', holderId: 'agent:Y', paths: ['src/d/'], readers: ['agent:X', 'agent:X', 42, 'agent:Z'] })
+  const noReader = mkClaimRec({ claimId: 'c_n', holderId: 'agent:Y', paths: ['src/n/'], readers: [] })
+
+  const D = (label, holderId, claims, t) => pairCase('dropHolder', label, () => {
+    const state = mkState({ claims: claims.map((c) => Object.assign({}, c, { readers: (c.readers || []).slice() })) })
+    return { hostArgs: [state, holderId, t === undefined ? T0 : t], coreArgs: [state, holderId, t === undefined ? T0 : t], state }
+  })
+  D('未过期声明**不**被释放（dispose 不缩短租约）', 'agent:X', [live], T0)
+  D('未过期声明不被释放，且 reader 列表原样保留', 'agent:X', [live, byOther], T0)
+  D('已过期声明被回收（expiresAt < t）', 'agent:X', [dead], T0)
+  D('边界：expiresAt === t 也算已过期（与 sweep 的 > t 同一判据）', 'agent:X', [atT], T0)
+  D('混合：未过期保留、已过期回收', 'agent:X', [live, dead, byOther], T0)
+  D('reader 从所有剩余 claim 被摘掉（含脏 readers 归一）', 'agent:X', [byOther, dirty, noReader], T0)
+  D('该 holder 一条声明都没有：只摘 reader', 'agent:X', [byOther], T0)
+  D('其他 holder 的未过期声明完全不受影响', 'agent:X', [live, noReader], T0)
+  D('空状态：ok 且无变化', 'agent:X', [], T0)
+  D('holderId 不在状态里：无变化', 'agent:NOPE', [live, byOther], T0)
+
+  // 幂等：第二次必须 changed === false（两形态一致）。
+  {
+    const mk = () => mkState({ claims: [
+      Object.assign({}, live, { readers: [] }),
+      Object.assign({}, dead, { readers: [] }),
+      Object.assign({}, byOther, { readers: byOther.readers.slice() })
+    ] })
+    const hs = mk(), cs = mk()
+    const h1 = host.dropHolder(hs, 'agent:X', T0), c1 = coreFns.dropHolder(cs, 'agent:X', T0)
+    const h2 = host.dropHolder(hs, 'agent:X', T0), c2 = coreFns.dropHolder(cs, 'agent:X', T0)
+    cmp('dropHolder · 第一次输出', outcome({ threw: false, value: h1 }), outcome({ threw: false, value: c1 }))
+    cmp('dropHolder · 第二次输出（幂等）', outcome({ threw: false, value: h2 }), outcome({ threw: false, value: c2 }))
+    cmp('dropHolder · 两次调用后的 state', hs, cs)
+    ok(h1.changed === true && h2.changed === false, 'host dropHolder 幂等：第一次 changed / 第二次 not changed', String(h1.changed) + '/' + String(h2.changed))
+    ok(c1.changed === true && c2.changed === false, 'core dropHolder 幂等：第一次 changed / 第二次 not changed', String(c1.changed) + '/' + String(c2.changed))
+    ok(h2.changed === false && c2.changed === false, '幂等那次不改变状态（同一次状态变更内完成）')
+  }
+
+  // 显式钉住 W7 的三条语义（不只看两形态相等，还看**具体取值**）。
+  {
+    const hs = mkState({ claims: [
+      Object.assign({}, live, { readers: ['agent:W'] }),
+      Object.assign({}, dead, { readers: ['agent:W'] }),
+      Object.assign({}, byOther, { readers: byOther.readers.slice() })
+    ] })
+    const cs = mkState({ claims: [
+      Object.assign({}, live, { readers: ['agent:W'] }),
+      Object.assign({}, dead, { readers: ['agent:W'] }),
+      Object.assign({}, byOther, { readers: byOther.readers.slice() })
+    ] })
+    const hr = host.dropHolder(hs, 'agent:X', T0), cr = coreFns.dropHolder(cs, 'agent:X', T0)
+    for (const [who, st, r] of [['host', hs, hr], ['core', cs, cr]]) {
+      ok(st.claims.some((c) => c.claimId === 'c_live'), who + '：未过期声明 c_live 在 dropHolder 之后仍然存在（未到期 ⇒ 不释放）',
+        JSON.stringify(st.claims.map((c) => c.claimId)))
+      ok(!st.claims.some((c) => c.claimId === 'c_dead'), who + '：已过期声明 c_dead 被回收',
+        JSON.stringify(st.claims.map((c) => c.claimId)))
+      ok(r.data.released.length === 1 && r.data.released[0].claimId === 'c_dead',
+        who + '：data.released 只含真正被删掉的那条', JSON.stringify(r.data.released.map((x) => x.claimId)))
+      const remain = st.claims.find((c) => c.claimId === 'c_o')
+      ok(remain && !remain.readers.includes('agent:X') && remain.readers.includes('agent:Z'),
+        who + '：reader 仍被摘掉，其他 reader 不受影响', JSON.stringify(remain && remain.readers))
+    }
+  }
+}
 // ---------------------------------------------------------------- heartbeat
 group('heartbeat', '续租：expiresAt = now + ttlSec / forbidden / not-found')
 {
@@ -834,7 +963,7 @@ group('corpus', '每个同名函数的语料条数下限（防止语料被悄悄
     const n = g ? g.pass + g.fail : 0
     ok(n >= 4, 'corpus · ' + name + ' 至少 4 条断言', 'actual=' + n)
   }
-  ok(EXPECTED_PARITY.length === 17, '逐输出对拍的同名函数恰好 17 个', String(EXPECTED_PARITY.length))
+  ok(EXPECTED_PARITY.length === 20, '逐输出对拍的同名函数恰好 20 个', String(EXPECTED_PARITY.length))
 }
 
 // ---------------------------------------------------------------- 汇总

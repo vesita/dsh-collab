@@ -445,7 +445,7 @@ Holder = {
 
 > 一致性保障：`collab-plugin.host.ts` 内联的 `norm`/`cleanName` 与核心库由对拍测试（`tests/collab-pure-logic.mjs` §9）保证不漂移；正式化进 host 组合后插件改为直接 import 核心模块消除重复。
 >
-> **0.9.0 起**这条保障被强化成两层：`tests/collab-inline-parity.mjs` 用括号配对扫描从 `hostCode` 里抽出**全部 18 个两形态同名函数**逐输出对拍（原先只有 `clockUtc`/`renderDigest` 两个），并以「实测同名集合必须恰好等于期望集合」做回归守护——任何一侧新增同名函数却忘记接入对拍都会变红。
+> **0.9.0 起**这条保障被强化成两层：`tests/collab-inline-parity.mjs` 用括号配对扫描从 `hostCode` 里抽出**全部 19 个两形态同名函数**逐输出对拍（原先只有 `clockUtc`/`renderDigest` 两个），并以「实测同名集合必须恰好等于期望集合」做回归守护——任何一侧新增同名函数却忘记接入对拍都会变红。
 
 > **0.9.0 架构变更**：上表是 M3 当时（0.4 时代）的落库结构。0.9.0 把 1640 行的单体 `src/index.ts`
 > 拆成 **11 个模块**（`contract` / `spec` / `skill` / `store` / `access` / `gate` / `push` / `tools` /

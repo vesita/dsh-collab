@@ -1,38 +1,45 @@
 import { createHarness } from './_harness.mjs'
 
 // collab-readers-push.mjs
-// 功能 D：锁上的读者反向注册（readers）+ 释放后的原生推送（sessionController.prompt）
-//         + 0.8.4 的子代理投递回退通道（subagents.sendMessage）。
+// 功能 D：锁上的读者反向注册（readers）+ 释放后的通知投递。
+//
+// **0.9.6 的载体变更（本文件的核心回归）**：通知不再经
+//   · `sessionController.prompt`（旧主通道），也不再经
+//   · `subagents.sendMessage`（0.8.4 的回退通道）。
+// 这两个 API 都**只收 content**，消息由宿主代造，宿主写死
+// `source: { kind: 'user', rpcId: 'dsh-collab-…' }` —— 实测转录里就是 `user/message` + `kind:'user'`，
+// 在 GUI 里渲染成**用户气泡**（落进 next-step 收件箱还会升级成 steering 气泡，与真人共用
+// UserStyleBubble 渲染器）。这违反 AGENTS.md §1「严禁冒充用户」。
+// 新投递面只有一个：**进程内解析目标 agent**（`ctx.get('agents').get(sessionId)`），解析到就
+// `agent.inject(msg)`；消息由**真实的** `@deepseek-ai/dsh-llm` 构造，来源显式非 user：
+//   { kind: 'plugin', plugin: 'dsh-collab', form: 'notice', summary: boundContextSummary(…) }
+// 客户端分流**只看 `source.kind`**（`dsh-client-ui-chat/lib/client.js:6058`，发生在收件箱分类之前），
+// `kind:'plugin'` + `form:'notice'` + **非空 summary** ⇒ 独立可折叠的 ContextInjectionRow，不是气泡。
+// 解析不到目标 agent 就**如实跳过**（`skipped.reason === 'agent-not-resolvable'`），绝不回退。
 //
 // 覆盖面：
 //   1) 纯逻辑：registerReader / dropHolder / readersOf / sweep（0.8.3 起**不清理 readers**）；
 //   2) 插件的 post-execute 会把"被通知者"反向登记进 claim.readers，且**不重复**；
-//   3) 显式 op=release 之后向活着的 reader 会话推送；排除释放者；同一 (claimId, reader) 只推一次；
-//   4) 安全硬约束：冷会话（agents.get 返回 undefined）**两个通道都零调用**（prompt 会 resume，
-//      subagents.sendMessage 会对"缺席的直接子会话"cold-resume，绝不允许）；
-//   5) best-effort：prompt 抛错 / 超时 / sessionController 缺失都不改变 release 的工具结果；
-//   6) agent/disposed 既释放声明、也把自己从所有 readers 摘掉；
-//   7) 0.8.3 的可观测性：release 结果上的 notify { readers, pushed, skipped[{sessionId,reason,error?}] }
-//      必须把"没有人需要通知"与"通知通道坏了"分开；0.8.3 的三种 reason 语义一字未改；
-//   8) 0.8.4 回退通道：prompt 以 **session/agent-busy + details.reason = 'use subagent delivery
-//      for this child session'** 被拒时改走 subagents.sendMessage；成功记入 pushed 并在
-//      pushedVia 标出通道；不邻接 -> reason 'not-adjacent'；其它回退失败 -> 'subagent-failed'；
-//      服务缺失 / 拿不到活 Agent -> 一次都不尝试；**非路由**的 prompt 失败（含同 code 的
-//      'prompt rejected'）不触发回退；
-//   9) 通知**载体**：不再**手抄** UserMessage 构造函数、也不再有副本（AGENTS.md §1「严禁冒充用户」）
-//      —— 构造一律走真实的 `@deepseek-ai/dsh-llm`，只是 source 必须显式非 user；
-//      `src/plugin-message.ts` 与 `lib/plugin-message.js` 都已删除；post-execute 的决策对象上
-//      **没有** additionalContexts 键、且**原样返回 downstream**；通知改由 `agent.inject` 逐事件
-//      投递一条**显式标注来源**的 notice（`source = {kind:'plugin', plugin:'dsh-collab',
-//      form:'notice', summary}`）—— 客户端按 `source.kind !== 'user'` 渲染成 **notice 行、
-//      不是用户气泡**，`summary` 缺失才会退化成 opaque 行。
+//   3) 显式 op=release 之后向活着的 reader **inject** 一条通知；排除释放者；同一 (claimId, reader) 只投一次；
+//   4) 安全硬约束：冷会话（agents.get 返回 undefined）**零投递**（既不 inject，也不碰旧通道）；
+//   5) best-effort：inject 抛错 / 投递面缺失都不改变 release 的工具结果，且错误**不被抹平**；
+//   6) agent/disposed（W7 起）**不释放未过期声明**、只把自己从所有 readers 摘掉，
+//      并因此**不产生**"锁已释放"通知（没有发生释放事件）；只回收已过期的声明；
+//   6b) dispose 不缩短租约：未到期声明在 dropHolder 之后、到期之前一直在，由 sweep 在 expiresAt 回收；
+//   7) 可观测性：release 结果上的 notify { readers, pushed, pushedVia, skipped[{sessionId,reason,error?}] }
+//      必须把"没有人需要通知"与"通知通道坏了"分开；pushedVia 反映真实通道（'inject'）；
+//   8) **旧通道彻底删除**：`sessionController.prompt` 与 `subagents.sendMessage` 在整个文件的所有场景里
+//      **零调用**（假服务在场并记录调用，所以"零"是一条非空断言）；旧 reason 取值
+//      （prompt-failed / not-adjacent / subagent-failed）不再出现在任何 notify 里；
+//   9) (a) 投递出去的**每一条**消息来源都显式非 user（kind/plugin/form + 非空 ≤120 字符 summary）；
+//  10) (b) TOCTOU：判据说活着、投递时解析不到目标 agent -> 投递数 0 且 skipped 带 agent-not-resolvable；
+//  11) (c) **负向对照**（手工执行，见下）：把 source 的 kind 改成 'user'（或恢复 controller.prompt）
+//      ⇒ (a) 必须变红。RED 原文见交付报告。
 //
-// 明确不覆盖（无法在没有活部署时验证）：真实 sessionController.prompt 的端到端投递、
-// **真实 subagents.sendMessage 的端到端投递**（邻接判定、cold-resume、sender 同一性都只有
-// DSH 自己那份实现说了算）、真实 agents 注册表的活性语义、真实会话被 steer/queue 后的行为、
-// 以及"agent.inject 的消息真的进了 next-step 收件箱"（那要活部署的会话日志）。下面的 subagents、
-// systemPrompt 与 agent 上的 inject 都是**假服务**，验证的是本插件侧的契约
-// （调用时机 / 参数形状 / 记账 / 注册形状），不是"真机上一定能投到"。见文件末尾的说明与报告。
+// 明确不覆盖（无法在没有活部署时验证）：真实 agents 注册表的活性/对象语义、真实会话被 inject 后
+// 是否真的进了 next-step 收件箱（那要活部署的会话日志）、真实 `agent.inject` 的同步性。下面的
+// agents / sessionController / subagents 都是**假服务**，验证的是本插件侧的契约
+// （调用时机 / 参数形状 / 记账 / 来源形状），不是"真机上一定能投到"。见文件末尾的说明与报告。
 //
 // 运行：node tests/collab-readers-push.mjs
 
@@ -55,8 +62,7 @@ const { sessionIdOf } = mod
 const { registerReader, dropHolder, readersOf, sweep, init } = core
 
 const h = createHarness({ skipped: true })
-// 本文件已无任何"跳过"分支（真身对拍随 src/plugin-message.ts 一起删除了），
-// 因此不再解构 skip()：留着它就是死代码，且会暗示这里还有未验证项。
+// 本文件已无任何"跳过"分支，因此不再解构 skip()：留着它就是死代码，且会暗示这里还有未验证项。
 // 汇总行仍由 harness 打印 ", 0 skipped" —— 在没有跳过项时这是实话。
 const { ok } = h
 
@@ -67,6 +73,28 @@ const mkClaim = (o) => Object.assign({
   claimId: 'c_x', holderId: 'agent:owner', holderName: 'Owner', paths: ['src/x/'],
   mode: 'exclusive', ttlSec: 1800, expiresAt: T0 + 1800 * 1000, note: '', createdAt: T0
 }, o)
+
+/**
+ * 全文件共享的投递账本（跨 harness）：每一条经 `agent.inject` 投出去的释放通知都在这里。
+ * 末尾的 (a) 断言对**每一条**做来源形状检查 —— 这正是"投递出去的每条消息"的字面要求。
+ */
+const deliveries = []
+/** 全文件共享的 notify 账本：末尾用它做"旧 reason 取值彻底消失"的全局扫描。 */
+const allNotifies = []
+
+/**
+ * (a) 来源形状：客户端分流只看 `source.kind`（dsh-client-ui-chat/lib/client.js:6058），
+ * 且 `form:'notice'` **必须带非空 summary**（否则退化成 opaque 行，client.js:795-800），
+ * summary 上限 120 字符由 boundContextSummary 保证。
+ */
+const sourceShapeOk = (msg) => {
+  const s = msg && msg.source
+  return !!s && s.kind === 'plugin' && s.plugin === 'dsh-collab' && s.form === 'notice' &&
+    typeof s.summary === 'string' && s.summary.length > 0 && s.summary.length <= 120
+}
+const sourceShapeWhy = (msg) => JSON.stringify(msg && msg.source)
+/** 旧通道（会冒充用户）的 reason 取值：0.9.6 起不再允许出现。 */
+const RETIRED_REASONS = ['prompt-failed', 'not-adjacent', 'subagent-failed']
 
 // ════════════════════════════════════════════════════════════════════════
 // 1. 纯逻辑
@@ -95,19 +123,58 @@ console.log('# registerReader / dropHolder / readersOf')
   const r4 = registerReader(st, 'c_2', 'agent:B')
   ok(r4.changed === false, '脏 readers 里已有的 holder 也算已登记')
 
-  // dropHolder：释放自己的声明 + 从**所有** claim 的 readers 摘掉
+  // dropHolder（W7）：声明（claim）的生命周期**只由租约 expiresAt 决定** —— dispose 不是释放信号。
+  // 只回收该 holder **已过期**的声明；未过期的原样保留（连同它自己的 readers）；
+  // 仍然把 holderId 从**所有剩余** claim 的 readers 里摘掉。
   const st2 = init()
-  st2.claims.push(mkClaim({ claimId: 'c_a', holderId: 'agent:X', paths: ['src/a/'] }))
+  st2.claims.push(mkClaim({ claimId: 'c_a', holderId: 'agent:X', paths: ['src/a/'], readers: ['agent:W'], expiresAt: T0 + 1800 * 1000 }))
+  st2.claims.push(mkClaim({ claimId: 'c_exp', holderId: 'agent:X', paths: ['src/e/'], expiresAt: T0 - 1 }))
   st2.claims.push(mkClaim({ claimId: 'c_b', holderId: 'agent:Y', paths: ['src/b/'], readers: ['agent:X', 'agent:Z'] }))
   st2.claims.push(mkClaim({ claimId: 'c_c', holderId: 'agent:Z', paths: ['src/c/'], readers: ['agent:X'] }))
-  const d = dropHolder(st2, 'agent:X')
+  const d = dropHolder(st2, 'agent:X', T0)
+  // 取值一律先 find 再判空：负向对照（改回旧语义）时声明会被提前删掉，
+  // 断言必须把每条都如实报出来，而不是在第一条上抛 TypeError 中断整个文件。
+  const keptA = st2.claims.find(c => c.claimId === 'c_a')
+  const keptB = st2.claims.find(c => c.claimId === 'c_b')
+  const keptC = st2.claims.find(c => c.claimId === 'c_c')
   ok(d.ok === true && d.changed === true, 'dropHolder 改变状态')
-  ok(!st2.claims.some(c => c.holderId === 'agent:X'), 'X 自己的声明被释放', JSON.stringify(st2.claims.map(c => c.claimId)))
-  ok(d.data.released.length === 1 && d.data.released[0].claimId === 'c_a', 'released 里带回被释放的声明（推送要用）')
-  ok(JSON.stringify(st2.claims.find(c => c.claimId === 'c_b').readers) === '["agent:Z"]', 'X 从 c_b 的 readers 里被摘掉')
-  ok(JSON.stringify(st2.claims.find(c => c.claimId === 'c_c').readers) === '[]', 'X 从 c_c 的 readers 里被摘掉')
-  const d2 = dropHolder(st2, 'agent:X')
-  ok(d2.changed === false, '再摘一次无变化（幂等）')
+  ok(!!keptA, '未过期声明**不**被释放（dispose 不缩短租约）', JSON.stringify(st2.claims.map(c => c.claimId)))
+  ok(JSON.stringify(keptA && keptA.readers) === '["agent:W"]', '未过期声明连同它自己的 readers 原样保留', JSON.stringify(keptA && keptA.readers))
+  ok(!st2.claims.some(c => c.claimId === 'c_exp'), '已过期声明被回收', JSON.stringify(st2.claims.map(c => c.claimId)))
+  ok(d.data.released.length === 1 && d.data.released[0].claimId === 'c_exp', 'released 只含**真正被删掉**的声明（推送要用）', JSON.stringify(d.data.released.map(x => x.claimId)))
+  ok(JSON.stringify(keptB && keptB.readers) === '["agent:Z"]', 'X 从 c_b 的 readers 里被摘掉', JSON.stringify(keptB && keptB.readers))
+  ok(JSON.stringify(keptC && keptC.readers) === '[]', 'X 从 c_c 的 readers 里被摘掉', JSON.stringify(keptC && keptC.readers))
+  const d2 = dropHolder(st2, 'agent:X', T0)
+  ok(d2.changed === false, '再摘一次无变化（幂等）', JSON.stringify(d2.data))
+  // 只摘 reader、不动任何声明的形态：changed 必须为 true（否则那一次 mutate 不会落盘）
+  const st3 = init()
+  st3.claims.push(mkClaim({ claimId: 'c_r', holderId: 'agent:Y', paths: ['src/r/'], readers: ['agent:X'], expiresAt: T0 + 1800 * 1000 }))
+  const d3 = dropHolder(st3, 'agent:X', T0)
+  ok(d3.changed === true && d3.data.released.length === 0, '只有 reader 可摘时 changed=true 且 released 为空', JSON.stringify(d3.data))
+  ok(st3.claims.length === 1, '没有任何声明被回收', JSON.stringify(st3.claims.map(c => c.claimId)))
+}
+
+console.log('# dropHolder 不缩短租约：未到期声明在 dropHolder 之后、到期之前一直存活（租约是唯一回收机制）')
+{
+  // 与真实负载同构：一个还活着的 holder + 一条到期时刻已知的声明（默认 ttlSec=1800）。
+  const s = init()
+  const EXPIRY = T0 + 1800 * 1000
+  s.claims.push(mkClaim({ claimId: 'c_alive', holderId: 'agent:LIVE', paths: ['src/a/'], expiresAt: EXPIRY }))
+  const r = dropHolder(s, 'agent:LIVE', T0)
+  ok(r.changed === false, '未到期 ⇒ dropHolder 一条声明都没删（changed=false）', JSON.stringify(r.data))
+  ok(s.claims.some(c => c.claimId === 'c_alive'), 'dropHolder 之后声明仍在（dispose 不缩短租约）', JSON.stringify(s.claims.map(c => c.claimId)))
+  const w1 = sweep(s, EXPIRY - 1)
+  ok(w1.expiredClaims === 0 && s.claims.some(c => c.claimId === 'c_alive'), '到期前 1ms 的 sweep 也不会回收它', JSON.stringify(w1))
+  const w2 = sweep(s, EXPIRY)
+  ok(w2.expiredClaims === 1 && !s.claims.some(c => c.claimId === 'c_alive'), '恰好在 expiresAt 由 sweep 回收 —— 租约是唯一的回收机制', JSON.stringify(w2))
+  // 安全侧后果（如实记录，不藏）：会话死亡后它的声明会一直占用到租约到期，
+  // 期间其他会话必须 op=wait 或协商；op=heartbeat 仍是唯一的续租方式。
+  // 也就是说"等待路径空闲"不再是可靠判据 —— 下面这条就是那条后果的可执行形式。
+  const s2 = init()
+  s2.claims.push(mkClaim({ claimId: 'c_dead_holder', holderId: 'agent:DEAD', paths: ['src/a/'], expiresAt: EXPIRY }))
+  dropHolder(s2, 'agent:DEAD', T0)
+  const stillBlocking = s2.claims.filter(c => c.mode === 'exclusive' && c.paths.some(p => p.startsWith('src/a')))
+  ok(stillBlocking.length === 1, '安全侧后果：dispose 之后该路径仍被占用（他人必须 wait/协商，直到租约到期）', JSON.stringify(stillBlocking.map(c => c.claimId)))
 }
 
 console.log('# sweep 不清理 readers（0.8.3：读者只由真正的"结束"信号移除）')
@@ -149,7 +216,7 @@ console.log('# sweep 不清理 readers（0.8.3：读者只由真正的"结束"�
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// 2. 插件级：真实 ctx 上的反向注册与推送
+// 2. 插件级：真实 ctx 上的反向注册与投递
 // ════════════════════════════════════════════════════════════════════════
 const settle = () => new Promise((r) => setTimeout(r, 25))
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
@@ -176,94 +243,76 @@ function makeFs(store, versions) {
 }
 
 /**
- * 真实 RemoteError 的形状（dsh-typert-protocol/lib/types/remote-error.js:9-33）：
- * code / details / isDSHRemoteError 都是**普通字段**，识别按字段而不是 instanceof。
- */
-const remoteError = (code, message, details) => {
-  const e = new Error(message)
-  e.code = code
-  e.details = details
-  e.isDSHRemoteError = true
-  e.name = 'RemoteError'
-  return e
-}
-/**
- * "该会话由子代理路由托管"那条拒绝：文案与 details 逐字取自
- * dsh-api-session-controller/lib/index.js:137，与主 AI 在活进程里实测到的 release 返回同文本。
- */
-const routingRejection = (sessionId) => remoteError(
-  'session/agent-busy',
-  'session "' + sessionId + '" is owned by subagent routing',
-  { reason: 'use subagent delivery for this child session' }
-)
-/**
- * **同一个 code** 的另一处抛出（dsh-api-session-controller/lib/index.js:785）：
- * 普通投递失败也叫 session/agent-busy，但 details.reason 不是那条路由指示。
- * 这是"只看 code 会误判"的活证据。
- */
-const busyPlainRejection = () => remoteError('session/agent-busy', 'prompt rejected', { reason: 'Error: inbox closed' })
-/** dsh-subagent 的 SubagentError 形状（HarnessError 子类：code 是普通字段，dsh-llm/lib/index.js:121）。 */
-const subagentError = (code, message) => {
-  const e = new Error(message)
-  e.code = code
-  e.name = 'SubagentError'
-  return e
-}
-
-/**
  * @param opts.claims       预置 claims
- * @param opts.liveSessions agents.get 认为"活着"的 sessionId
- * @param opts.sessionRows  sessionController.list 返回的行（running 判定）
- * @param opts.promptThrows prompt 是否抛普通错误
- * @param opts.promptRouting prompt 是否抛"子代理路由托管"拒绝（code + details.reason）
- * @param opts.promptRoutingNoDetails 同上，但**丢掉 details**（只剩 message 兜底判据）
- * @param opts.promptBusyPlain prompt 是否抛同 code 但 reason 非路由的拒绝（index.js:785 分支）
- * @param opts.sendFails    subagents.sendMessage 抛出的错误
- * @param opts.sendHangs    subagents.sendMessage 永不 resolve（验证回退超时护栏）
- * @param opts.withController 是否提供 sessionController
- * @param opts.withSubagents  是否提供 subagents（默认提供；false = 服务缺失）
+ * @param opts.liveSessions agents.get 认为"活着"的 sessionId（默认给一个带 inject 的假 agent）
+ * @param opts.agentObjects  指定 sessionId -> 现成的 agent 对象（断言对象同一性时用）
+ * @param opts.agentsWithoutInject 活着的会话返回**没有 inject 面**的对象（受限宿主）
+ * @param opts.injectThrows  假 agent 的 inject 抛错（验证失败被如实记下、不抹平）
+ * @param opts.agentsVanishAfterProbe 第一次 agents.get（存活判据）返回活 agent，之后返回 undefined
+ *        —— 复现 TOCTOU 竞态：(b) 解析不到目标 agent 时必须如实跳过
+ * @param opts.withAgents    false = agents 服务缺失（投递面整个不在）
  * @param opts.agentsGetThrows agents.get 是否抛异常（存活判据本身坏了 — 基础设施故障）
- * @param opts.timerThrowsWhenArmed ctx.timer.timeout 在 armTimer() 之后是否抛异常
- *        （在**读者处理途中**制造一个未预期异常，用来验证 notifyReaders 的整体兜底会不会记账）
+ * @param opts.withController / withSubagents 是否提供**旧通道**的假服务（默认提供；
+ *        它们在本文件里的用途只有一个：记录调用并断言**零调用**）
  */
 async function makeHarness(opts = {}) {
   const store = new Map()
   const versions = new Map()
   const tools = []
+  // 旧通道的观测点：本文件所有场景都必须保持 0（"绝不冒充用户"的可执行断言）。
   const prompts = []
   const sends = []
-  const timerState = { armed: false }
+  // 新通道的观测点：经 agent.inject 投出去的释放通知。
+  const injects = []
+  const getCalls = new Map()
   const statePath = projectStateFile(CWD)
   if (opts.claims) {
     store.set(statePath, JSON.stringify({ schemaVersion: 1, seq: opts.claims.length, claims: opts.claims, messages: [], holders: [] }))
     versions.set(statePath, 1)
   }
   const ctx = new Context()
+  const withAgents = opts.withAgents !== false
   const withController = opts.withController !== false
   const withSubagents = opts.withSubagents !== false
-  for (const n of ['tools', 'timer', 'fs', 'sessions', 'sessionTitle', 'agents', 'systemPrompt']) ctx.provide(n)
+  for (const n of ['tools', 'timer', 'fs', 'sessions', 'sessionTitle', 'systemPrompt']) ctx.provide(n)
+  if (withAgents) ctx.provide('agents')
   if (withController) ctx.provide('sessionController')
   if (withSubagents) ctx.provide('subagents')
   ctx.set('tools', { register: (t) => { tools.push(t); return () => {} } })
   ctx.set('timer', {
-    timeout: (ms) => {
-      // 只在显式 arm 之后抛：插件装载期与其它 op 的 timer 调用不受影响。
-      if (opts.timerThrowsWhenArmed && timerState.armed) throw new Error('timer service exploded')
-      return new Promise((r) => setTimeout(r, ms))
-    },
+    timeout: (ms) => new Promise((r) => setTimeout(r, ms)),
     interval: () => () => {}
   })
   ctx.set('fs', makeFs(store, versions))
   ctx.set('sessions', { get: () => ({ header: { cwd: CWD } }) })
   ctx.set('sessionTitle', { get: () => ({ title: 'Push Worker' }) })
-  ctx.set('agents', {
-    currentInitiator: () => undefined,
-    list: () => [],
-    get: (id) => {
-      if (opts.agentsGetThrows) throw new Error('agents registry exploded')
-      return (opts.liveSessions || []).includes(id) ? { id } : undefined
+  /** 活着的读者会话返回的假 agent：inject 记录到本 harness + 全文件账本。 */
+  const liveAgent = (id) => {
+    if (opts.agentObjects && opts.agentObjects[id]) return opts.agentObjects[id]
+    if (opts.agentsWithoutInject) return { id }
+    return {
+      id,
+      inject: (message) => {
+        if (opts.injectThrows) throw new Error('inject channel exploded')
+        injects.push({ sessionId: id, message })
+        deliveries.push({ sessionId: id, message })
+      }
     }
-  })
+  }
+  if (withAgents) {
+    ctx.set('agents', {
+      currentInitiator: () => undefined,
+      list: () => [],
+      get: (id) => {
+        if (opts.agentsGetThrows) throw new Error('agents registry exploded')
+        const n = (getCalls.get(id) || 0) + 1
+        getCalls.set(id, n)
+        // TOCTOU：存活判据那次探测还能拿到 agent，真正投递时它已经没了。
+        if (opts.agentsVanishAfterProbe && n > 1) return undefined
+        return (opts.liveSessions || []).includes(id) ? liveAgent(id) : undefined
+      }
+    })
+  }
   // 假 systemPrompt：只记录注册进来的运行时上下文段（与 tests/collab-awareness.mjs、
   // tests/collab-skill.mjs 的假服务同形），disposer 从活集合里摘掉该段。
   // 本文件只关心**注册形状**（名称 / order），不在这里跑 text() 的取用逻辑
@@ -276,27 +325,21 @@ async function makeHarness(opts = {}) {
     }
   })
   if (withController) {
+    // 旧主通道的假件：**只记录调用**。任何一次调用都意味着"通知又开始冒充用户"，
+    // 由各场景里的 `h.prompts.length === 0` 断言变红。
     ctx.set('sessionController', {
       prompt: async (request, _signal) => {
         prompts.push(request)
-        if (opts.promptRouting) throw routingRejection(request.sessionId)
-        if (opts.promptRoutingNoDetails) throw remoteError('session/agent-busy', 'session "' + request.sessionId + '" is owned by subagent routing', undefined)
-        if (opts.promptBusyPlain) throw busyPlainRejection()
-        if (opts.promptThrows) throw new Error('prompt rejected')
-        if (opts.promptHangs) return new Promise(() => {}) // 永不 resolve：用于验证超时分支
         return { accepted: true }
       },
-      list: async () => ({ items: (opts.sessionRows || []).slice() })
+      list: async () => ({ items: [] })
     })
   }
   if (withSubagents) {
-    // 假 subagents：只记录调用并复现契约里的失败形状。真实邻接判定在 DSH 那份实现里，
-    // 这里**不假装**验证了它。
+    // 旧回退通道的假件：同样**只记录调用**，必须恒为 0。
     ctx.set('subagents', {
       sendMessage: async (sender, targetId, content, options) => {
         sends.push({ sender, targetId, content, options })
-        if (opts.sendFails) throw opts.sendFails
-        if (opts.sendHangs) return new Promise(() => {})
         return 'msg-' + sends.length
       }
     })
@@ -306,11 +349,12 @@ async function makeHarness(opts = {}) {
   const readState = () => JSON.parse(store.get(statePath) || '{}')
   const writeState = (doc) => { store.set(statePath, JSON.stringify(doc)); versions.set(statePath, (versions.get(statePath) || 0) + 1) }
   const lock = tools.find((t) => t.name === 'collab_lock')
-  // agentId 可以是字符串（构造一个 holder），也可以是**现成的 agent 对象**
-  // （0.8.4 用它断言回退 sender 的对象同一性：sendMessage 要求 sender 是 registry 里的同一对象）。
-  const callLock = (args, agentId) => {
+  // agentId 可以是字符串（构造一个 holder），也可以是**现成的 agent 对象**。
+  const callLock = async (args, agentId) => {
     const agent = agentId && typeof agentId === 'object' ? agentId : { id: agentId, session: { header: { cwd: CWD } } }
-    return lock.execute(args, { agent })
+    const res = await lock.execute(args, { agent })
+    if (res && res.data && res.data.notify) allNotifies.push(res.data.notify)
+    return res
   }
   /** 驱动 post-execute 瀑布：返回 { decision, downstream, nextCalls }（与 collab-access-gate.mjs 同形）。 */
   const post = async (exec, downstream = { kind: 'accept' }) => {
@@ -322,12 +366,10 @@ async function makeHarness(opts = {}) {
     })
     return { decision, downstream: produced, nextCalls }
   }
-  return { ctx, tools, lock, prompts, sends, store, statePath, readState, writeState, callLock, post, contexts, armTimer: () => { timerState.armed = true } }
+  return { ctx, tools, lock, prompts, sends, injects, store, statePath, readState, writeState, callLock, post, contexts }
 }
 
-// ── agent.inject 捕获：通知载体（`form:'notice'` 的显式来源消息）的观测点 ──
-// 第 3 节用它断言"通知真的逐事件经 agent.inject 投出、且来源显式非 user"。
-// 第 2 节只关心 readers 反向登记，不看 inject。
+// ── agent.inject 捕获（访问通知）：第 3 节用它断言 access 通知的载体 ──
 let injectLog = []
 const resetInject = () => { injectLog = [] }
 /** 从 inject 记录里取正文（防御性：拿不到就返回空串，让断言失败而不是抛）。 */
@@ -382,30 +424,42 @@ console.log('# 回归：休眠读者的登记在"任意写路径"的 sweep 之�
   ok(rel.data.notify.readers === 1 && rel.data.notify.pushed.length === 0 &&
      rel.data.notify.skipped.length === 1 && rel.data.notify.skipped[0].reason === 'not-live',
     'notify 如实报出"有 1 个休眠读者、0 条投递"', JSON.stringify(rel.data.notify))
+  ok(h.injects.length === 0, '休眠读者一条都没投（新通道也不会唤醒冷会话）', JSON.stringify(h.injects.length))
 }
 
-console.log('# 显式 op=release 之后向活着的 reader 推送')
+console.log('# 显式 op=release 之后向活着的 reader 投递（新通道：进程内解析 agent + inject）')
 {
   const foreign = mkClaim({ claimId: 'c_lock', holderId: 'agent:owner', holderName: 'Owner', holderIdShort: undefined, paths: ['src/a/'], readers: ['agent:me', 'agent:ghost'], expiresAt: Date.now() + HOUR })
   const h = await makeHarness({ claims: [foreign], liveSessions: ['me'] })
   const res = await h.callLock({ op: 'release', claimId: 'c_lock' }, 'owner')
   ok(res.ok === true, 'release 本身成功', JSON.stringify(res))
   await settle()
-  ok(h.prompts.length === 1, '只向活着的 reader 推一条（冷会话 ghost 被丢弃）', JSON.stringify(h.prompts.length))
-  const p = h.prompts[0]
-  ok(p.sessionId === 'me', 'sessionId 是被通知的会话（holderId 去掉 agent: 前缀）', String(p.sessionId))
-  ok(p.mode === 'queue' || p.mode === 'steer', "mode 是 'queue' 或 'steer'", String(p.mode))
-  ok(typeof p.requestId === 'string' && p.requestId.startsWith('dsh-collab-'), 'requestId 带插件前缀', String(p.requestId))
-  ok(Array.isArray(p.content) && p.content.length === 1 && p.content[0].type === 'text' && typeof p.content[0].text === 'string',
-    'content 是 [{type:text,text}] 形状', JSON.stringify(p.content))
-  ok(p.content[0].text.includes('src/a/'), '通知文案点出被释放的路径', p.content[0].text)
+  // 旧通道一次都没碰：它们是"宿主代造消息 → kind:'user' → 用户气泡"的来源。
+  ok(h.prompts.length === 0 && h.sends.length === 0,
+    '旧通道零调用（sessionController.prompt / subagents.sendMessage）',
+    JSON.stringify({ prompts: h.prompts.length, sends: h.sends.length }))
+  ok(h.injects.length === 1, '只向活着的 reader 投一条（冷会话 ghost 被丢弃）', JSON.stringify(h.injects.length))
+  const inj = h.injects[0]
+  ok(inj.sessionId === 'me', '投递目标是活着的读者会话（holderId 去掉 agent: 前缀）', String(inj.sessionId))
+  // ---- (a) 来源形状：显式非 user，且 notice 带非空 ≤120 字符 summary ----
+  const msg = inj.message
+  const source = msg && msg.source
+  ok(sourceShapeOk(msg), '(a) source 是 {kind:plugin, plugin:dsh-collab, form:notice}（客户端据此渲染成 notice 行，不是气泡）', sourceShapeWhy(msg))
+  ok(!!source && typeof source.summary === 'string' && source.summary.length > 0 && source.summary.length <= 120,
+    '(a) source.summary 是非空字符串且 ≤120 字符（缺它会退化成 opaque 行）', JSON.stringify(source && source.summary))
+  ok(!!msg && msg.role === 'user' && Object.isFrozen(msg),
+    '消息是冻结的 user 角色（role / id / 深冻结都由真实构造函数补）',
+    JSON.stringify({ role: msg && msg.role, frozen: !!(msg && Object.isFrozen(msg)) }))
+  ok(Array.isArray(msg.content) && msg.content.length === 1 && msg.content[0].type === 'text' && typeof msg.content[0].text === 'string',
+    'content 是 [{type:text,text}] 形状（模型可见全文）', JSON.stringify(msg && msg.content))
+  ok(noticeText(inj).includes('src/a/'), '通知文案点出被释放的路径', noticeText(inj))
   // 释放者的显示名走 hname()（sessionTitle 优先），与 claim 的 holderName 同源逻辑；
   // 本 harness 的 sessionTitle 固定返回 'Push Worker'。
-  ok(p.content[0].text.includes('Push Worker'), '通知文案点出释放者（会话标题）', p.content[0].text)
-  ok(res.data.released[0].readers.includes('agent:me'), 'release 结果里带回 readers（推送的输入）', JSON.stringify(res.data.released[0].readers))
+  ok(noticeText(inj).includes('Push Worker'), '通知文案点出释放者（会话标题）', noticeText(inj))
+  ok(noticeText(inj).includes('（独占）'), '通知正文用中文模式标签（W9 文案中文化；数据取值仍是 exclusive）', noticeText(inj))
+  ok(res.data.released[0].readers.includes('agent:me'), 'release 结果里带回 readers（投递的输入）', JSON.stringify(res.data.released[0].readers))
 
-  // ---- 0.8.3：推送结果可观测（notify） ----
-  // ok / released / serverTime 的语义与形状必须原样保留，notify 只是**追加**字段。
+  // ---- 推送结果可观测（notify）：ok / released / serverTime 的语义与形状必须原样保留 ----
   ok(res.ok === true && Array.isArray(res.data.released) && typeof res.data.serverTime === 'number',
     'ok/released/serverTime 的语义与形状不变', JSON.stringify({ ok: res.ok, released: Array.isArray(res.data.released), serverTime: typeof res.data.serverTime }))
   const n = res.data.notify
@@ -415,213 +469,162 @@ console.log('# 显式 op=release 之后向活着的 reader 推送')
     '不活的读者进 notify.skipped 且 reason === not-live', JSON.stringify(n && n.skipped))
   ok(n && n.pushed.length + n.skipped.length === n.readers, '每个候选读者要么 pushed 要么 skipped（无静默丢失）',
     JSON.stringify(n && { readers: n.readers, pushed: n.pushed.length, skipped: n.skipped.length }))
-  // ---- 0.8.4：pushedVia 是**追加**字段，既有字段/取值一字未改 ----
+  // pushedVia 反映**真实通道**：'inject'（不是已删除的 'session-controller' / 'subagents'）。
   ok(n && Array.isArray(n.pushedVia) && n.pushedVia.length === n.pushed.length,
-    'pushedVia 与 pushed 等长（通道信息一一对应，0.8.4 追加）', JSON.stringify(n && n.pushedVia))
-  ok(n && JSON.stringify(n.pushedVia) === '[{"sessionId":"me","channel":"session-controller"}]',
-    '未走回退的投递在 pushedVia 里标为 session-controller', JSON.stringify(n && n.pushedVia))
+    'pushedVia 与 pushed 等长（通道信息一一对应）', JSON.stringify(n && n.pushedVia))
+  ok(n && JSON.stringify(n.pushedVia) === '[{"sessionId":"me","channel":"inject"}]',
+    "pushedVia 标出真实通道 = 'inject'（进程内 agents 解析 + agent.inject）", JSON.stringify(n && n.pushedVia))
   // 有界性：claim 被 release 移除后 readers 一起消亡，不残留、不需额外 TTL。
   const afterDoc = h.readState()
   ok(afterDoc.claims.length === 0 && JSON.stringify(afterDoc.claims.flatMap(c => readersOf(c))) === '[]',
     'claim 被 release 移除后 readers 不残留', JSON.stringify(afterDoc.claims))
 }
 
-console.log('# 0.8.4 回退通道：prompt 被"子代理路由托管"拒绝 -> subagents.sendMessage 重投')
+console.log('# (a) summary 由 boundContextSummary 截断：超长路径表也不会超过 120 字符')
 {
-  const foreign = mkClaim({ claimId: 'c_lock', holderId: 'agent:owner', holderName: 'Owner', paths: ['src/a/'], readers: ['agent:me'], expiresAt: Date.now() + HOUR })
-  const h = await makeHarness({ claims: [foreign], liveSessions: ['me'], promptRouting: true })
-  // 传**现成的 agent 对象**：回退契约要求 sender 是 "exact live Agent"，
-  // DSH 用 `ctx.agents.get(sender.id) !== sender` 做对象同一性判定，所以这里能断言同一性。
-  const AGENT_OWNER = { id: 'owner', session: { header: { cwd: CWD } } }
-  const res = await h.callLock({ op: 'release', claimId: 'c_lock' }, AGENT_OWNER)
+  const long = mkClaim({
+    claimId: 'c_long', holderId: 'agent:owner', holderName: 'Owner',
+    paths: [
+      'src/very/long/path/segment-A/aaaaaaaa/', 'src/very/long/path/segment-B/bbbbbbbb/',
+      'src/very/long/path/segment-C/cccccccc/', 'src/very/long/path/segment-D/dddddddd/',
+      'src/very/long/path/segment-E/eeeeeeee/'
+    ],
+    readers: ['agent:me'], expiresAt: Date.now() + HOUR
+  })
+  const h = await makeHarness({ claims: [long], liveSessions: ['me'] })
+  await h.callLock({ op: 'release', claimId: 'c_long' }, 'owner')
   await settle()
-  ok(res.ok === true && Array.isArray(res.data.released) && res.data.released.length === 1,
-    'release 仍 ok:true 且 released 原样', JSON.stringify({ ok: res.ok, released: res.data.released.length }))
-  ok(h.prompts.length === 1, '先走原生 prompt 一次', String(h.prompts.length))
-  ok(h.sends.length === 1, '被路由拒绝后，回退通道恰好调用一次', String(h.sends.length))
-  const s = h.sends[0]
-  ok(s.sender === AGENT_OWNER, 'sender 是释放者那个**活 Agent 对象本身**（同一性，绝不重建）',
-    JSON.stringify(s.sender && s.sender.id) + ' same=' + String(s.sender === AGENT_OWNER))
-  ok(s.sender && s.sender.id === 'owner', 'sender.id === 释放者', JSON.stringify(s.sender && s.sender.id))
-  ok(s.targetId === 'me', 'targetId === 读者 sessionId（holderId 去掉 agent: 前缀）', String(s.targetId))
-  ok(Array.isArray(s.content) && s.content.length === 1 && s.content[0].type === 'text' && typeof s.content[0].text === 'string',
-    'content 是 [{type:text,text}] 形状', JSON.stringify(s.content))
-  ok(s.content[0].text === h.prompts[0].content[0].text, '两个通道投的是**同一条**通知文案', s.content[0].text)
-  ok(s.content[0].text.includes('src/a/'), '回退文案点出被释放的路径', s.content[0].text)
-  ok(s.options && typeof s.options === 'object' && s.options.signal && typeof s.options.signal.aborted === 'boolean',
-    'options.signal 是 AbortSignal（自建 AbortController）', JSON.stringify(s.options && Object.keys(s.options)))
-  const n = res.data.notify
-  ok(JSON.stringify(n.pushed) === '["me"]', '回退成功记入成功侧 pushed', JSON.stringify(n.pushed))
-  ok(JSON.stringify(n.pushedVia) === '[{"sessionId":"me","channel":"subagents"}]',
-    'pushedVia 可区分地标出通道 = subagents', JSON.stringify(n.pushedVia))
-  ok(n.skipped.length === 0, '回退成功时没有 skipped', JSON.stringify(n.skipped))
-  ok(n.pushed.length === n.pushedVia.length, 'pushed 与 pushedVia 等长')
-  // 幂等键 (claimId, reader)：回退成功过的一对，重新放回状态文件再释放也不再投。
-  h.writeState({ schemaVersion: 1, seq: 1, claims: [mkClaim({ claimId: 'c_lock', holderId: 'agent:owner', paths: ['src/a/'], readers: ['agent:me'], expiresAt: Date.now() + HOUR })], messages: [], holders: [] })
-  const res2 = await h.callLock({ op: 'release', claimId: 'c_lock' }, 'owner')
-  await settle()
-  ok(h.prompts.length === 1 && h.sends.length === 1, '回退成功过的 (claimId, reader) 不再重投',
-    JSON.stringify({ prompts: h.prompts.length, sends: h.sends.length }))
-  ok(res2.data.notify.skipped.length === 1 && res2.data.notify.skipped[0].reason === 'already-pushed',
-    '第二次 release 如实报 already-pushed', JSON.stringify(res2.data.notify))
+  const s = h.injects[0] && h.injects[0].message && h.injects[0].message.source
+  ok(h.injects.length === 1 && !!s && typeof s.summary === 'string' && s.summary.length > 0 && s.summary.length <= 120,
+    '(a) 超长路径表下 summary 仍非空且 ≤120 字符（120 上限由 boundContextSummary 保证）',
+    JSON.stringify({ len: s && s.summary.length, summary: s && s.summary }))
+  ok(noticeText(h.injects[0]).length > 120,
+    '对照：模型可见正文不受 120 限制（summary 只是折叠态的一句话）', String(noticeText(h.injects[0]).length))
 }
 
-console.log('# 0.8.4 回退失败分类：不邻接 -> not-adjacent；其它 -> subagent-failed')
+console.log('# 旧通道整体删除：即使读者是"子代理路由托管"的会话也不再走 prompt/sendMessage')
 {
-  const claim = () => mkClaim({ claimId: 'c_lock', holderId: 'agent:owner', paths: ['src/a/'], readers: ['agent:sib'], expiresAt: Date.now() + HOUR })
-  // 文案逐字取自 dsh-subagent/lib/index.js:968 / :1887（authorizeLineage：durable 父不是 sender）
-  const h = await makeHarness({
-    claims: [claim()], liveSessions: ['sib'], promptRouting: true,
-    sendFails: subagentError('UNAUTHORIZED', 'subagent "sib" belongs to another parent session')
-  })
+  // 0.8.4 的场景：读者会话由子代理路由托管，`sessionController.prompt` 会被 DSH 结构化拒绝，
+  // 当时据此改走 `subagents.sendMessage`。**两条都是宿主代造消息、来源被写成 kind:'user'**，
+  // 所以现在整条链路删掉了：投递只走进程内 agents 解析 + inject，与"路由托管"无关。
+  const claim = () => mkClaim({ claimId: 'c_lock', holderId: 'agent:owner', holderName: 'Owner', paths: ['src/a/'], readers: ['agent:me'], expiresAt: Date.now() + HOUR })
+  const h = await makeHarness({ claims: [claim()], liveSessions: ['me'] })
   const res = await h.callLock({ op: 'release', claimId: 'c_lock' }, 'owner')
   await settle()
-  ok(res.ok === true, '回退失败不影响 release 的 ok:true')
-  ok(h.sends.length === 1, '回退确实被尝试过一次', String(h.sends.length))
-  const n = res.data.notify
-  ok(n.pushed.length === 0 && JSON.stringify(n.pushedVia) === '[]', '没有成功投递（pushed/pushedVia 都空）', JSON.stringify({ pushed: n.pushed, pushedVia: n.pushedVia }))
-  ok(n.skipped.length === 1 && n.skipped[0].sessionId === 'sib' && n.skipped[0].reason === 'not-adjacent',
-    '跨父会话的子代理读者 -> reason === not-adjacent（如实记录，不静默）', JSON.stringify(n.skipped))
-  ok(n.skipped[0].error === 'subagent "sib" belongs to another parent session', 'skipped[].error 带回真实文案', JSON.stringify(n.skipped[0].error))
+  ok(res.ok === true, 'release 仍 ok:true', JSON.stringify(res && { ok: res.ok }))
+  ok(h.prompts.length === 0, 'prompt 零调用（不再是投递面）', String(h.prompts.length))
+  ok(h.sends.length === 0, 'subagents.sendMessage 零调用（旧回退通道已删除）', String(h.sends.length))
+  ok(h.injects.length === 1, '投递照常发生（解析到活 agent 就 inject）', String(h.injects.length))
+  ok(JSON.stringify(res.data.notify.pushedVia) === '[{"sessionId":"me","channel":"inject"}]',
+    "记账标出真实通道 'inject'", JSON.stringify(res.data.notify.pushedVia))
 
-  // PARENT_UNAVAILABLE（:1834/:1844）：直接父会话不活 -> 同属邻接前提不成立
-  const h2 = await makeHarness({
-    claims: [claim()], liveSessions: ['sib'], promptRouting: true,
-    sendFails: subagentError('PARENT_UNAVAILABLE', 'direct parent is not live; the message was not delivered')
-  })
+  // 传**现成的 agent 对象**（对象同一性）：解析到就直接调它自己的 inject，绝不重建对象。
+  const LIVE_ME = withInject('me')
+  resetInject()
+  const h2 = await makeHarness({ claims: [claim()], liveSessions: ['me'], agentObjects: { me: LIVE_ME } })
   const res2 = await h2.callLock({ op: 'release', claimId: 'c_lock' }, 'owner')
   await settle()
-  ok(res2.data.notify.skipped[0].reason === 'not-adjacent', 'PARENT_UNAVAILABLE 也算 not-adjacent', JSON.stringify(res2.data.notify.skipped))
+  ok(res2.ok === true, 'release 仍 ok:true（现成 agent 对象场景）', JSON.stringify(res2 && { ok: res2.ok }))
+  ok(h2.prompts.length === 0 && h2.sends.length === 0, '旧通道仍然零调用', JSON.stringify({ prompts: h2.prompts.length, sends: h2.sends.length }))
+  ok(injectLog.length === 1 && injectLog[0].agent === 'me',
+    '投递给的是 agents 注册表里那个**现成 agent 对象**（不重建）', JSON.stringify(injectLog.map(e => e.agent)))
+  ok(sourceShapeOk(injectLog[0] && injectLog[0].message), '(a) 该投递的来源形状同样正确', sourceShapeWhy(injectLog[0] && injectLog[0].message))
 
-  // NOT_RESUMABLE（:1883/:1889）：目标不是可续子会话 -> 邻接前提不成立
-  const h3 = await makeHarness({
-    claims: [claim()], liveSessions: ['sib'], promptRouting: true,
-    sendFails: subagentError('NOT_RESUMABLE', 'subagent "sib" has no supported continuation state and cannot be resumed; choose a different target')
-  })
-  const res3 = await h3.callLock({ op: 'release', claimId: 'c_lock' }, 'owner')
+  // 幂等键 (claimId, reader)：投递成功过的一对，重新放回状态文件再释放也不再投。
+  const restored = { schemaVersion: 1, seq: 1, claims: [claim()], messages: [], holders: [] }
+  h.writeState(restored)
+  const res3 = await h.callLock({ op: 'release', claimId: 'c_lock' }, 'owner')
   await settle()
-  ok(res3.data.notify.skipped[0].reason === 'not-adjacent', 'NOT_RESUMABLE 也算 not-adjacent', JSON.stringify(res3.data.notify.skipped))
-
-  // UNAUTHORIZED 但说的是"发送者已不是活 Agent"（:1735）—— **不是**邻接问题，
-  // 谎报成 not-adjacent 会把人带去排查邻接，所以归入 subagent-failed。
-  const h4 = await makeHarness({
-    claims: [claim()], liveSessions: ['sib'], promptRouting: true,
-    sendFails: subagentError('UNAUTHORIZED', 'message delivery requires the exact live sender agent')
-  })
-  const res4 = await h4.callLock({ op: 'release', claimId: 'c_lock' }, 'owner')
-  await settle()
-  ok(res4.data.notify.skipped[0].reason === 'subagent-failed',
-    "sender 不活（不是邻接问题）-> subagent-failed，不谎报 not-adjacent", JSON.stringify(res4.data.notify.skipped))
+  ok(h.prompts.length === 0 && h.sends.length === 0 && h.injects.length === 1,
+    '已投递过的 (claimId, reader) 不再重投，且旧通道仍然零调用',
+    JSON.stringify({ injects: h.injects.length, prompts: h.prompts.length, sends: h.sends.length }))
+  ok(res3.data.notify.skipped.length === 1 && res3.data.notify.skipped[0].reason === 'already-pushed',
+    '第二次 release 如实报 already-pushed', JSON.stringify(res3.data.notify))
 }
 
-console.log('# 0.8.4 回退前置闸：subagents 服务缺失 / 拿不到活 Agent -> 零 sendMessage 调用、不抛')
+console.log('# (b) 解析不到目标 agent：投递数 0 + skipped.reason = agent-not-resolvable（如实跳过，绝不冒充）')
+{
+  // TOCTOU：存活判据（第一次 agents.get）看到 agent 活着，真正投递时（第二次 get）它已经不在了。
+  // 旧实现在这里会掉头去 prompt / sendMessage —— 那正是"冒充用户"的来源。
+  // 新实现必须**如实跳过**：投递数 0，skipped 里带明确的 agent-not-resolvable。
+  const foreign = mkClaim({ claimId: 'c_lock', holderId: 'agent:owner', holderName: 'Owner', paths: ['src/a/'], readers: ['agent:me'], expiresAt: Date.now() + HOUR })
+  const h = await makeHarness({ claims: [foreign], liveSessions: ['me'], agentsVanishAfterProbe: true })
+  const res = await h.callLock({ op: 'release', claimId: 'c_lock' }, 'owner')
+  await settle()
+  ok(res.ok === true, 'release 本身仍然成功（投递失败是旁路）', JSON.stringify(res && { ok: res.ok }))
+  ok(h.injects.length === 0, '(b) 解析不到目标 agent -> 投递数 0', JSON.stringify(h.injects.length))
+  ok(h.prompts.length === 0 && h.sends.length === 0,
+    '(b) 也**没有**回退到任何会冒充用户的旧通道', JSON.stringify({ prompts: h.prompts.length, sends: h.sends.length }))
+  const n = res.data.notify
+  ok(n && n.pushed.length === 0 && JSON.stringify(n.pushedVia) === '[]', '(b) 没有成功投递记录', JSON.stringify({ pushed: n && n.pushed, pushedVia: n && n.pushedVia }))
+  ok(n && n.skipped.length === 1 && n.skipped[0].sessionId === 'me' && n.skipped[0].reason === 'agent-not-resolvable',
+    "(b) skipped 里带新取值 'agent-not-resolvable'（如实跳过，不冒充）", JSON.stringify(n && n.skipped))
+  ok(n && n.skipped[0].error === 'agent-not-resolvable', '(b) 该记录带同一句话的错误文本，便于排查', JSON.stringify(n && n.skipped[0].error))
+  ok(n && n.pushed.length + n.skipped.length === n.readers, '(b) 候选读者仍然逐条记账（无静默丢失）', JSON.stringify(n))
+}
+
+console.log('# 投递面故障如实记账：agents 服务缺失 / agent 没有 inject 面 / inject 抛错')
 {
   const claim = () => mkClaim({ claimId: 'c_lock', holderId: 'agent:owner', paths: ['src/a/'], readers: ['agent:me'], expiresAt: Date.now() + HOUR })
-  // a) 服务缺失
-  const h = await makeHarness({ claims: [claim()], liveSessions: ['me'], promptRouting: true, withSubagents: false })
+  // a) agents 服务整个缺失：**不是**"没人需要通知"，必须留在 skipped 里；也绝不回退到旧通道。
+  const h = await makeHarness({ claims: [claim()], liveSessions: ['me'], withAgents: false })
   let threw = null, res = null
   try { res = await h.callLock({ op: 'release', claimId: 'c_lock' }, 'owner') } catch (e) { threw = e }
   await settle()
-  ok(threw === null, 'subagents 服务缺失时不抛', threw && String(threw.message))
-  ok(h.sends.length === 0, 'subagents 服务缺失 -> 一次都不尝试回退', JSON.stringify(h.sends.length))
+  ok(threw === null, 'agents 服务缺失时不抛', threw && String(threw.message))
+  ok(h.injects.length === 0 && h.prompts.length === 0 && h.sends.length === 0, '一条都不投，也不碰旧通道', JSON.stringify({ injects: h.injects.length, prompts: h.prompts.length, sends: h.sends.length }))
   const n = res.data.notify
-  ok(n.skipped.length === 1 && n.skipped[0].reason === 'subagent-failed' && n.skipped[0].error === 'no-subagents-service',
-    '如实记 skipped（subagent-failed / no-subagents-service）', JSON.stringify(n.skipped))
+  ok(n && n.skipped.length === 1 && n.skipped[0].reason === 'inject-failed' && n.skipped[0].error === 'no-agents-service',
+    '如实记 skipped（inject-failed / no-agents-service）', JSON.stringify(n.skipped))
   ok(n.pushed.length === 0 && JSON.stringify(n.pushedVia) === '[]', '没有任何成功投递记录', JSON.stringify(n.pushedVia))
 
-  // b) agent/disposed 路径拿不到"活 Agent"（那个 agent 正在销毁）
-  const dead = mkClaim({ claimId: 'c_dead', holderId: 'agent:dead', holderName: 'Dead', paths: ['src/d/'], readers: ['agent:me'], expiresAt: Date.now() + HOUR })
-  const h2 = await makeHarness({ claims: [dead], liveSessions: ['me'], promptRouting: true })
-  h2.ctx.emit('agent/disposed', { agent: { id: 'dead' } })
-  for (let i = 0; i < 40 && h2.prompts.length === 0; i++) await sleep(25)
-  await settle()
-  ok(h2.prompts.length === 1, 'disposed 路径仍然尝试了原生 prompt', String(h2.prompts.length))
-  ok(h2.sends.length === 0, '拿不到活 Agent -> 零 sendMessage 调用（不回退、也不 cold-resume）', JSON.stringify(h2.sends.length))
-}
-
-console.log('# 0.8.4 回归：非"子代理路由"的 prompt 失败一律不触发回退')
-{
-  const claim = () => mkClaim({ claimId: 'c_lock', holderId: 'agent:owner', paths: ['src/a/'], readers: ['agent:me'], expiresAt: Date.now() + HOUR })
-  // a) 普通 Error（没有 code）
-  const h = await makeHarness({ claims: [claim()], liveSessions: ['me'], promptThrows: true })
-  const res = await h.callLock({ op: 'release', claimId: 'c_lock' }, 'owner')
-  await settle()
-  ok(h.prompts.length === 1 && h.sends.length === 0, '普通 prompt 失败 -> 零回退调用', JSON.stringify({ prompts: h.prompts.length, sends: h.sends.length }))
-  ok(res.data.notify.skipped[0].reason === 'prompt-failed', '仍记 prompt-failed（0.8.3 语义不变）', JSON.stringify(res.data.notify.skipped))
-
-  // b) **同一个 code**，但 details.reason 不是路由指示（index.js:785 的真实分支：普通投递失败）
-  const h2 = await makeHarness({ claims: [claim()], liveSessions: ['me'], promptBusyPlain: true })
+  // b) 解析到的对象没有 inject 面（受限宿主）：只跳过，不另找通道。
+  const h2 = await makeHarness({ claims: [claim()], liveSessions: ['me'], agentsWithoutInject: true })
   const res2 = await h2.callLock({ op: 'release', claimId: 'c_lock' }, 'owner')
   await settle()
-  ok(h2.prompts.length === 1 && h2.sends.length === 0,
-    "session/agent-busy 但 reason 非路由（'prompt rejected'）-> 不回退", JSON.stringify({ prompts: h2.prompts.length, sends: h2.sends.length }))
-  ok(res2.data.notify.skipped[0].reason === 'prompt-failed' && res2.data.notify.skipped[0].error === 'prompt rejected',
-    '如实报 prompt-failed + 真实文案', JSON.stringify(res2.data.notify.skipped))
+  const n2 = res2.data.notify
+  ok(h2.injects.length === 0 && h2.prompts.length === 0 && h2.sends.length === 0, '没有 inject 面 -> 零投递、零旧通道调用', JSON.stringify({ injects: h2.injects.length, prompts: h2.prompts.length, sends: h2.sends.length }))
+  ok(n2.skipped.length === 1 && n2.skipped[0].reason === 'inject-failed' && n2.skipped[0].error === 'agent-has-no-inject',
+    '如实记 inject-failed / agent-has-no-inject', JSON.stringify(n2.skipped))
 
-  // c) details 万一丢失：message 是 DSH 自己写死的路由诊断 -> 兜底判据仍应回退
-  const h3 = await makeHarness({ claims: [claim()], liveSessions: ['me'], promptRoutingNoDetails: true })
-  const res3 = await h3.callLock({ op: 'release', claimId: 'c_lock' }, 'owner')
+  // c) inject 自己抛错：错误**不许被抹平**（不退回 () => undefined 那种写法）。
+  const h3 = await makeHarness({ claims: [claim()], liveSessions: ['me'], injectThrows: true })
+  let threw3 = null, res3 = null
+  try { res3 = await h3.callLock({ op: 'release', claimId: 'c_lock' }, 'owner') } catch (e) { threw3 = e }
   await settle()
-  ok(h3.sends.length === 1, 'details 丢失但 message 含 "owned by subagent routing" -> 仍回退', JSON.stringify(h3.sends.length))
-  ok(JSON.stringify(res3.data.notify.pushedVia) === '[{"sessionId":"me","channel":"subagents"}]', '兜底判据下也正确标注通道', JSON.stringify(res3.data.notify.pushedVia))
+  ok(threw3 === null, 'inject 抛错不冒泡到工具调用', threw3 && String(threw3.message))
+  ok(res3 && res3.ok === true && res3.data.released.length === 1, 'inject 抛错时 release 仍 ok:true + released', JSON.stringify(res3 && { ok: res3.ok }))
+  const n3 = res3.data.notify
+  ok(n3 && n3.readers === 1 && n3.pushed.length === 0 && n3.skipped.length === 1 && n3.skipped[0].reason === 'inject-failed',
+    'inject 抛错 -> reason === inject-failed 且 release 仍 ok:true', JSON.stringify(n3))
+  ok(n3 && n3.skipped[0].error === 'inject channel exploded', 'skipped[].error 带回真实错误文本（不抹平）', JSON.stringify(n3 && n3.skipped[0].error))
 }
 
-console.log('# 0.8.4 安全闸门回归：读者不活 -> prompt 与 sendMessage 双双零调用（绝不 cold-resume）')
+console.log('# 安全硬约束：冷读者零投递（既不 inject，也不碰旧通道）')
 {
-  // 把 prompt 设成"路由拒绝"：如果闸门失守，读者会先撞上路由拒绝、再触发一次回退 ——
-  // 而 subagents.sendMessage 对"缺席的直接子会话"会 cold-resume，这条断言就是那道闸。
-  const foreign = mkClaim({ claimId: 'c_lock', holderId: 'agent:owner', paths: ['src/a/'], readers: ['agent:cold'], expiresAt: Date.now() + HOUR })
-  const h = await makeHarness({ claims: [foreign], liveSessions: [], promptRouting: true })
-  const res = await h.callLock({ op: 'release', claimId: 'c_lock' }, 'owner')
-  await settle()
-  ok(res.ok === true, 'release 仍成功')
-  ok(h.prompts.length === 0, '冷读者：prompt 零调用', JSON.stringify(h.prompts.length))
-  ok(h.sends.length === 0, '冷读者：subagents.sendMessage 零调用（防止 cold-resume），单独断言', JSON.stringify(h.sends.length))
-  const n = res.data.notify
-  ok(n.skipped.length === 1 && n.skipped[0].sessionId === 'cold' && n.skipped[0].reason === 'not-live',
-    'reason 仍是 not-live（既有取值语义不变）', JSON.stringify(n.skipped))
-}
-
-console.log('# 0.8.4 回退通道与 prompt 通道同一套超时护栏')
-{
-  const foreign = mkClaim({ claimId: 'c_lock', holderId: 'agent:owner', paths: ['src/a/'], readers: ['agent:me'], expiresAt: Date.now() + HOUR })
-  const h = await makeHarness({ claims: [foreign], liveSessions: ['me'], promptRouting: true, sendHangs: true })
-  const t0 = Date.now()
-  let threw = null, res = null
-  try { res = await h.callLock({ op: 'release', claimId: 'c_lock' }, 'owner') } catch (e) { threw = e }
-  const took = Date.now() - t0
-  ok(threw === null, '回退超时不冒泡到工具调用', threw && String(threw.message))
-  ok(res && res.ok === true, '回退超时时 release 仍 ok:true', JSON.stringify(res && { ok: res.ok }))
-  ok(h.sends.length === 1, '回退确实被尝试', String(h.sends.length))
-  const n = res.data.notify
-  ok(n.skipped.length === 1 && n.skipped[0].reason === 'subagent-failed' && n.skipped[0].error === 'timeout',
-    "回退超时 -> subagent-failed + error 'timeout'", JSON.stringify(n.skipped))
-  ok(took >= 3000 && took < 15000, '确实等满了推送超时窗口才判定（不是立刻放弃）', String(took) + 'ms')
-}
-
-console.log('# 安全硬约束：冷会话零调用')
-{
-  // readers 里只有一个"不活着"的会话 -> 一次 prompt 都不能发
+  // readers 里只有一个"不活着"的会话 -> 一次投递都不能发。
+  // 这条同时是"新通道不会唤醒冷会话"的论证：注册表里没有它，解析即失败，结构上没有投递面。
   const foreign = mkClaim({ claimId: 'c_lock', holderId: 'agent:owner', paths: ['src/a/'], readers: ['agent:cold'], expiresAt: Date.now() + HOUR })
   const h = await makeHarness({ claims: [foreign], liveSessions: [] })
   const res = await h.callLock({ op: 'release', claimId: 'c_lock' }, 'owner')
   await settle()
   ok(res.ok === true, 'release 仍成功')
-  ok(h.prompts.length === 0, 'agents.get(sessionId) === undefined -> 绝不调用 prompt（冷会话不得被唤醒）', JSON.stringify(h.prompts))
-  // 0.8.3：这种"没有人被通知"必须是**可观测**的，而不是静默
+  ok(h.injects.length === 0, 'agents.get(sessionId) === undefined -> 绝不 inject', JSON.stringify(h.injects.length))
+  ok(h.prompts.length === 0 && h.sends.length === 0, '旧通道同样零调用（它们会 resume 冷会话 / cold-resume）', JSON.stringify({ prompts: h.prompts.length, sends: h.sends.length }))
+  // 这种"没有人被通知"必须是**可观测**的，而不是静默
   const n = res.data.notify
   ok(n && n.readers === 1 && n.pushed.length === 0, 'notify 如实报出"有 1 个候选读者、0 条投递"', JSON.stringify(n))
   ok(n && n.skipped.length === 1 && n.skipped[0].sessionId === 'cold' && n.skipped[0].reason === 'not-live',
     '冷会话带 reason === not-live 进 skipped（刻意不唤醒）', JSON.stringify(n && n.skipped))
 }
 
-console.log('# 排除释放者自己 / 同一 (claimId, reader) 只推一次')
+console.log('# 排除释放者自己 / 同一 (claimId, reader) 只投一次')
 {
   const foreign = mkClaim({ claimId: 'c_lock', holderId: 'agent:owner', paths: ['src/a/'], readers: ['agent:owner', 'agent:me'], expiresAt: Date.now() + HOUR })
   const h = await makeHarness({ claims: [foreign], liveSessions: ['owner', 'me'] })
   const res0 = await h.callLock({ op: 'release', claimId: 'c_lock' }, 'owner')
   await settle()
-  ok(h.prompts.length === 1 && h.prompts[0].sessionId === 'me', '不推给释放者自己', JSON.stringify(h.prompts.map(p => p.sessionId)))
+  ok(h.injects.length === 1 && h.injects[0].sessionId === 'me', '不投给释放者自己', JSON.stringify(h.injects.map(i => i.sessionId)))
   ok(res0.data.notify.readers === 1, '释放者自己不计入 notify.readers（候选读者只有 me）', JSON.stringify(res0.data.notify))
 
   // 把同一条 claim（同 claimId + 同 reader）重新放回状态文件再释放一次：
@@ -631,96 +634,61 @@ console.log('# 排除释放者自己 / 同一 (claimId, reader) 只推一次')
   const res2 = await h.callLock({ op: 'release', claimId: 'c_lock' }, 'owner')
   await settle()
   ok(res2.ok === true, '第二次 release 也成功')
-  ok(h.prompts.length === 1, '同一 (claimId, reader) 只推一次', JSON.stringify(h.prompts.length))
-  // 0.8.3：被去重挡下的那条也必须可见，reason 限于 already-pushed
+  ok(h.injects.length === 1, '同一 (claimId, reader) 只投一次', JSON.stringify(h.injects.length))
+  // 被去重挡下的那条也必须可见，reason 限于 already-pushed
   const n2 = res2.data.notify
   ok(n2 && n2.readers === 1 && n2.pushed.length === 0 && n2.skipped.length === 1 &&
      n2.skipped[0].sessionId === 'me' && n2.skipped[0].reason === 'already-pushed',
     '去重挡下的读者进 skipped 且 reason === already-pushed', JSON.stringify(n2))
 }
 
-console.log('# mode：跑着的会话用 steer，其余 queue')
+console.log('# agent/disposed（W7）：不释放未过期声明 + 从所有 readers 摘掉 + 不产生"锁已释放"通知')
 {
-  const foreign = mkClaim({ claimId: 'c_lock', holderId: 'agent:owner', paths: ['src/a/'], readers: ['agent:run'], expiresAt: Date.now() + HOUR })
-  const h = await makeHarness({ claims: [foreign], liveSessions: ['run'], sessionRows: [{ sessionId: 'run', running: true }] })
-  await h.callLock({ op: 'release', claimId: 'c_lock' }, 'owner')
-  await settle()
-  ok(h.prompts.length === 1 && h.prompts[0].mode === 'steer', 'SessionSummary.running === true -> steer', JSON.stringify(h.prompts.map(p => p.mode)))
-
-  const h2 = await makeHarness({ claims: [mkClaim({ claimId: 'c_lock', holderId: 'agent:owner', paths: ['src/a/'], readers: ['agent:idle'], expiresAt: Date.now() + HOUR })], liveSessions: ['idle'], sessionRows: [{ sessionId: 'idle', running: false }] })
-  await h2.callLock({ op: 'release', claimId: 'c_lock' }, 'owner')
-  await settle()
-  ok(h2.prompts.length === 1 && h2.prompts[0].mode === 'queue', 'running === false -> queue', JSON.stringify(h2.prompts.map(p => p.mode)))
-
-  // list 缺失 -> 判定不了 -> queue
-  const h3 = await makeHarness({ claims: [mkClaim({ claimId: 'c_lock', holderId: 'agent:owner', paths: ['src/a/'], readers: ['agent:x'], expiresAt: Date.now() + HOUR })], liveSessions: ['x'] })
-  delete h3.ctx.get('sessionController').list
-  await h3.callLock({ op: 'release', claimId: 'c_lock' }, 'owner')
-  await settle()
-  ok(h3.prompts.length === 1 && h3.prompts[0].mode === 'queue', 'list() 不可用 -> 退回 queue（判定不确定时用 queue）', JSON.stringify(h3.prompts.map(p => p.mode)))
-}
-
-console.log('# best-effort：prompt 抛错 / sessionController 缺失都不影响 release 结果')
-{
-  const foreign = mkClaim({ claimId: 'c_lock', holderId: 'agent:owner', paths: ['src/a/'], readers: ['agent:me'], expiresAt: Date.now() + HOUR })
-  const h = await makeHarness({ claims: [foreign], liveSessions: ['me'], promptThrows: true })
-  let threw = null, res = null
-  try { res = await h.callLock({ op: 'release', claimId: 'c_lock' }, 'owner') } catch (e) { threw = e }
-  await settle()
-  ok(threw === null, 'prompt 抛错不会冒泡到工具调用', threw && String(threw.message))
-  ok(res && res.ok === true && res.data.released.length === 1, 'prompt 抛错时 release 仍返回 ok:true + released', JSON.stringify(res && { ok: res.ok }))
-  ok(h.prompts.length === 1, '确实尝试推送过（不是没走到）', String(h.prompts.length))
-  // 0.8.3：失败必须带回**真实错误**（0.8.2 把它抹平成 undefined，与"没人可推"无法区分）
-  const n = res.data.notify
-  ok(n && n.readers === 1 && n.pushed.length === 0 && n.skipped.length === 1 &&
-     n.skipped[0].sessionId === 'me' && n.skipped[0].reason === 'prompt-failed',
-    'prompt 抛错 -> reason === prompt-failed 且 release 仍 ok:true', JSON.stringify(n))
-  ok(n && n.skipped[0].error === 'prompt rejected', 'skipped[].error 带回真实错误文本（不再抹平）', JSON.stringify(n && n.skipped[0].error))
-
-  const h2 = await makeHarness({ claims: [mkClaim({ claimId: 'c_lock', holderId: 'agent:owner', paths: ['src/a/'], readers: ['agent:me'], expiresAt: Date.now() + HOUR })], liveSessions: ['me'], withController: false })
-  let threw2 = null, res2 = null
-  try { res2 = await h2.callLock({ op: 'release', claimId: 'c_lock' }, 'owner') } catch (e) { threw2 = e }
-  ok(threw2 === null, 'sessionController 缺失时不抛', threw2 && String(threw2.message))
-  ok(res2 && res2.ok === true, 'sessionController 缺失时 release 照常成功', JSON.stringify(res2 && { ok: res2.ok }))
-  const n2 = res2.data.notify
-  ok(n2 && n2.readers === 1 && n2.skipped.length === 1 && n2.skipped[0].reason === 'prompt-failed' &&
-     n2.skipped[0].error === 'no-session-controller',
-    '通道整个缺失时读者仍在 skipped 里（不是静默 return）', JSON.stringify(n2))
-}
-
-console.log('# 超时：prompt 永不 resolve -> reason 仍是 prompt-failed，但 error 区分出 timeout')
-{
-  const foreign = mkClaim({ claimId: 'c_lock', holderId: 'agent:owner', paths: ['src/a/'], readers: ['agent:me'], expiresAt: Date.now() + HOUR })
-  const h = await makeHarness({ claims: [foreign], liveSessions: ['me'], promptHangs: true })
-  const t0 = Date.now()
-  let threw = null, res = null
-  try { res = await h.callLock({ op: 'release', claimId: 'c_lock' }, 'owner') } catch (e) { threw = e }
-  const took = Date.now() - t0
-  ok(threw === null, '超时不会冒泡到工具调用', threw && String(threw.message))
-  ok(res && res.ok === true, '超时时 release 仍 ok:true', JSON.stringify(res && { ok: res.ok }))
-  const n = res.data.notify
-  ok(n && n.readers === 1 && n.pushed.length === 0 && n.skipped.length === 1 && n.skipped[0].reason === 'prompt-failed',
-    '超时的读者进 skipped 且 reason === prompt-failed', JSON.stringify(n))
-  ok(n && n.skipped[0].error === 'timeout', '超时用 error === timeout 与"prompt 真的失败"区分', JSON.stringify(n && n.skipped[0].error))
-  ok(took >= 3000 && took < 15000, '确实等满了推送超时窗口才判定（不是立刻放弃）', String(took) + 'ms')
-}
-
-console.log('# agent/disposed：释放声明 + 从所有 readers 摘掉 + 向读者推送')
-{
-  const dead = mkClaim({ claimId: 'c_dead', holderId: 'agent:dead', holderName: 'Dead', paths: ['src/d/'], readers: ['agent:me'], expiresAt: Date.now() + HOUR })
+  // W7 实测过的锁安全缺陷就是在这里发生的：dispose 之后会话往往**恢复并继续干活**，
+  // 它的对话历史里仍然"记得"自己持有这个路径。旧实现把声明提前删掉 ⇒ 别的会话
+  // op=overview 看到路径空闲，两边都以为可以写。现在声明只由租约决定。
+  const alive = mkClaim({ claimId: 'c_alive', holderId: 'agent:dead', holderName: 'Dead', paths: ['src/d/'], readers: ['agent:me'], expiresAt: Date.now() + HOUR })
   const other = mkClaim({ claimId: 'c_other', holderId: 'agent:owner', paths: ['src/o/'], readers: ['agent:dead', 'agent:me'], expiresAt: Date.now() + HOUR })
-  const h = await makeHarness({ claims: [dead, other], liveSessions: ['me'] })
+  const h = await makeHarness({ claims: [alive, other], liveSessions: ['me'] })
   h.ctx.emit('agent/disposed', { agent: { id: 'dead' } })
-  // 轮询等待异步 mutate + 推送落定
-  for (let i = 0; i < 40 && h.prompts.length === 0; i++) await sleep(25)
+  // 轮询等待异步 mutate 落定：判据是"reader 已被摘掉"（这正是本次 mutate 的可见效果）。
+  for (let i = 0; i < 40; i++) {
+    const d = h.readState()
+    const o = (d.claims || []).find(c => c.claimId === 'c_other')
+    if (o && Array.isArray(o.readers) && !o.readers.includes('agent:dead')) break
+    await sleep(25)
+  }
   const doc = h.readState()
-  ok(!doc.claims.some(c => c.claimId === 'c_dead'), 'disposed 的 holder 自己的声明被释放', JSON.stringify(doc.claims.map(c => c.claimId)))
+  ok(doc.claims.some(c => c.claimId === 'c_alive'), 'disposed 的 holder 的**未过期**声明仍然在（dispose 不是释放信号）', JSON.stringify(doc.claims.map(c => c.claimId)))
+  const own = doc.claims.find(c => c.claimId === 'c_alive')
+  ok(own && JSON.stringify(own.readers) === '["agent:me"]', '未过期声明连同它自己的 readers 原样保留', JSON.stringify(own && own.readers))
   const remain = doc.claims.find(c => c.claimId === 'c_other')
   ok(remain && !remain.readers.includes('agent:dead'), 'disposed 的 holder 从其他 claim 的 readers 里被摘掉', JSON.stringify(remain && remain.readers))
   ok(remain && remain.readers.includes('agent:me'), '其他读者不受影响', JSON.stringify(remain && remain.readers))
-  ok(h.prompts.length === 1, '被释放声明的读者（me）收到一条推送', JSON.stringify(h.prompts.length))
-  ok(h.prompts[0] && h.prompts[0].sessionId === 'me', '推送目标是活着的读者会话', JSON.stringify(h.prompts.map(p => p.sessionId)))
-  ok(h.prompts[0] && h.prompts[0].content[0].text.includes('src/d/'), '推送文案点出被释放的路径', h.prompts[0] && h.prompts[0].content[0].text)
+  ok(h.injects.length === 0, '没有发生释放事件 ⇒ 不产生"锁已释放"通知（旧行为在这里说谎）', JSON.stringify(h.injects.length))
+  // 新通道不需要"释放者的活 Agent 当 sender"这一约束在 release 路径上仍然成立；
+  // 这里只能断言 disposed 路径**一条都没碰**旧通道。
+  ok(h.prompts.length === 0 && h.sends.length === 0, 'disposed 路径也不碰旧通道', JSON.stringify({ prompts: h.prompts.length, sends: h.sends.length }))
+}
+
+console.log('# agent/disposed：已到期声明由 sweep 回收（不是被 dispose 释放），同样不产生通知')
+{
+  // mutate() 会先 sweep 掉所有过期声明 —— 到期回收的唯一机制是租约，dispose 只是顺手摘 reader。
+  // 所以 agent/disposed 路径的 data.released **恒为空**，这条通道上不再存在"锁已释放"通知。
+  const expired = mkClaim({ claimId: 'c_exp', holderId: 'agent:dead', paths: ['src/d/'], readers: ['agent:me'], expiresAt: Date.now() - 1000 })
+  const other = mkClaim({ claimId: 'c_other', holderId: 'agent:owner', paths: ['src/o/'], readers: ['agent:dead', 'agent:me'], expiresAt: Date.now() + HOUR })
+  const h = await makeHarness({ claims: [expired, other], liveSessions: ['me'] })
+  h.ctx.emit('agent/disposed', { agent: { id: 'dead' } })
+  for (let i = 0; i < 40; i++) {
+    const d = h.readState()
+    const o = (d.claims || []).find(c => c.claimId === 'c_other')
+    if (o && Array.isArray(o.readers) && !o.readers.includes('agent:dead')) break
+    await sleep(25)
+  }
+  const doc = h.readState()
+  ok(!doc.claims.some(c => c.claimId === 'c_exp'), '已到期声明被回收（由 sweep 完成）', JSON.stringify(doc.claims.map(c => c.claimId)))
+  ok(doc.claims.some(c => c.claimId === 'c_other'), '他人的未到期声明不受影响', JSON.stringify(doc.claims.map(c => c.claimId)))
+  ok(h.injects.length === 0, '到期回收没有事件源 ⇒ 也不投递（已知限制，见下一节）', JSON.stringify(h.injects.length))
 }
 
 console.log('# 已知限制：TTL 自然到期不推送（没有事件源）')
@@ -732,7 +700,7 @@ console.log('# 已知限制：TTL 自然到期不推送（没有事件源）')
   await h.callLock({ op: 'status', paths: ['src/a/'] }, 'me')
   await settle()
   ok(res.ok === true, 'list 正常返回')
-  ok(h.prompts.length === 0, '过期声明被 sweep 掉，但不会触发任何推送（无事件源，已知限制）', JSON.stringify(h.prompts.length))
+  ok(h.injects.length === 0, '过期声明被 sweep 掉，但不会触发任何投递（无事件源，已知限制）', JSON.stringify(h.injects.length))
   ok(Array.isArray(res.data.claims) && res.data.claims.length === 0, '过期声明在视图里已被清理', JSON.stringify(res.data && res.data.claims && res.data.claims.length))
   // 只读路径（list/overview/status）只做内存态清理、不回写磁盘；下一次写路径才会落盘。
   // 这里如实断言这个**已知行为**，而不是假装磁盘也被清了。
@@ -747,12 +715,36 @@ console.log('# 已知限制：TTL 自然到期不推送（没有事件源）')
 // ════════════════════════════════════════════════════════════════════════
 console.log('# 推送链路的整体兜底：读者处理途中抛异常必须记账（item 4）')
 {
-  const foreign = mkClaim({ claimId: 'c_boom', holderId: 'agent:owner', holderName: 'Owner', paths: ['src/a/'], readers: ['agent:me'], expiresAt: Date.now() + HOUR })
-  // timer.timeout 在 arm 之后抛：这条异常发生在**读者处理途中**（pushOne 里建超时护栏那一步），
-  // 真缺陷下它会被整体兜底静默吞掉 —— 于是 readers=1 却 pushed+skipped=0，无人能解释。
-  const hb = await makeHarness({ claims: [foreign], liveSessions: ['me'], timerThrowsWhenArmed: true })
-  hb.armTimer()
-  const res = await hb.callLock({ op: 'release', claimId: 'c_boom' }, 'owner')
+  const { installStore } = await import(path.join(ROOT, '../lib/store.js'))
+  const { installTools } = await import(path.join(ROOT, '../lib/tools.js'))
+  const { installPush } = await import(path.join(ROOT, '../lib/push.js'))
+  const store = new Map()
+  const versions = new Map()
+  const statePath = projectStateFile(CWD)
+  store.set(statePath, JSON.stringify({
+    schemaVersion: 1, seq: 1,
+    claims: [mkClaim({ claimId: 'c_boom', holderId: 'agent:owner', holderName: 'Owner', paths: ['src/a/'], readers: ['agent:me'], expiresAt: Date.now() + HOUR })],
+    messages: [], holders: []
+  }))
+  versions.set(statePath, 1)
+  const tools = []
+  const ctx = new Context()
+  for (const serviceName of ['tools', 'timer', 'fs', 'sessions', 'sessionTitle', 'agents']) ctx.provide(serviceName)
+  ctx.set('tools', { register: (t) => { tools.push(t); return () => {} } })
+  ctx.set('timer', { timeout: (ms) => new Promise((r) => setTimeout(r, ms)), interval: () => () => {} })
+  ctx.set('fs', makeFs(store, versions))
+  ctx.set('sessions', { get: () => ({ header: { cwd: CWD } }) })
+  ctx.set('sessionTitle', { get: () => ({ title: 'Push Worker' }) })
+  ctx.set('agents', { get: () => undefined })
+  const storeApi = installStore(ctx)
+  const push = installPush(ctx, storeApi)
+  // 制造一个**在读者处理途中**抛出、且不被逐条兜住的异常：把存活判据整个打坏。
+  // （真实的 livenessOf 自己 catch 的是 agents.get 抛错，那是 liveness-check-failed；
+  //   这里越过它，直接命中 notifyReaders 的整体兜底 —— item 4 要检的正是那条兜底不静默截断。）
+  storeApi.livenessOf = () => { throw new Error('liveness exploded') }
+  installTools(ctx, storeApi, push)
+  const lock = tools.find((t) => t.name === 'collab_lock')
+  const res = await lock.execute({ op: 'release', claimId: 'c_boom' }, { agent: { id: 'owner', session: { header: { cwd: CWD } } } })
   const n = res && res.data && res.data.notify
   ok(res.ok === true, 'release 本身仍然成功（推送是旁路，兜底不得影响工具结果）', JSON.stringify(res && { ok: res.ok }))
   ok(n && n.readers === 1 && n.pushed.length === 0, '候选读者 1 人、成功投递 0 条', JSON.stringify(n))
@@ -761,7 +753,7 @@ console.log('# 推送链路的整体兜底：读者处理途中抛异常必须�
     JSON.stringify(n && { pushed: n.pushed, skipped: n.skipped }))
   ok(n && n.skipped.length === 1 && n.skipped[0].reason === 'internal',
     'item 4：兜底补记的是 reason=internal 的记录', JSON.stringify(n && n.skipped))
-  ok(n && n.skipped.length === 1 && String(n.skipped[0].error || '').includes('timer service exploded'),
+  ok(n && n.skipped.length === 1 && String(n.skipped[0].error || '').includes('liveness exploded'),
     'item 4：internal 记录带真实错误文本', JSON.stringify(n && n.skipped))
 }
 
@@ -868,12 +860,22 @@ console.log('# 源码级：releaseWithNotify 兜底里不再有「不可能抛�
     JSON.stringify(catchBody.slice(0, 160)))
 }
 
+console.log('# 源码级：push.ts 不再出现旧通道（prompt / sendMessage）的调用面')
+{
+  const src = readFileSync(path.join(ROOT, '../src/push.ts'), 'utf8')
+  // 注释里当然可以（也必须）解释为什么删掉它们 —— 这里只看**去掉注释后的代码**。
+  const code = src.replace(/\/\/[^\n]*/g, '').replace(/\/\*[\s\S]*?\*\//g, '')
+  ok(!/\.prompt\s*\(/.test(code), 'push.ts 的代码里不再调用 .prompt(', JSON.stringify(code.match(/.{0,40}\.prompt\s*\(.{0,40}/) || null))
+  ok(!/sendMessage\s*\(/.test(code), 'push.ts 的代码里不再调用 sendMessage(', JSON.stringify(code.match(/.{0,40}sendMessage\s*\(.{0,40}/) || null))
+  ok(!/kind\s*:\s*['"]user['"]/.test(code), "push.ts 的代码里没有 kind:'user'（不冒充用户）", null)
+  ok(/\.inject\s*\(/.test(code), 'push.ts 用 agent.inject 投递（逐事件、不唤醒）', null)
+  ok(/from\s+'@deepseek-ai\/dsh-llm'/.test(code), '构造函数来自真实的 @deepseek-ai/dsh-llm（不手抄副本）', null)
+}
+
 // ════════════════════════════════════════════════════════════════════════
 // 3. 通知载体：显式来源的 notice 经 agent.inject 逐事件投递（AGENTS.md §1 的可执行版本）
 // ════════════════════════════════════════════════════════════════════════
-// 旧机制在这里与真实 @deepseek-ai/dsh-llm 的 createUserMessage 现场对拍。真身对拍已随
-// 副本（src/plugin-message.ts）一起删除 —— 现在没有"我们的消息实现"可以对拍了，
-// 于是这一节改为断言**新载体**的契约：来源显式非 user 的 notice + agent.inject 逐事件投递。
+// 访问通知（src/access.ts）是这套载体的范例；释放通知（src/push.ts）0.9.6 起与它同构。
 console.log('# 通知载体：手抄的消息副本已删除，通知经 agent.inject 投递 form:notice 的显式来源消息')
 {
   // (a) 副本本身**必须不存在**：留着它就会有人再用一次。
@@ -893,11 +895,7 @@ console.log('# 通知载体：手抄的消息副本已删除，通知经 agent.i
   // (c) 通知真的经 agent.inject 投出，且来源显式（kind / plugin / form + 非空 summary）。
   ok(injectLog.length === 1, '命中后 agent.inject 恰好调用一次', 'injects=' + injectLog.length)
   const msg = injectLog[0] && injectLog[0].message
-  const source = msg && msg.source
-  ok(!!source && source.kind === 'plugin' && source.plugin === 'dsh-collab' && source.form === 'notice',
-    "inject 收到的消息 source 是 {kind:'plugin', plugin:'dsh-collab', form:'notice'}", JSON.stringify(source))
-  ok(!!source && typeof source.summary === 'string' && source.summary.length > 0,
-    'source.summary 是非空字符串（notice 缺它会退化成 opaque 行）', JSON.stringify(source && source.summary))
+  ok(sourceShapeOk(msg), "inject 收到的消息 source 是 {kind:'plugin', plugin:'dsh-collab', form:'notice', summary 非空}（(a) 同款判据）", sourceShapeWhy(msg))
   ok(!!msg && msg.role === 'user' && Object.isFrozen(msg),
     '消息是冻结的 user 角色（role / id / 深冻结都由构造函数补）',
     JSON.stringify({ role: msg && msg.role, frozen: !!(msg && Object.isFrozen(msg)) }))
@@ -909,6 +907,32 @@ console.log('# 通知载体：手抄的消息副本已删除，通知经 agent.i
     JSON.stringify([...h.contexts.keys()]))
   ok(!h.contexts.has('dsh-collab/access'), '**不再**注册 dsh-collab/access 上下文段（载体已换）',
     JSON.stringify([...h.contexts.keys()]))
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// 4. 全局断言：(a) 每条投递的来源形状 + 旧通道/旧 reason 的彻底消失
+// ════════════════════════════════════════════════════════════════════════
+console.log('# (a) 投递出去的**每一条**消息来源都显式非 user')
+{
+  ok(deliveries.length > 0, '(a) 本次至少投递过一条（否则下面的"每一条"是空断言）', 'deliveries=' + deliveries.length)
+  const bad = deliveries.filter(d => !sourceShapeOk(d.message))
+  ok(bad.length === 0,
+    '(a) 每条投递的 source 都是 {kind:plugin, plugin:dsh-collab, form:notice} 且 summary 非空 ≤120',
+    bad.map(d => d.sessionId + ' -> ' + sourceShapeWhy(d.message)).join(' | '))
+  const texts = deliveries.map(d => noticeText(d))
+  ok(texts.every(t => t.includes('[dsh-collab]')), '(a) 每条投递的正文都带 dsh-collab 前缀（可追溯）', JSON.stringify(texts.slice(0, 2)))
+}
+
+console.log('# 旧通道的 reason 取值不再出现在任何一次 notify 里')
+{
+  ok(allNotifies.length > 0, '本次至少收集到一次 notify（否则下面的扫描是空断言）', 'notifies=' + allNotifies.length)
+  const seen = []
+  for (const n of allNotifies) for (const s of (n.skipped || [])) if (RETIRED_REASONS.includes(s.reason)) seen.push(s.reason)
+  ok(seen.length === 0, 'prompt-failed / not-adjacent / subagent-failed 已彻底不再产生', JSON.stringify(seen))
+  const channels = []
+  for (const n of allNotifies) for (const p of (n.pushedVia || [])) channels.push(p.channel)
+  ok(channels.length > 0 && channels.every(c => c === 'inject'),
+    "所有成功投递的 pushedVia.channel 都是 'inject'", JSON.stringify([...new Set(channels)]))
 }
 
 h.finish()

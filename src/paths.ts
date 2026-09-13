@@ -42,7 +42,7 @@ export function expandHome(p: string, home: string = homedir()): string {
 export function dshHomeDir(env: EnvLike = process.env): string {
   const home = homedir()
   if (typeof home !== 'string' || !home.trim()) {
-    throw new Error('dsh-collab: cannot determine an absolute user home (os.homedir() is empty); set DSH_HOME to an absolute path')
+    throw new Error('dsh-collab: 无法确定用户的绝对主目录（os.homedir() 为空）；请把 DSH_HOME 设为绝对路径')
   }
   const raw = env ? env.DSH_HOME : undefined
   const configured = typeof raw === 'string' ? raw.trim() : ''

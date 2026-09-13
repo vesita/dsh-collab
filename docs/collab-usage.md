@@ -18,7 +18,7 @@
 插件在运行时上下文里注入一行实时态势。同项目有其他会话持有声明时，你会看到类似：
 
 ```
-[dsh-collab] 同项目其他会话当前占用：S1 调研（exclusive）占用 crates/transport/，租约 30 分（09-13 06:35Z–09-13 07:05Z）。改动这些路径前请先执行 collab_lock op=wait 或用 collab_board 协商。
+[dsh-collab] 同项目其他会话当前占用：S1 调研（独占）占用 crates/transport/，租约 30 分（09-13 06:35Z–09-13 07:05Z）。改动这些路径前请先执行 collab_lock op=wait 或用 collab_board 协商。
 ```
 
 租约用**绝对 UTC 起止时刻**表示，不用「还剩几分钟」的倒计时：DSH 只有在运行时上下文文本逐字节变化时才提交新快照，时间无关的摘要因此不会每隔几分钟被重新注入一次。
@@ -130,8 +130,33 @@ collab_lock op=wait paths=["src/backend/models/"] timeoutMs=15000
 | `release claimId=...` | 释放指定声明（仅 holder 本人） |
 | `release paths=[...]` | 释放与给定路径重叠的本人声明 |
 | `heartbeat claimId=...` | 续租（延长至 `now + ttlSec`） |
+| `reap` | **僵尸声明显式回收**（默认 dry-run，只列候选、不改状态） |
+| `reap confirm=true` | 真正回收命中判据的僵尸声明（回收后通知其读者） |
 
-### 2.6 本地工具链辅助
+### 2.6 僵尸声明显式回收（`reap`）
+
+被**强杀**的会话（dsh 重启等）不会 `release`，它未到期的声明会一直占用到租约到期；租约最长
+`86400` 秒 ⇒ 最长 24 小时内他人对这些路径的**写入都会被门控硬拒绝**，而声明只有持有者本人能
+`release`（他人拿到 `forbidden`）。`reap` 就是给这种情况的一条**显式**出口：
+
+```
+collab_lock op=reap                                  # 第一步：只看候选（dry-run，绝不改状态）
+collab_lock op=reap confirm=true                      # 第二步：确认后真正删除
+collab_lock op=reap paths=["src/"] olderThanSec=60    # 可限定路径 / 放宽 age 门槛
+```
+
+候选必须**同时**满足：声明未过期（已过期的归 `sweep()`）；holder 不在 `ctx.get('agents').list()`
+里；不是调用者自己（清自己的锁用 `release`）；`now - createdAt` 严格大于 `olderThanSec`
+（默认 **600 秒**）。`human:console` 这类没有活体信号的 holder 一律不收。响应里
+`candidates[]`（dry-run）或 `reaped[]`（confirm）逐条带 `holderId` / `paths` / `ageSec` /
+`remainingSec` 与 `reasons`（每条判据一个标签）。
+
+> **为什么必须显式**：`agents.list()` 只含本进程**此刻加载着**的 agent，休眠但**可唤回**的会话
+> 同样不在里面 —— 运行时注册表无法区分"休眠可唤回"与"真死"。所以 reap **绝不自动触发**：
+> 没有定时器、不在 `sweep()`/读路径里、`agent/disposed` 也不会调用它。误杀的代价是持有者恢复后
+> 仍以为自己有锁，而另一边看到路径空闲（W7 的锁安全缺陷）。
+
+### 2.7 本地工具链辅助
 
 开工或提交前，可用 Rust CLI 做协作自检：
 
@@ -170,7 +195,7 @@ collab_board op=read channel=general since=0 limit=50
 
 - 身份取自调用方会话（`exec.agent.id`），工具参数里传不了 holder，因此无法冒充他人。
 - 每条声明 / 消息都记录 holderId、holderName（会话标题截断 24 字）、时间戳。
-- 租约过期是权威回收机制；agent 正常下线时插件也会立即释放其声明。
+- 租约 `expiresAt` 是声明生命周期的**唯一权威**回收机制：agent 正常下线（`agent/disposed`）**不会**提前释放它未到期的声明，只会回收**已过期**的声明、并把它从各 claim 的读者名单里摘掉；未到期的声明原样保留到租约到期后由惰性清理回收。`op=heartbeat` 是**唯一**的续租方式。
 
 ---
 

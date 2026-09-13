@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Literal
 
 Mode = Literal["exclusive", "shared", "read"]
-OpLock = Literal["claim", "release", "list", "overview", "status", "heartbeat", "wait"]
+OpLock = Literal["claim", "release", "list", "overview", "status", "heartbeat", "wait", "reap"]
 OpBoard = Literal["post", "read"]
 SuggestedAction = Literal["wait", "negotiate", "switch_path"]
 

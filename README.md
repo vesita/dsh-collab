@@ -16,6 +16,10 @@
 3. **声明占用**：改动前 `claim` 目标路径；冲突时 `wait` 等待或用 `collab_board` 协商。
 
 > 面向使用者的完整规范见 [`docs/collab-usage.md`](docs/collab-usage.md)。
+>
+> 子代理路由（默认继承父会话 vs 用原生 preset 固定成配置路由）的机制与实测证据见
+> [`docs/dsh-subagent-routing.md`](docs/dsh-subagent-routing.md) —— **那是文档，不是提示词**，
+> 不进 `skills/`、不进运行时纪律文本。
 
 ---
 
@@ -28,6 +32,7 @@
 ├── docs/
 │   ├── collab-plugin-design.md   # 完整设计文档（18 节 + 决策记录 + M1-M3 实现纪要）
 │   ├── collab-usage.md           # 面向任意会话的使用指南
+│   ├── dsh-subagent-routing.md   # DSH 子代理路由：默认继承 vs 原生 preset 固定（机制 + 实测索引；非提示词）
 │   └── collab-ux-backlog.md      # 使用不便清单与优化方向（含实测使用统计）
 ├── scripts/
 │   ├── collab_models.py          # Python dataclass 模型定义（Schema 派生）
@@ -42,7 +47,7 @@
 │   ├── tools.ts                  # collab_lock / collab_board 注册（消费 store + push）
 │   ├── access.ts                 # 功能 A：访问通知（逐事件经 agent.inject 投递 form:'notice' 的显式来源消息）+ 读者反向注册（tools/post-execute）
 │   ├── gate.ts                   # 功能 C：写/读的原生审批门控（tools/pre-execute）
-│   ├── push.ts                   # 功能 D：释放推送 + 子代理回退通道 + agent/disposed 生命周期
+│   ├── push.ts                   # 功能 D：释放推送（唯一通道 agent.inject + 显式来源 form:'notice'）+ agent/disposed 生命周期
 │   ├── awareness.ts              # 协作态势注入（运行时上下文 order 130）
 │   ├── delegation.ts             # 委托纪律：settings 偏好 + 随包 skill + 常驻纪律块（order 131）
 │   ├── skill.ts                  # 随包 skill 读盘与 buildSkillIndex（delegation 与路由共用）
@@ -62,7 +67,7 @@
     ├── collab-pure-logic.mjs        # 纯逻辑回归 + hostCode 内联副本漂移守护
     ├── collab-integration.mjs       # Cordis 插件端到端（fake ctx）
     ├── collab-hostcode-parity.mjs   # 动态宿主形态**行为**对拍（路径 + 三态语义 + holder 回收）
-    ├── collab-inline-parity.mjs     # 两形态**同名函数**逐输出对拍（18 个，含集合回归守护）
+    ├── collab-inline-parity.mjs     # 两形态**同名函数**逐输出对拍（19 个，含集合回归守护）
     ├── collab-contract-derivation.mjs # 契约派生守卫（schema ⇄ d.ts ⇄ Python ⇄ Rust ⇄ 真实工具 schema）
     ├── collab-message-provenance.mjs # 规范守卫：严禁冒充用户（AGENTS.md §1）
     ├── collab-digest-stability.mjs  # 态势摘要文本时间稳定性回归（运行时快照去重）
@@ -125,7 +130,7 @@ agents.currentInitiator()            → 正在装配的那个会话
 渲染结果形如：
 
 ```
-[dsh-collab] 同项目其他会话当前占用：Other Session（exclusive）占用 src/backend/，租约 30 分（09-13 06:35Z–09-13 07:05Z）。改动这些路径前请先执行 collab_lock op=wait 或用 collab_board 协商。
+[dsh-collab] 同项目其他会话当前占用：Other Session（独占）占用 src/backend/，租约 30 分（09-13 06:35Z–09-13 07:05Z）。改动这些路径前请先执行 collab_lock op=wait 或用 collab_board 协商。
 ```
 
 租约刻意用**绝对 UTC 起止时刻**表示，而不是「还剩几分钟」的倒计时：DSH 只在运行时上下文的文本逐字节变化时才提交新快照，时间无关的摘要因此不会因为过了几分钟而被重复注入。
@@ -181,6 +186,99 @@ agents.currentInitiator()            → 正在装配的那个会话
 
 ---
 
+## 0.9.8：僵尸声明的显式回收（`op=reap`）
+
+**要解决的问题（实测，不是推演）**：2026-09-13 深夜，一个子代理会话（W10）被强杀（dsh 重启），
+它持有的 `src/` + `tests/` exclusive 声明**留在了状态文件里**。声明只有持有者本人能 `release`
+（对其他会话返回 `{"ok":false,"error":"forbidden","message":"only holder can release"}`），
+而租约 `ttlSec` 最长可到 `86400` 秒 ⇒ **最长 24 小时内，任何其他会话对这些路径的写入都会被门控
+硬拒绝**（本部署审批被禁用，`ask` 即 `deny`）。当时主 AI 只能手工改状态文件
+（`~/.dsh/collab/projects/*.json`）才解开。
+
+**判据为什么必须极其小心**：`agents.get(holderId) === undefined` **不能**单独作为"僵尸"依据 ——
+休眠但**可唤回**的会话同样返回 undefined（实测活进程 `agents.list()` 只有 2 个 agent，
+而 `sessionController.list()` 有 224 个会话）。这正是 0.8.2 的真缺陷（按 liveness 清 readers，
+静默丢通知）与 W7 的决策（`agent/disposed` 不得提前释放未到期声明）的来源。
+**运行时注册表无法区分"休眠可唤回"与"真死"**，而误杀的代价不对称：被回收的会话恢复后仍按对话历史
+以为自己持有锁，另一边却看到路径空闲 ⇒ 两边同时以为可以写。
+
+**因此 `op=reap` 是纯显式的**：默认 dry-run，`confirm: true` 才动手，且**绝不**接进 `sweep()`
+或任何读路径、定时器、`agent/disposed`。判据（每条都写进返回值的 `reasons`）：
+
+| 判据 | 说明 |
+| --- | --- |
+| 未过期 | `expiresAt > now`；已过期的归 `sweep()`，不是僵尸 |
+| holder 不在 `agents.list()` | `ctx.get('agents').list()` 的 `'agent:' + id` 列表里没有它 |
+| 不是调用者自己 | 清自己的锁用 `op=release` |
+| age 超门槛 | `now - createdAt` **严格大于** `olderThanSec`，默认 **600 秒**（保守；可显式放大/缩小） |
+| `paths` 限定（可选） | 只考虑与给定路径相交的声明 |
+| **只对 `agent:<id>` holder** | `human:console` 从不在 `agents.list()` 里，"不在名单"对它零信息量；按它回收等于纯按 age 回收 |
+
+**活体检查跑不成时一个也不收**：拿不到 `agents.list()`（服务/方法缺失或抛错）⇒ `liveHolderIds = null`
+⇒ 候选为空并如实标 `livenessCheck: 'unavailable'`（"拿不到名单"与"名单为空"是两件事）。
+
+**返回**（沿用现有信封，不改任何既有 op 的形状）：
+
+- dry-run：`{ ok:true, data:{ dryRun:true, olderThanSec, serverTime, livenessCheck, candidates:[…] } }`
+- `confirm:true`：`{ ok:true, data:{ dryRun:false, olderThanSec, serverTime, livenessCheck, reaped:[…] } }`
+
+每个条目 = 该声明的公开视图（`claimId` / `holderId` / `holderName` / `paths` / `mode` …）
+加上 `ageSec`、`remainingSec`（剩余租约）与 `reasons`（逐条判据标签）。
+
+**回收后的读者通知**复用功能 D 的同一条投递面（`notifyReaders` → `agent.inject` + `form:'notice'`
+的显式来源消息），**不另造通道**，也绝不触碰任何会冒充用户（`kind:'user'`）的接口；文案说"回收"
+而不是"释放"（回收者不是原持有者）。只有**真的回收到了**才通知，dry-run 与空结果都不发。
+
+**回归守卫**：`tests/collab-reap.mjs`（dry-run 状态逐字节不变 / confirm 正负成对 / age 门槛 /
+自己的不回收 / 过期不归它 / paths 限定 / 通知 source 形状 / 活体检查不可用 / 静态断言"reap 只由
+工具 handler 调用"）；两形态同步由 `tests/collab-inline-parity.mjs`（`reap` 进同名函数逐输出对拍）
+与 `tests/collab-hostcode-parity.mjs`（宿主内联形态的 dry-run/confirm 行为）守护。
+
+> **负向对照**（可复核）：临时删掉 `src/collab-core.ts` 里的 `if (live.has(c.holderId)) continue`
+> 一行，`tests/collab-reap.mjs` 立即红在「2.4 活着的 holder 的声明**一条都没动**」（只剩 `c_mine`，
+> `c_live` 被误删）；还原后逐字节一致、全绿。
+
+---
+
+## 0.9.6：释放通知不再冒充用户 + 声明生命周期只认租约
+
+**修的是两个真问题（都实测过）**：
+
+- **释放通知在 GUI 里是「用户气泡」**。旧实现经 `sessionController.prompt`（主通道）与
+  `subagents.sendMessage`（0.8.4 的回退通道）投递，而这两个 API **只收 `content`、不收 message**：
+  消息由宿主代造并写死 `source: { kind: 'user', rpcId: 'dsh-collab-…' }` ⇒ 客户端按 `source.kind`
+  分流后渲染成**用户气泡**（落进 next-step 收件箱还会升级成 steering 气泡，与真人输入共用同一个
+  渲染器）。插件既改不了也看不见来源 ⇒ 只能换载体。
+- **会话被 dispose 会提前丢掉未到期的声明**。`dropHolder` 原先只按 `holderId` 过滤、完全不看
+  `expiresAt`：会话一结束就释放。但同一个 session 常常随后恢复并继续干活（对话历史里仍"记得"
+  自己持锁），而别的会话在 `overview` 里看到路径**空闲** ⇒ 两边同时以为可以写。
+
+**现在的行为**：
+
+1. 释放通知的唯一投递面是 `ctx.get('agents').get(sessionId)` 解析到读者**自己的活 agent** 后
+   `agent.inject(createUserMessage({ source: { kind: 'plugin', plugin: 'dsh-collab', form: 'notice',
+   summary: boundContextSummary(…) } }))` —— 来源显式，GUI 里是独立可折叠的 notice 行而非气泡。
+   解析不到就**如实跳过**（`skipped.reason = 'agent-not-resolvable'`），**没有任何回退通道**；
+   `inject` 是同步契约 ⇒ 不再有 `timeout` 这一态；`prompt-failed` / `not-adjacent` /
+   `subagent-failed` 三个 reason 随通道一起删除。
+2. **租约 `expiresAt` 是声明生命周期的唯一权威**：`agent/disposed` 只回收该 holder **已过期**的声明、
+   并把它从各 claim 的 `readers` 里摘掉；未到期声明原样保留，到期由惰性清理回收，`op=heartbeat`
+   是唯一续租方式。安全侧后果如实记：会话死亡后其声明会占用到租约到期。
+3. 常驻纪律新增一条：**主会话上下文最贵**（主 AI 跑最强也最贵的模型 ⇒ 目标是低上下文运行），
+   配套 `skills/subagent-delegation/SKILL.md` §6 把「成本」一节改写为「让主 AI 用得起最强的模型」。
+
+**回归守卫**：
+
+- `tests/collab-readers-push.mjs` 全场景断言旧通道**零调用**，且每条投递的 source 形状为
+  `plugin/notice` + 非空且 ≤120 字符的 summary（负向对照：把 `kind` 改回 `'user'` 即红）；
+- `tests/collab-message-provenance.mjs` 新增机械规则：剥注释后扫 `src/` 与 `lib/`，
+  `src/push.ts` 必须经 `agent.inject` + 真身 `createUserMessage`，且**代码里不得再出现**
+  `subagents.sendMessage` / `sessionController`（负向对照：分别污染 `src/push.ts` 与 `lib/push.js` 各得一次 RED）；
+- 两形态同步由 `tests/collab-inline-parity.mjs`（`dropHolder` 已进同名函数逐输出对拍）与
+  `tests/collab-hostcode-parity.mjs`（触发真实注册的 `agent/disposed` 处理器）守护。
+
+---
+
 ## 0.9.4：提示词硬化：子代理禁止 client 平台 Inspect + 探索阶段默认先派
 
 **修的是真故障（实测定位）**：
@@ -229,7 +327,7 @@ claim 删除并强制刷新后双方都回落通用规范。修复前实测 `6 p
 **三道新的守卫**（都进了 `npm test`）：
 
 - `tests/collab-inline-parity.mjs`：从动态形态的 `hostCode` 字符串里用**括号配对扫描**抽出
-  **全部 18 个两形态同名函数**逐输出对拍。此前只有 `clockUtc` / `renderDigest` 两个被比对；
+  **全部 19 个两形态同名函数**逐输出对拍。此前只有 `clockUtc` / `renderDigest` 两个被比对；
   并用「实测同名集合必须**恰好等于**期望集合」做回归守护——任何一侧新增同名函数却忘记接进对拍都会红。
 - `tests/collab-contract-derivation.mjs`：把「schema 是单一事实源」从**声称**变成**可执行**——
   逐字段核对 `$defs` ⇄ `src/types/collab.d.ts` ⇄ `scripts/collab_models.py` ⇄
@@ -252,15 +350,21 @@ claim 删除并强制刷新后双方都回落通用规范。修复前实测 `6 p
 
 ## 0.8.0：访问通知、原生写保护与读者推送
 
-> **0.8.4 修复（功能 D 的投递通道）**：读者若是**由 subagent 路由托管的会话**，
-> `sessionController.prompt` 会被 DSH 结构化拒绝（`session/agent-busy`，message
-> `session "…" is owned by subagent routing`，details 里明写
+> **0.8.4 的历史修复（功能 D 的投递通道）—— 该修复已于 0.9.6 整体删除，仅作沿革记录**：
+> 读者若是**由 subagent 路由托管的会话**，`sessionController.prompt` 会被 DSH 结构化拒绝
+> （`session/agent-busy`，message `session "…" is owned by subagent routing`，details 里明写
 > `use subagent delivery for this child session`）。0.8.3 之前这条拒绝只留下一条
 > `prompt-failed`，通知实际发不出去。0.8.4 在这种情况改用 **`ctx.subagents.sendMessage`**
 > 再投一次，并在 `notify` 里把"走的哪个通道"与失败原因分开记。**安全闸门一条都没放宽**：
 > 仍然只对 `isLiveSession()` 为真的读者投递 —— 回退通道会对"缺席的直接子会话"
 > cold-resume，所以那道闸门对两个通道统一生效；拿不到释放者的活 Agent、或 `subagents`
-> 不可用时不回退。详见下文「功能 D」。
+> 不可用时不回退。
+>
+> **0.9.6：上面这两条通道连同 `prompt-failed` / `not-adjacent` / `subagent-failed` 三个
+> reason 一起从 `src/push.ts` 删除。** 理由见下文「功能 D」：两个 API 都只收 `content`、
+> 消息由宿主代造并写死 `source: { kind: 'user', rpcId: 'dsh-collab-…' }`，在 GUI 里就是
+> **用户气泡**（冒充真人输入，违反 `AGENTS.md` §1）。现在的唯一投递面是 `agent.inject` +
+> 显式 `plugin/notice` 来源。
 
 > **0.8.3 修复（bug + 可观测性）**：0.8.2 的 `sweep()` 会按「会话是否加载」判据清理 `readers`，
 > 而该判据对**休眠但可唤回**的会话返回 `undefined` —— 只是空闲的读者会在下一次任意写路径上
@@ -336,7 +440,8 @@ claim 增加可读性维度（`readable`，默认 `true`；缺字段的老状态
 
 每条 claim 增加 `readers`（holderId 列表；**由 `publish()` / `readersOf()` 归一输出** `[]` —— 新 claim 初始为空，缺字段的老状态文件按空处理；schema 里的 `default: []` 只是文档性声明，运行时不回填它）。**被通知这个动作本身就完成登记**：
 功能 A 投递通知时把被通知者写入该 claim 的 `readers`（去重）。移除读者的路径**只有两条**：
-持有者释放，以及 `agent/disposed`（真正的会话结束，同时释放该 holder 的声明）。
+持有者释放，以及 `agent/disposed`（会话结束）时把已消失的 holder 从**所有** claim 的
+`readers` 里摘掉（会话结束时**不再**同时释放它未到期的声明，见下文「claim 生命周期」）。
 
 > **0.8.3 修复（清理语义）**：0.8.2 曾在 `mutate()` 里把「会话是否加载」判据
 > （`agents.get(sessionId) !== undefined`）注入 `sweep()`，并用它**同时**清理 holders 与 readers。
@@ -349,16 +454,50 @@ claim 增加可读性维度（`readable`，默认 `true`；缺字段的老状态
 > 有界性不需要新增 TTL 或上限：readers 挂在 claim 上，claim 在 release 或到期时被移除，
 > readers 随 claim 一起消亡。
 
-在**显式 `op=release`** 成功之后、以及 `agent/disposed` 自动释放之后，插件向受影响 claim 的
-读者推送一条通知，走可选的 `ctx.sessionController.prompt({requestId, sessionId, mode, content})`；
-被"子代理路由托管"拒绝时改走 `ctx.subagents.sendMessage`（0.8.4 的回退通道，见下文）：
+**0.9.6：投递面只剩一个 —— `agent.inject` + 显式来源的 notice。**
+在**显式 `op=release`** 成功之后、以及 `agent/disposed` 回收了该 holder **已过期**的声明之后，
+插件向受影响 claim 的读者推送一条通知，投递路径**只有这一条**：
 
-* **只推给此刻活着的会话**（`ctx.agents.get(sessionId)` 判定）。冷会话**直接丢弃**——
-  `prompt` 的文档写明它会 resume 会话，而 `subagents.sendMessage` 的文档写明它对"缺席的直接
-  子会话"会 cold-resume，两者都不允许因为推送唤醒冷会话（这道闸门对两个通道统一生效）；
-* 通道缺失（`sessionController` 不可用）不再静默：候选读者会以 `prompt-failed` 出现在 `notify` 里；
-* `mode`：`SessionSummary.running === true` 用 `'steer'`，其余（含判定不了）用 `'queue'`；
-* 排除释放者自己；同一 `(claimId, reader)` 只推一次；全部 best-effort，绝不影响 release 的返回值。
+```
+ctx.get('agents')          // 进程内的 agents 注册表
+  → agents.get(sessionId)  // 解析读者**自己的活 agent**
+  → agent.inject(createUserMessage({
+      content: [{ type: 'text', text }],
+      source: { kind: 'plugin', plugin: 'dsh-collab', form: 'notice', summary: boundContextSummary(…) }
+    }))
+```
+
+* **来源显式、不冒充用户**：消息由**真实的** `@deepseek-ai/dsh-llm` 的 `createUserMessage`
+  构造，`source` 显式写成 `plugin/notice`（`summary` 非空，经 `boundContextSummary` 截到
+  120 字符）。客户端的分流只看 `source.kind`，且发生在收件箱分类**之前**
+  （`dsh-client-ui-chat/lib/client.js:6058`）：`kind !== 'user'` ⇒ 渲染成**独立可折叠的 notice
+  行**，**无论投进哪个收件箱都不是气泡**。
+* **排除释放者自己**；同一 `(claimId, reader)` 只推一次（幂等键不变，仍**先记账再投递**，
+  成功/失败都不再重投）；全部 **best-effort**，绝不抛、绝不影响 release 的返回值。
+* **只推给此刻活着的会话**：投递前先过 `store.livenessOf(sessionId)` 这道安全闸门。
+  `not-live` 直接跳过（**刻意不唤醒冷会话**；注入面对未加载的会话在结构上也不可能投递 ——
+  注册表里根本没有它，解析即失败）。`liveness-check-failed`（存活判据**自己坏了**）与
+  `not-live` **严格区分**，绝不折叠成后者。
+* **同步契约 ⇒ 不再有 `timeout` 这一态**：`agent.inject(message): void` 是**同步**的
+  （`dsh-agent/lib/types/runtime-types.d.ts:209`；实现 `dsh-agent-loop/lib/index.js:795` 只是把
+  消息 splice 进收件箱并返回，`wakeup=false`），同步调用要么正常返回、要么当场抛，
+  不存在"永不 resolve"的窗口。旧实现给 `prompt` 通道套的 3s 超时护栏随旧通道一起删除。
+* **解析不到就如实跳过，没有任何回退**：`agents.get(sessionId)` 解析不到目标 agent（存活判据
+  与这次查询之间的 TOCTOU 竞态）⇒ `skipped.reason = 'agent-not-resolvable'`；`agents` 服务本身
+  缺失 ⇒ `inject-failed` + `error: 'no-agents-service'`；解析到的对象没有 `inject` 面（受限宿主）
+  ⇒ `inject-failed` + `'agent-has-no-inject'`。**绝不再掉头去找任何"能把消息投出去"的通道** ——
+  那正是旧实现冒充用户的来源。
+* `pushedVia[].channel` **只有一个取值**：`'inject'`。
+* `notifyReaders` 的第 4 个形参 `releaserAgent` **保留但不再使用**：0.8.4 曾拿它当子代理回退
+  通道的 sender；通道删除后它不参与任何判定，保留只为**不动 `src/tools.ts:51` 的调用点签名**。
+
+**为什么换掉旧通道**：0.8.4 的两条通道（`ctx.sessionController.prompt({requestId, sessionId,
+mode, content})` 与 `ctx.subagents.sendMessage(sender, targetId, content, {signal})`）都**只收
+`content`**，消息由宿主代造，宿主写死 `source: { kind: 'user', rpcId: 'dsh-collab-…' }`
+—— 实测转录里就是 `user/message` + `kind:'user'`，在 GUI 里渲染成**用户气泡**（落进 next-step
+收件箱还会升级成 steering 气泡，与真人输入共用同一个渲染器）。这违反 `AGENTS.md` §1
+「严禁冒充用户」，故整体删除。自己构造消息（来源显式非 user）再 `agent.inject` 就能既投出去
+又不冒充 —— 旧注释里"插件无法改变来源"的结论是错的。
 
 **推送结果可观测（0.8.3）**：`op=release` 的返回在原有 `ok` / `released` / `serverTime` **之外**
 追加一个 `notify` 字段，让"没有人需要通知"与"通知通道坏了"不再长得一样：
@@ -369,81 +508,59 @@ claim 增加可读性维度（`readable`，默认 `true`；缺字段的老状态
   "released": [ /* 原样，未改动 */ ],
   "serverTime": 1789293294682,
   "notify": {
-    "readers": 2,                       // 该次涉及的读者数：按 sessionId 去重、非 agent holder 不计入（与下面 pushed/skipped 的逐 (claim, reader) 口径不同）
+    "readers": 6,                       // 该次涉及的读者数：按 sessionId 去重、非 agent holder 不计入（与下面 pushed/skipped 的逐 (claim, reader) 口径不同）
     "pushed": ["ses_me"],               // 真正投递成功的 sessionId
-    "skipped": [
-      { "sessionId": "ses_idle", "reason": "not-live" },              // 刻意不唤醒
-      { "sessionId": "ses_x",    "reason": "already-pushed" },        // 同 (claimId, reader) 已推过
-      { "sessionId": "ses_y",    "reason": "prompt-failed", "error": "timeout" } // 真实错误，超时即 'timeout'
-    ]
-  }
-}
-```
-
-`reason` 在 0.8.3 只有 `not-live` / `already-pushed` / `prompt-failed` 三种取值；0.8.4 追加
-`not-adjacent` / `subagent-failed`（见下文），共 **5** 种。`error` 出现在后三种失败取值上，携带真实
-错误文本（`'timeout'`、`'no-session-controller'` 或 `prompt` 抛出的原始 message）；`not-live` /
-`already-pushed` 不带。凡是失败都仍是 best-effort：`release` 一定仍是 `ok:true`，绝不抛出。
-
-**子代理投递回退通道（0.8.4）**：读者如果是一个**由 subagent 路由托管的会话**，原生
-`prompt` 会被 DSH 结构化拒绝，错误与 DSH 自己给的指示（实测 + 源码 `dsh-api-session-controller/lib/index.js:137`）是：
-
-```jsonc
-// RemoteError：code = 'session/agent-busy'
-// message = 'session "ses_child" is owned by subagent routing'
-// details = { reason: 'use subagent delivery for this child session' }
-```
-
-这时插件改用 `ctx.get('subagents')` 的
-`sendMessage(sender: Agent, targetId: SessionId, content: ContentBlock[], { signal })`
-（Inspect 实查的服务契约）把同一条通知再投一次：
-
-* **sender 必须是释放者的那个活 Agent 对象本身**（工具处理器里的 `exec.agent`）。DSH 用
-  `ctx.agents.get(sender.id) !== sender` 做对象同一性判定（`dsh-subagent/lib/index.js:1735`），
-  所以插件只做类型收窄、**绝不重建**该对象；拿不到它（例如 `agent/disposed` 那条路径上
-  正在销毁的 agent）就**不回退**，如实记 `skipped`。
-* **邻接是硬约束**：`sendMessage` 只能投给 sender 的**直接父会话**或**直接可续子会话**。
-  跨父会话的子代理读者会被 DSH 拒绝（`SubagentError` code `UNAUTHORIZED` / `PARENT_UNAVAILABLE`
-  / `NOT_RESUMABLE`），插件把这次失败记成 `reason: 'not-adjacent'`（**如实记录，不静默**）。
-* `signal` 用自建 `AbortController`，并沿用与 `prompt` 通道同一套 3s 超时护栏。
-* **不 cold-resume 的保证**：`sendMessage` 的文档写明 "an absent direct child cold-resumes
-  from persistence"。插件因此把 `isLiveSession(sessionId)`（`ctx.agents.get(sessionId) !== undefined`）
-  这道闸门放在**两个通道之前**统一判定 —— 不活的读者一律 `reason: 'not-live'` 直接丢弃，
-  一次 `prompt`、一次 `sendMessage` 都不会发出去。回退**没有**放宽任何既有安全闸门。
-
-`notify` 相应地**只做追加**（既有字段名与既有 `reason` 取值一字未改）：
-
-```jsonc
-{
-  "ok": true,
-  "released": [ /* 原样，未改动 */ ],
-  "serverTime": 1789293294682,
-  "notify": {
-    "readers": 3,
-    "pushed": ["ses_parent", "ses_child"],        // 语义不变：投递成功的 sessionId（不分通道）
-    "pushedVia": [                                 // 0.8.4 追加：与 pushed 等长同序
-      { "sessionId": "ses_parent", "channel": "session-controller" },
-      { "sessionId": "ses_child",  "channel": "subagents" }
+    "pushedVia": [                      // 与 pushed 等长同序；0.9.6 起 channel 只有一个取值
+      { "sessionId": "ses_me", "channel": "inject" }
     ],
     "skipped": [
-      { "sessionId": "ses_idle",  "reason": "not-live" },                        // 既有
-      { "sessionId": "ses_x",     "reason": "already-pushed" },                  // 既有
-      { "sessionId": "ses_y",     "reason": "prompt-failed", "error": "timeout" },// 既有（非路由的 prompt 失败）
-      { "sessionId": "ses_sib",   "reason": "not-adjacent",  "error": "subagent \"ses_sib\" belongs to another parent session" }, // 0.8.4 追加
-      { "sessionId": "ses_z",     "reason": "subagent-failed", "error": "no-subagents-service" }                                 // 0.8.4 追加
+      { "sessionId": "ses_idle", "reason": "not-live" },                                   // 刻意不唤醒
+      { "sessionId": "ses_x",    "reason": "already-pushed" },                             // 同 (claimId, reader) 已推过
+      { "sessionId": "ses_y",    "reason": "liveness-check-failed", "error": "…" },        // 存活判据自己坏了
+      { "sessionId": "ses_z",    "reason": "agent-not-resolvable", "error": "agent-not-resolvable" }, // 判据说活着，投递时已解析不到
+      { "sessionId": "ses_w",    "reason": "inject-failed", "error": "no-agents-service" },// 通道不可用/投递抛错
+      { "sessionId": "ses_v",    "reason": "internal", "error": "…" }                      // 链路兜底（逐条补记）
     ]
   }
 }
 ```
 
-新增取值：`not-adjacent`（原生 prompt 被"路由托管"拒绝、回退又因邻接不成立被拒）与
-`subagent-failed`（回退通道本身失败/超时/不可用，`error` 为真实文案或
-`'timeout'` / `'no-subagents-service'` / `'no-live-sender-agent'`）。哪些失败**不**触发回退是刻意的：
-只有 `code === 'session/agent-busy'` **且** `details.reason === 'use subagent delivery for this
-child session'`（`details` 丢失时退化为比对 message 里 DSH 自己写死的 `owned by subagent routing` /
-`durable parent address`）才回退。同一个 code 在 DSH 里**不止一处**抛出 ——
-`dsh-api-session-controller/lib/index.js:785` 用 `session/agent-busy` + message `prompt rejected`
-表示普通投递失败，那种情况**不回退**；认不出的 `agent-busy` 一律不触发，宁可少一次回退。
+0.9.6 起 `reason` 共 **6** 种取值（与 `src/contract.ts:147-148` 的联合类型逐字一致）：
+
+| reason | 含义 | `error` |
+| --- | --- | --- |
+| `not-live` | 会话此刻未加载，**刻意不唤醒**（注入面对未加载的会话结构上不可能投递） | 无 |
+| `already-pushed` | 同一 `(claimId, reader)` 已推过 | 无 |
+| `liveness-check-failed` | 存活判据**本身坏了**（基础设施故障）—— 与 `not-live` 严格区分，绝不折叠 | 真实错误文本 |
+| `agent-not-resolvable` | 0.9.6 追加：判据说活着、投递时却已解析不到目标 agent（TOCTOU 竞态）—— **如实跳过，无回退** | `'agent-not-resolvable'` |
+| `inject-failed` | 0.9.6 追加：投递面本身不可用/失败 | `'no-agents-service'` / `'agent-has-no-inject'` / inject 抛出的真实文本 |
+| `internal` | 0.9.0 追加：推送链路的整体兜底，逐条补记尚未记账的候选，使 `pushed + skipped` 永远能对上候选条数 | 真实错误文本 |
+
+**已删除（0.9.6）**：`prompt-failed` / `not-adjacent` / `subagent-failed` —— 它们描述的
+`sessionController.prompt` 与 `subagents.sendMessage` 两条通道会让宿主把消息来源写成
+`kind:'user'`（GUI 里是用户气泡），已整体移除，**取值不再可产生**。凡是失败都仍是 best-effort：
+`release` 一定仍是 `ok:true`，绝不抛出。
+
+**claim 生命周期（0.9.6 语义）：租约 `expiresAt` 是声明生命周期的唯一权威。**
+
+`agent/disposed`（会话结束）**不再提前释放未到期的声明**，它只做两件事：
+
+1. 回收该 holder **已过期**的声明（若确实回收到了，走同一条 `notifyReaders` 通知其读者）；
+2. 把已消失的 holder 从**各 claim 的 `readers`** 里摘掉（否则会向一个已经死掉的会话推送）。
+
+**未到期的声明原样保留**（含它自己的 `readers`），到期由 `sweep()` 回收。
+
+> **为什么**：会话 dispose 之后常常会被恢复，并继续按对话历史认为自己持有锁；如果声明在
+> dispose 时就消失，另一个会话会看到"路径空闲"，于是两边同时以为可以写。
+
+**安全侧后果（如实写）**：会话死亡后，它**未到期**的声明会一直占用到租约到期，期间他人只能
+`op=wait` 等待或用 `collab_board` 协商；`op=heartbeat` 是**唯一**的续租方式。
+
+> **历史（0.8.4 的 `subagents.sendMessage` 回退通道，0.9.6 已整体删除）**：它要求 sender 是
+> 释放者的活 Agent（工具处理器里的 `exec.agent`，DSH 用对象同一性判定）、且只能投给 sender 的
+> **直接父会话 / 直接可续子会话**（邻接硬约束，跨父会话记 `not-adjacent`），并复用 prompt 通道
+> 同一套 3s 超时护栏（超时/不可用记 `subagent-failed`）。这些约束与 reason 随通道一起消失 ——
+> 现在的 `inject` 面**既不需要 sender、也不要求邻接**，只要求读者自己的 agent 在本进程内可解析。
 
 > **已知限制**：claim **自然过期（TTL 到期）不推送** —— 没有对应的事件源，过期只在下一次
 > 读/写时被 `sweep()` 惰性清理。需要对方知晓时请显式 `op=release`。
@@ -459,13 +576,14 @@ npm test                # 依次运行下列全部测试
 node tests/collab-pure-logic.mjs       # 纯逻辑 + hostCode 漂移守护
 node tests/collab-integration.mjs      # Cordis 插件端到端（fake ctx）
 node tests/collab-hostcode-parity.mjs  # 动态宿主形态**行为**对拍
-node tests/collab-inline-parity.mjs    # 两形态**同名函数**逐输出对拍（18 个 + 集合回归守护）
+node tests/collab-inline-parity.mjs    # 两形态**同名函数**逐输出对拍（20 个 + 集合回归守护）
 node tests/collab-contract-derivation.mjs # 契约派生守卫（schema ⇄ d.ts ⇄ Python ⇄ Rust ⇄ 真实工具 schema）
 node tests/collab-message-provenance.mjs # 规范守卫：严禁冒充用户（AGENTS.md §1）
 node tests/collab-digest-stability.mjs # 态势摘要文本时间稳定性
 node tests/collab-awareness.mjs        # 多会话态势注入
 node tests/collab-access-gate.mjs      # 访问通知（agent.inject 的 notice 载体）+ 原生写保护（真实 cordis waterfall）
-node tests/collab-readers-push.mjs     # readers 反向注册 + 释放推送 + 子代理回退通道 + 通知载体
+node tests/collab-readers-push.mjs     # readers 反向注册 + 释放推送（唯一通道 agent.inject / form:'notice'）+ 通知载体
+node tests/collab-reap.mjs             # op=reap 僵尸声明显式回收（dry-run / confirm / age 门槛 / 无自动触发路径）
 node tests/collab-e2e.mjs              # 真实 fs 路径/语义端到端（临时 DSH_HOME）
 node tests/collab-skill.mjs            # 随包 skill + 委托纪律 + 偏好设置
 node tests/collab-client-route.mjs     # Host 端技能索引路由（GET /dsh-collab/skill-index）
@@ -488,6 +606,7 @@ cargo test --manifest-path crates/collab-cli/Cargo.toml
 | 行为 | 阈值 | 说明 |
 | --- | --- | --- |
 | 过期声明回收 | 租约到期 | 过期声明随每次读取失效，不再阻塞他人 |
+| **僵尸声明显式回收** | **仅 `op=reap` + `confirm:true`** | **绝不自动**：dry-run 默认、判据见 0.9.8 一节；被强杀的会话留下的未到期声明由调用方显式确认后回收 |
 | 留言保留 | 最近 `MAX_MESSAGES = 2000` 条 | 超出部分从最旧的开始丢弃，写入时回报 `swept.droppedMessages`（`swept` 是**条件字段**：仅当本次 `droppedMessages > 0` 或 `prunedHolders > 0` 时才出现在返回里，且不含 readers 相关字段） |
 | 陈旧 holder 回收 | 无活跃声明且 `HOLDER_TTL_MS = 24h` 未出现 | 回收由 `sweep()` 执行；`list` 另用 `holderView()` 给出 `ageSec` / `active` / `stale` 与 `staleHolders` |
 | holder 废弃预警 | 无活跃声明且静默 `HOLDER_STALE_WARN_MS = 1h` | `stale` 走这条更短的阈值，因此它是"看起来已废弃"的先行信号，在 `list` 上始终可达 |

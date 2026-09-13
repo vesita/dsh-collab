@@ -252,7 +252,7 @@ console.log('# degraded path when settings.prepareDocument() is unavailable')
 // 不同的快照文本 —— 而 DSH 正是按文本逐字节比较来做快照去重的。
 console.log('# awareness digest: hostCode inline vs collab-core (byte-for-byte)')
 {
-  const { renderDigest, clockUtc } = await import(new URL('../lib/collab-core.js', import.meta.url))
+  const { renderDigest, clockUtc, modeLabel } = await import(new URL('../lib/collab-core.js', import.meta.url))
 
   // 从 hostCode 源码里抽出真实函数体（不是复制品），注入它依赖的同源函数后执行。
   const extract = (fnName, scope = {}) => {
@@ -263,8 +263,16 @@ console.log('# awareness digest: hostCode inline vs collab-core (byte-for-byte)'
     if (arrow) return new Function(...names, 'return function ' + fnName + '(' + arrow[1] + ') {' + arrow[2] + '}')(...vals)
     throw new Error('cannot extract ' + fnName + ' from hostCode')
   }
+  // 宿主内联的 MODE_LABELS 从真实源码抽出来，不手抄副本。
+  const labelsDecl = /const MODE_LABELS = \{([^}]*)\}/.exec(hostCode)
+  ok(!!labelsDecl, 'hostCode contains inline MODE_LABELS', String(labelsDecl))
+  const hostModeLabels = labelsDecl ? new Function('return {' + labelsDecl[1] + '}')() : {}
+  const hostModeLabel = extract('modeLabel', { MODE_LABELS: hostModeLabels })
   const hostClockUtc = extract('clockUtc')
-  const hostRenderDigest = extract('renderDigest', { clockUtc: hostClockUtc })
+  const hostRenderDigest = extract('renderDigest', { clockUtc: hostClockUtc, modeLabel: hostModeLabel })
+  ok(['exclusive', 'shared', 'read'].every((m) => hostModeLabel(m) === modeLabel(m)),
+    'hostCode modeLabel === collab-core modeLabel for all three modes',
+    JSON.stringify(['exclusive', 'shared', 'read'].map((m) => [hostModeLabel(m), modeLabel(m)])))
 
   // 固定绝对时刻，测试不依赖真实时钟；时钟秒数刻意非 0，证明输出被截到分钟。
   const T0 = Date.UTC(2026, 0, 2, 3, 4, 37)
@@ -301,7 +309,7 @@ console.log('# awareness digest: hostCode inline vs collab-core (byte-for-byte)'
   ok(renderDigest([c3, c1, c2]) === renderDigest([c1, c2, c3]), 'collab-core digest is order-independent')
   // 具体文案断言：确认两侧比较的是**真实输出**，而不是两个空串/同一退化物
   const sample = renderDigest([c1, c2])
-  ok(sample.includes('One（exclusive）占用 src/one/，租约 30 分（01-02 03:04Z–01-02 03:34Z）'),
+  ok(sample.includes('One（独占）占用 src/one/，租约 30 分（01-02 03:04Z–01-02 03:34Z）'),
     'core digest renders the documented absolute-window format', sample)
   ok(hostRenderDigest([c1, c2]) === sample, 'hostCode digest equals that exact literal too', hostRenderDigest([c1, c2]))
 }
@@ -423,12 +431,12 @@ console.log('# registered awareness provider emits exactly collab-core renderDig
     const r0 = await lockLocal.execute({ op: 'list' }, A)
     map.set(r0.data.statePath, 'not-json{{{')
     const { w } = await warnOf(lockLocal, A)
-    ok(w.includes('corrupted'), 'hostCode: corrupt state is still surfaced', JSON.stringify(w))
-    ok(!/;\s*backup:\s/.test(w), 'hostCode: a failed backup must NOT be reported as "backup: <path>"', JSON.stringify(w))
-    ok(!/reinitialized/.test(w), 'hostCode: a failed reset must NOT be reported as "reinitialized"', JSON.stringify(w))
-    ok(/backup failed: disk on fire/.test(w), 'hostCode: warning states the backup failure and its cause', JSON.stringify(w))
-    ok(/reinitialize failed: disk on fire/.test(w), 'hostCode: warning states the reset failure and its cause', JSON.stringify(w))
-    ok(/original corrupt content left on disk/.test(w), 'hostCode: warning tells where the corrupt content now lives', JSON.stringify(w))
+    ok(w.includes('状态文件损坏'), 'hostCode: corrupt state is still surfaced', JSON.stringify(w))
+    ok(!/；\s*备份：/.test(w), 'hostCode: a failed backup must NOT be reported as "backup: <path>"', JSON.stringify(w))
+    ok(!w.includes('已重新初始化'), 'hostCode: a failed reset must NOT be reported as "reinitialized"', JSON.stringify(w))
+    ok(/备份失败：disk on fire/.test(w), 'hostCode: warning states the backup failure and its cause', JSON.stringify(w))
+    ok(/重新初始化失败：disk on fire/.test(w), 'hostCode: warning states the reset failure and its cause', JSON.stringify(w))
+    ok(/原始损坏内容仍留在磁盘上/.test(w), 'hostCode: warning tells where the corrupt content now lives', JSON.stringify(w))
     ok(map.get(r0.data.statePath) === 'not-json{{{', 'hostCode: original corrupt bytes are left on disk')
   }
   // (b) 只有重置失败：备份路径如实给出，同时不得宣称"已重新初始化"
@@ -441,8 +449,8 @@ console.log('# registered awareness provider emits exactly collab-core renderDig
     const { w } = await warnOf(lockLocal, A)
     const backupKeys = [...map.keys()].filter((k) => k.includes('.corrupt-'))
     ok(backupKeys.length === 1 && map.get(backupKeys[0]) === 'not-json{{{', 'hostCode: the backup really holds the corrupt bytes', JSON.stringify(backupKeys))
-    ok(w.includes('backup: ' + backupKeys[0]), 'hostCode: a successful backup still reports its real path', JSON.stringify(w))
-    ok(!/reinitialized/.test(w) && /reinitialize failed: reset exploded/.test(w), 'hostCode: the failed reset is reported honestly', JSON.stringify(w))
+    ok(w.includes('备份：' + backupKeys[0]), 'hostCode: a successful backup still reports its real path', JSON.stringify(w))
+    ok(!w.includes('已重新初始化') && /重新初始化失败：reset exploded/.test(w), 'hostCode: the failed reset is reported honestly', JSON.stringify(w))
   }
   // (c) 回归：全成功时文案与此前逐字一致（只允许失败时改文案）
   {
@@ -452,8 +460,8 @@ console.log('# registered awareness provider emits exactly collab-core renderDig
     const key = r0.data.statePath
     map.set(key, 'not-json{{{')
     const { w } = await warnOf(lockLocal, A)
-    ok(/^state corrupted; reinitialized; backup: /.test(w), 'hostCode: the all-success wording is byte-compatible with before', JSON.stringify(w))
-    ok(!/failed/.test(w), 'hostCode: no failure wording on the success path', JSON.stringify(w))
+    ok(/^状态文件损坏；已重新初始化；备份：/.test(w), 'hostCode: 全成功时的 warning 措辞（中文）', JSON.stringify(w))
+    ok(!w.includes('失败'), 'hostCode: no failure wording on the success path', JSON.stringify(w))
   }
   // (d) 旧状态文件迁移写入失败必须留痕
   {
@@ -471,9 +479,140 @@ console.log('# registered awareness provider emits exactly collab-core renderDig
     }
     const lockLocal = await boot(fsImpl, cwd)
     const { w } = await warnOf(lockLocal, A)
-    ok(/legacy migrate failed: migrate write exploded/.test(w), 'hostCode: a failed legacy migration is surfaced as "legacy migrate failed: <cause>"', JSON.stringify(w))
+    ok(/旧落点迁移失败：migrate write exploded/.test(w), 'hostCode: a failed legacy migration is surfaced as 「旧落点迁移失败：<cause>」', JSON.stringify(w))
     ok(map.get(legacyPath) === legacyDoc, 'hostCode: a failed migration leaves the legacy file untouched')
   }
+}
+
+// ---------- 6. agent/disposed 的真实接线：宿主形态也不因 dispose 释放未过期声明（W7） ----------
+// inline-parity 逐输出对拍的是**从 hostCode 抽出来的函数体**，它证明不了 disposed 钩子真的把
+// 「当前的 now()」传了进去（若传成 Infinity / 未来时刻，就会退回"dispose 释放一切"的锁安全缺陷）。
+// 这里捕获**真实注册**的 agent/disposed 处理器并触发它，断言状态文件里的未过期声明纹丝不动，
+// 而该 holder 的 reader 登记仍被摘掉。
+console.log('# agent/disposed wiring: an unexpired claim survives dispose (W7)')
+{
+  const map = new Map()
+  const toolsLocal = []
+  const handlers = new Map()
+  const fsLocal = {
+    resolve: (p, o) => makeTarget(path.isAbsolute(p) ? p : path.resolve(o && o.cwd ? o.cwd : process.cwd(), p)),
+    stat: async (t) => (map.has(t.path) ? { version: 1 } : undefined),
+    readText: async (t) => map.get(t.path) || '',
+    writeText: async (t, c) => { map.set(t.path, c); return { operation: 'create', version: 1 } },
+    processPath: (t) => t.path,
+    listDir: async () => []
+  }
+  const ctxLocal = {
+    fs: fsLocal,
+    timer: { timeout: (ms) => new Promise((r) => setTimeout(r, ms)), interval: () => () => {} },
+    effect: (fn) => { const d = fn(); return typeof d === 'function' ? d : () => {} },
+    on: (ev, fn) => { handlers.set(ev, fn); return () => {} },
+    get: (name) => {
+      if (name === 'settings') return { prepareDocument: async () => SETTINGS_DOC }
+      if (name === 'sessions') return { get: () => ({ header: { cwd: '/fake/host/dispose' } }) }
+      if (name === 'sessionTitle') return { get: () => ({ title: 'Dispose Worker' }) }
+      return undefined
+    }
+  }
+  const pluginLocal = new Function('harness', 'ctx', hostCode)(
+    { defineTool: (d) => d, registerTool: (_c, t) => { toolsLocal.push(t); return () => {} }, handle: () => () => {} }, ctxLocal)
+  await pluginLocal.apply(ctxLocal)
+  const lockLocal = toolsLocal.find((t) => t.name === 'collab_lock')
+  const disposed = handlers.get('agent/disposed')
+  ok(typeof disposed === 'function', 'hostCode registers an agent/disposed handler', typeof disposed)
+
+  const DEAD = { agent: { id: 'agent-dead-host' } }
+  const r = await lockLocal.execute({ op: 'claim', paths: ['src/host-dispose/'], ttlSec: 600 }, DEAD)
+  ok(r.ok === true, 'setup: the doomed holder owns an unexpired claim', JSON.stringify(r && r.data && r.data.claim))
+  const sp = (await lockLocal.execute({ op: 'list' }, DEAD)).data.statePath
+  // 另一个 holder 的声明把这个 holder 登记成 reader：dispose 只该把它从 readers 里摘掉。
+  const doc = JSON.parse(map.get(sp))
+  doc.claims.push({
+    claimId: 'c_other_readers', holderId: 'agent:other', holderName: 'Other', paths: ['src/other/'],
+    mode: 'exclusive', ttlSec: 600, expiresAt: Date.now() + 600000, note: '', createdAt: Date.now(),
+    readable: true, readers: ['agent:agent-dead-host', 'agent:keep']
+  })
+  map.set(sp, JSON.stringify(doc))
+
+  disposed({ agent: { id: 'agent-dead-host' } })
+  let after = JSON.parse(map.get(sp))
+  for (let i = 0; i < 60; i++) {
+    await new Promise((res) => setTimeout(res, 20))
+    after = JSON.parse(map.get(sp))
+    const o = (after.claims || []).find((c) => c.claimId === 'c_other_readers')
+    if (o && Array.isArray(o.readers) && !o.readers.includes('agent:agent-dead-host')) break
+  }
+  const claims = after.claims || []
+  const own = claims.filter((c) => c.holderId === 'agent:agent-dead-host')
+  ok(own.length === 1, '未过期声明在 agent/disposed 之后仍然存在（dispose 不是释放信号）', JSON.stringify(claims.map((c) => c.claimId)))
+  ok(own.length === 1 && own[0].expiresAt > Date.now(), '保留下来的正是那条未到期声明（租约没有被缩短）', JSON.stringify(own.map((c) => c.expiresAt)))
+  const other = claims.find((c) => c.claimId === 'c_other_readers')
+  ok(!!other && !other.readers.includes('agent:agent-dead-host'), 'dispose 仍把这个 holder 从其他 claim 的 readers 摘掉', JSON.stringify(other && other.readers))
+  ok(!!other && other.readers.includes('agent:keep'), '其他读者不受影响', JSON.stringify(other && other.readers))
+}
+
+// ---------- N. op=reap（0.9.8，宿主内联形态的行为对拍）----------
+// 包形态的完整覆盖在 tests/collab-reap.mjs；这里只钉宿主内联副本的**行为**：
+// 默认 dry-run 不改状态、confirm:true 只删活体名单外的、活着的 holder 一条不动。
+console.log('# op=reap (host inline form): dry-run default / confirm removes only non-live holders')
+{
+  const map = new Map()
+  const toolsLocal = []
+  const LIVE = ['agent-lived', 'agent-reaper']
+  const injects = []
+  const ctxLocal = {
+    fs: {
+      resolve: (p, o) => makeTarget(path.isAbsolute(p) ? p : path.resolve(o && o.cwd ? o.cwd : process.cwd(), p)),
+      stat: async (t) => (map.has(t.path) ? { version: 1 } : undefined),
+      readText: async (t) => map.get(t.path) || '',
+      writeText: async (t, c) => { map.set(t.path, c); return { operation: 'create', version: 1 } },
+      processPath: (t) => t.path,
+      listDir: async () => []
+    },
+    timer: { timeout: (ms) => new Promise((r) => setTimeout(r, ms)), interval: () => () => {} },
+    effect: (fn) => { const d = fn(); return typeof d === 'function' ? d : () => {} },
+    on: () => () => {},
+    get: (name) => {
+      if (name === 'settings') return { prepareDocument: async () => SETTINGS_DOC }
+      if (name === 'sessions') return { get: () => ({ header: { cwd: '/fake/host/reap' } }) }
+      if (name === 'sessionTitle') return { get: (s) => ({ title: s && s.id === 'agent-reaper' ? 'Reaper' : 'Host Worker' }) }
+      if (name === 'agents') return {
+        currentInitiator: () => undefined,
+        list: () => LIVE.map((id) => ({ id })),
+        get: (id) => (LIVE.includes(id) ? { id, inject: (m) => injects.push({ id, m }) } : undefined)
+      }
+      return undefined
+    }
+  }
+  const pluginLocal = new Function('harness', 'ctx', hostCode)(
+    { defineTool: (d) => d, registerTool: (_c, t) => { toolsLocal.push(t); return () => {} }, handle: () => () => {} }, ctxLocal)
+  await pluginLocal.apply(ctxLocal)
+  const lockLocal = toolsLocal.find((t) => t.name === 'collab_lock')
+  const REAPER = { agent: { id: 'agent-reaper' } }
+  const DEAD = { agent: { id: 'agent-dead' } }
+  const LIVED = { agent: { id: 'agent-lived' } }
+  await lockLocal.execute({ op: 'claim', paths: ['src/dead/'], ttlSec: 600 }, DEAD)
+  await lockLocal.execute({ op: 'claim', paths: ['src/lived/'], ttlSec: 600 }, LIVED)
+  await lockLocal.execute({ op: 'claim', paths: ['src/reaper/'], ttlSec: 600 }, REAPER)
+  const sp = (await lockLocal.execute({ op: 'list' }, REAPER)).data.statePath
+  // 把三条声明都"变老"（1000 秒前创建），但仍未到期 —— 只有不在 LIVE 里的那条该被回收。
+  const doc = JSON.parse(map.get(sp))
+  for (const c of doc.claims) { c.createdAt = Date.now() - 1000 * 1000 }
+  map.set(sp, JSON.stringify(doc))
+  const before = map.get(sp)
+
+  const dry = await lockLocal.execute({ op: 'reap' }, REAPER)
+  ok(dry.ok === true && dry.data.dryRun === true, '宿主 reap 默认 dry-run', JSON.stringify(dry && dry.data && dry.data.dryRun))
+  const cand = (dry.data && dry.data.candidates) || []
+  ok(cand.length === 1 && cand[0].holderId === 'agent:agent-dead', '宿主 dry-run 只列不在 agents.list() 里的那条', JSON.stringify(cand.map((c) => c.holderId)))
+  ok(map.get(sp) === before, '宿主 dry-run 后状态零变化（逐字节）')
+
+  const conf = await lockLocal.execute({ op: 'reap', confirm: true }, REAPER)
+  ok(conf.ok === true && conf.data.dryRun === false && conf.data.reaped.length === 1 && conf.data.reaped[0].holderId === 'agent:agent-dead',
+    '宿主 confirm:true 只回收那条僵尸声明', JSON.stringify(conf && conf.data && conf.data.reaped && conf.data.reaped.map((c) => c.holderId)))
+  const ids = (JSON.parse(map.get(sp)).claims || []).map((c) => c.holderId).sort()
+  ok(JSON.stringify(ids) === JSON.stringify(['agent:agent-lived', 'agent:agent-reaper']),
+    '宿主 confirm:true 后活着的与自己的一条都没动', JSON.stringify(ids))
 }
 
 h.finish()

@@ -44,9 +44,14 @@ export interface SessionTitleService { get(session: SessionLike): { title?: stri
 /**
  * ctx.agents 中功能 D 用到的活体查询面（实测：`get(id: SessionId): Agent | undefined`）。
  * "活着的会话"是本功能唯一允许被推送的目标 —— 推送会 resume 冷会话，绝不允许。
+ *
+ * `list()`（0.9.8 op=reap 的活体检查）：返回**此刻加载着的** agent。它同样不含休眠会话，
+ * 所以它只用来"排除确信活着的人"，**不许**反过来当成"不在名单里 = 已死"的死亡证明
+ * （见 src/collab-core.ts 的 reap 注释）。服务没提供 list 时按"检查不可用"处理：一个也不回收。
  */
 export interface AgentsLookupService {
   get(id: string): AgentLike | undefined
+  list?(): AgentLike[]
 }
 
 /**
@@ -94,23 +99,25 @@ export interface SubagentsService {
 }
 
 /**
- * 单条推送的返回：成功，或带一行可读原因失败（超时用 'timeout'）。
- * 0.8.4 追加两个**可选**标记（`ok` / `error` 的语义与取值一字未动），
- * 让调用方不必解析 error 文本就知道该不该走子代理回退：
- *   - subagentRouting：失败是 `session/agent-busy` 的"子代理路由托管"拒绝 → 该走回退；
- *   - notAdjacent：回退通道因**邻接**前提不成立被拒（读者不是释放者的直接父/子会话）。
+ * 单条推送的返回：成功，或带一行可读原因失败。
+ * 0.9.6：`inject` 的契约是**同步**的（`inject(message): void`），不存在"永不 resolve"的窗口，
+ * 所以不再有 'timeout' 这一态；`ok` / `error` 的语义与取值一字未动。
+ * 失败分支的可选标记让调用方不必解析 error 文本就知道失败类别：
+ *   - notResolvable：存活判据说"活着"，但此刻 `agents.get(sessionId)` 已解析不到目标 agent
+ *     （TOCTOU 竞态）——**如实跳过**，不回退到任何别的通道（旧实现的 subagentRouting /
+ *     notAdjacent 两个标记随通道一起删除：那两条通道会让宿主把来源写成 kind:'user'，即冒充用户）。
  */
 export type PushOutcome =
   | { ok: true }
-  | { ok: false; error: string; subagentRouting?: true; notAdjacent?: true }
+  | { ok: false; error: string; notResolvable?: true }
 
-/** 0.8.4：投递通道名（`notify.pushedVia[].channel`）。 */
-export type PushChannel = 'session-controller' | 'subagents'
+/** 0.9.6：投递通道名（`notify.pushedVia[].channel`）。**只剩一个诚实通道**：`agent.inject`。 */
+export type PushChannel = 'inject'
 
 /**
  * 一次 release 的推送结果汇总（0.8.3 起挂在 release 结果的 `data.notify` 上）。
- * 目的：让释放者能区分"没有人需要通知"与"通知通道坏了" —— 0.8.2 把两者都变成了静默。
- * 0.8.4 只**追加**字段与取值（既有字段名、既有 reason 的语义都没改）。
+ * 目的：让释放者能区分"没有人需要通知"与"通知通道坏了"。
+ * 0.9.6：投递面换成 `agent.inject`（显式来源的 notice），随旧通道删除的取值见下。
  */
 export interface NotifyOutcome {
   /** 该次涉及的去重读者数（= pushed + skipped 的候选读者；无会话的非 agent holder 不计入）。 */
@@ -118,29 +125,33 @@ export interface NotifyOutcome {
   /** 真正投递成功的 sessionId（一次投递一条；同一读者挂在多条被释放的 claim 上时会出现多次）。语义与 0.8.3 相同，不分通道。 */
   pushed: string[]
   /**
-   * 0.8.4 追加：每次成功投递所走的通道，与 `pushed` **等长且同序**。
-   * 'session-controller' = 原生 `prompt`；'subagents' = 子代理路由回退通道（`subagents.sendMessage`）。
-   * 始终存在（无成功投递时为空数组）。
+   * 每次成功投递所走的通道，与 `pushed` **等长且同序**。
+   * 0.9.6 起**只有一个**取值：'inject' = 进程内解析到读者自己的 agent 后 `agent.inject` 一条
+   * 显式来源（`kind:'plugin'`, `form:'notice'`）的消息。始终存在（无成功投递时为空数组）。
    */
   pushedVia: Array<{ sessionId: string; channel: PushChannel }>
-  /** 未能投递的候选读者。既有取值 not-live / already-pushed / prompt-failed 的语义不变，只追加取值。 */
+  /** 未能投递的候选读者。既有取值 not-live / already-pushed 的语义不变。 */
   skipped: Array<{
     sessionId: string
     /**
-     * not-live        = 会话此刻未加载（刻意不唤醒，两个通道都不会碰它）；
-     * already-pushed  = 同 (claimId, reader) 已推过；
-     * prompt-failed   = 原生 prompt 失败/超时/通道缺失，**且不是**子代理路由拒绝（0.8.3 语义不变）；
-     * not-adjacent    = 0.8.4 追加：原生 prompt 被"子代理路由托管"拒绝、而回退通道又因**邻接**不成立被拒
-     *                   （该读者不是释放者的直接父会话或直接可续子会话）；
-     * subagent-failed = 0.8.4 追加：回退通道本身失败/超时/不可用（拿不到活 Agent、`subagents` 服务缺失等）。
-     * liveness-check-failed = 0.9.0 追加：**存活判据本身坏了**（agents.get 抛异常）—— 基础设施故障，
-     *                   与"会话没在线"（not-live）是两件事，绝不能折叠成后者；带真实错误文本。
-     * internal        = 0.9.0 追加：推送链路的整体兜底（当前候选读者处理途中抛出未预期的异常）。
-     *                   逐条补记尚未记账的候选，使 pushed + skipped 永远能对上候选条数。
+     * not-live               = 会话此刻未加载（刻意不唤醒；注入面对未加载的会话结构上不可能投递）；
+     * already-pushed         = 同 (claimId, reader) 已推过；
+     * liveness-check-failed  = 存活判据**本身坏了**（agents.get 抛异常）—— 基础设施故障，
+     *                          与"会话没在线"（not-live）是两件事，绝不能折叠成后者；带真实错误文本。
+     * agent-not-resolvable   = 0.9.6 追加：判据说活着、投递时却已解析不到目标 agent（TOCTOU 竞态）
+     *                          —— **如实跳过**，不回退到任何会冒充用户的通道（旧通道已删除）。
+     * inject-failed          = 0.9.6 追加：投递面本身不可用/失败（`agents` 服务缺失 ->
+     *                          error 'no-agents-service'；解析到的对象没有 inject 面 ->
+     *                          'agent-has-no-inject'；inject 抛出 -> 真实错误文本）。
+     * internal               = 0.9.0 追加：推送链路的整体兜底（当前候选读者处理途中抛出未预期的异常）。
+     *                          逐条补记尚未记账的候选，使 pushed + skipped 永远能对上候选条数。
+     * 已删除（0.9.6）：prompt-failed / not-adjacent / subagent-failed —— 它们描述的
+     * `sessionController.prompt` 与 `subagents.sendMessage` 两条通道会让宿主把消息来源写成
+     * `kind:'user'`（GUI 里是用户气泡），已整体移除，取值不再可产生。
      */
-    reason: 'not-live' | 'already-pushed' | 'prompt-failed' | 'not-adjacent' | 'subagent-failed'
-      | 'liveness-check-failed' | 'internal'
-    /** 出现于失败取值：真实错误文本，或 'timeout' / 'no-session-controller' / 'no-subagents-service' / 'no-live-sender-agent'。 */
+    reason: 'not-live' | 'already-pushed' | 'liveness-check-failed'
+      | 'agent-not-resolvable' | 'inject-failed' | 'internal'
+    /** 出现于失败取值：真实错误文本，或 'no-agents-service' / 'agent-has-no-inject' / 'agent-not-resolvable'。 */
     error?: string
   }>
 }
@@ -254,6 +265,10 @@ export interface CollabArgs {
   readable?: boolean
   ttlSec?: number
   timeoutMs?: number
+  /** op=reap：默认 false = dry-run；显式 true 才真正删除僵尸声明。 */
+  confirm?: boolean
+  /** op=reap：age 门槛（秒），默认 600（REAP_DEFAULT_OLDER_THAN_SEC）。 */
+  olderThanSec?: number
   note?: string
   channel?: string
   body?: string
