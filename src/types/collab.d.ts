@@ -37,7 +37,7 @@ export interface Message {
   author: string;
   ts: number;
   body: string;
-  mentions: string[];
+  mentions?: string[];
   replyTo?: string;
 }
 
@@ -46,8 +46,7 @@ export interface Holder {
   name: string;
   kind: 'agent' | 'human';
   sessionId?: string;
-  preset?: string;
-  lastSeenAt: number;
+  lastSeenAt?: number;
 }
 
 export interface StateDocument {

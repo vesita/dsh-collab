@@ -11,6 +11,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub enum Mode {
     Exclusive,
     Shared,
+    /// 只读观测（schema `$defs.Mode` 的第三个成员）：不排他，也不被他人排他。
+    /// **必须能反序列化** —— TS 侧会写入 mode:"read" 的声明，缺这个变体会让整个状态文件解析失败。
+    Read,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -74,11 +77,8 @@ pub struct Holder {
 pub struct StateDocument {
     pub schema_version: i32,
     pub seq: i64,
-    #[serde(default)]
     pub claims: Vec<Claim>,
-    #[serde(default)]
     pub messages: Vec<Message>,
-    #[serde(default)]
     pub holders: Vec<Holder>,
 }
 
@@ -92,6 +92,37 @@ impl Default for StateDocument {
             holders: vec![],
         }
     }
+}
+
+/// schema `$defs.ConflictInfo.properties.suggestedAction` 的枚举派生。
+/// snake_case 序列化：wait / negotiate / switch_path。
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum SuggestedAction {
+    Wait,
+    Negotiate,
+    SwitchPath,
+}
+
+/// schema `$defs.ConflictInfo` 的 Rust 派生（TS 侧同名类型见 src/types/collab.d.ts 的 ConflictInfo）。
+/// 由 `claim` 的冲突分支真实构造，因此不是"仅供对照"的死类型。
+/// 与 TS 侧 `conflictError()` 同源：required = claimId/holderId/path/overlapsWith/mode/expiresAt，
+/// 其余为可选。
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ConflictInfo {
+    pub claim_id: String,
+    pub holder_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub holder_name: Option<String>,
+    pub path: String,
+    pub overlaps_with: String,
+    pub mode: Mode,
+    pub expires_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remaining_sec: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suggested_action: Option<SuggestedAction>,
 }
 
 pub fn now_ms() -> i64 {
@@ -341,20 +372,43 @@ fn main() -> Result<()> {
                 Mode::Exclusive
             };
 
-            // 冲突检测
-            let mut conflicts = Vec::new();
-            for c in &state.claims {
-                if c.holder_id == holder || c.expires_at <= now || c.mode == Mode::Shared {
-                    continue;
-                }
-                for p in &norm_paths {
-                    for cp in &c.paths {
-                        if overlaps(p, cp) {
-                            let rem = ((c.expires_at - now) / 1000).max(0);
-                            conflicts.push(format!(
-                                "Path '{}' overlaps with '{}' held by {} (expires in {}s)",
-                                p, cp, c.holder_id, rem
-                            ));
+            // 冲突检测。与 src/collab-core.ts 的 claim() 同源：
+            //   - read 是纯观测：他人 mode=read 的声明不排他（跳过），自己 mode=read 时整段跳过（不被挡）；
+            //   - shared 同样跳过（会被独占挡，但不挡别人）。
+            let mut conflicts: Vec<ConflictInfo> = Vec::new();
+            if mode != Mode::Read {
+                for c in &state.claims {
+                    if c.holder_id == holder
+                        || c.expires_at <= now
+                        || c.mode == Mode::Shared
+                        || c.mode == Mode::Read
+                    {
+                        continue;
+                    }
+                    for p in &norm_paths {
+                        for cp in &c.paths {
+                            if overlaps(p, cp) {
+                                let remaining_sec = ((c.expires_at - now) / 1000).max(0);
+                                conflicts.push(ConflictInfo {
+                                    claim_id: c.claim_id.clone(),
+                                    holder_id: c.holder_id.clone(),
+                                    holder_name: Some(
+                                        c.holder_name.clone().unwrap_or_else(|| c.holder_id.clone()),
+                                    ),
+                                    path: p.clone(),
+                                    overlaps_with: cp.clone(),
+                                    mode: c.mode.clone(),
+                                    expires_at: c.expires_at,
+                                    remaining_sec: Some(remaining_sec),
+                                    // 与 TS conflictError() 同阈值：<=30s 建议等待，否则协商。
+                                    suggested_action: Some(if remaining_sec <= 30 {
+                                        SuggestedAction::Wait
+                                    } else {
+                                        SuggestedAction::Negotiate
+                                    }),
+                                });
+                                break;
+                            }
                         }
                     }
                 }
@@ -370,8 +424,14 @@ fn main() -> Result<()> {
                     println!("{}", serde_json::to_string_pretty(&err)?);
                 } else {
                     eprintln!("❌ Claim Conflict detected!");
-                    for cf in conflicts {
-                        eprintln!("  - {}", cf);
+                    for cf in &conflicts {
+                        eprintln!(
+                            "  - Path '{}' overlaps with '{}' held by {} (expires in {}s)",
+                            cf.path,
+                            cf.overlaps_with,
+                            cf.holder_id,
+                            cf.remaining_sec.unwrap_or(0)
+                        );
                     }
                     eprintln!("💡 Suggestion: wait for lease expiration or negotiate via collab_board");
                 }
@@ -483,7 +543,7 @@ fn main() -> Result<()> {
             for file in &modified_files {
                 let norm = norm_path(file).unwrap_or_else(|| file.clone());
                 for c in &state.claims {
-                    if c.expires_at <= now || c.mode == Mode::Shared {
+                    if c.expires_at <= now || c.mode == Mode::Shared || c.mode == Mode::Read {
                         continue;
                     }
                     for cp in &c.paths {
@@ -586,6 +646,56 @@ mod tests {
     fn test_hash_project_key() {
         let h1 = hash_project_key("/home/vesita/coding/my/dsh-collab");
         assert_eq!(h1, "83f418894e9dd");
+    }
+
+    /// 回归：schema `$defs.Mode` 有第三个成员 `read`，TS 侧会真的写进状态文件。
+    /// 反例（修复前）：enum 只有 Exclusive/Shared ⇒ 带 read 声明的整份状态文件解析失败（CLI 全挂）。
+    #[test]
+    fn test_read_mode_deserializes_and_round_trips() {
+        let raw = r#"{
+          "schemaVersion": 1, "seq": 1,
+          "claims": [{
+            "claimId": "c_1", "holderId": "agent:a", "paths": ["src/a/"],
+            "mode": "read", "ttlSec": 1800, "expiresAt": 99999999999999, "createdAt": 1
+          }],
+          "messages": [], "holders": []
+        }"#;
+        let doc: StateDocument = serde_json::from_str(raw).expect("mode:read must parse");
+        assert_eq!(doc.claims[0].mode, Mode::Read);
+        let out = serde_json::to_string(&doc).expect("must serialize");
+        assert!(out.contains("\"mode\":\"read\""), "read must survive a write-back: {out}");
+    }
+
+    /// schema 里 StateDocument 的 claims/messages/holders 是 **required**：
+    /// 派生产物不得对它们放行（历史漂移：三个字段都带 #[serde(default)]，把必填当成了可选）。
+    #[test]
+    fn test_state_document_requires_arrays() {
+        assert!(
+            serde_json::from_str::<StateDocument>(r#"{ "schemaVersion": 1, "seq": 0 }"#).is_err(),
+            "claims/messages/holders are required by the schema"
+        );
+    }
+
+    /// ConflictInfo 是 schema `$defs.ConflictInfo` 的 Rust 派生，且被 claim 的冲突分支真实构造。
+    #[test]
+    fn test_conflict_info_serializes_like_schema() {
+        let c = ConflictInfo {
+            claim_id: "c_1".into(),
+            holder_id: "agent:b".into(),
+            holder_name: Some("B".into()),
+            path: "src/a/".into(),
+            overlaps_with: "src/a/".into(),
+            mode: Mode::Exclusive,
+            expires_at: 1,
+            remaining_sec: Some(5),
+            suggested_action: Some(SuggestedAction::Wait),
+        };
+        let s = serde_json::to_string(&c).expect("must serialize");
+        assert!(s.contains("\"claimId\":\"c_1\""), "{s}");
+        assert!(s.contains("\"overlapsWith\":\"src/a/\""), "{s}");
+        assert!(s.contains("\"suggestedAction\":\"wait\""), "{s}");
+        let sw = serde_json::to_string(&SuggestedAction::SwitchPath).unwrap();
+        assert_eq!(sw, "\"switch_path\"");
     }
 }
 

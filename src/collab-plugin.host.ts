@@ -92,6 +92,15 @@ return {
     }
     const conflict = cs => { const e = new Error('conflict'); e.collabConflict = true; e.conflicts = cs; return e }
     const withWarn = (data, warn) => (warn ? Object.assign({}, data, { warning: warn }) : data)
+    // 把任意抛出物转成一行可读文本（warning 里要带真实原因，不能只写「失败了」）。
+    // 与包形态 store.ts 的 describeError 同语义（两形态各写一份，见 inline-parity 的说明）。
+    const describeError = e => {
+      try {
+        const m = e && typeof e === 'object' ? e.message : undefined
+        if (typeof m === 'string' && m) return m
+        return String(e)
+      } catch (e2) { return 'unknown error' }
+    }
     async function cwdOf(agentId, agent) {
       try {
         if (agent && agent.session && agent.session.header && typeof agent.session.header.cwd === 'string' && agent.session.header.cwd) return agent.session.header.cwd
@@ -126,6 +135,15 @@ return {
         const degradedWarn = 'cannot resolve DSH user dir (settings.prepareDocument unavailable or invalid); state lives in project-local .dsh-collab/ and is NOT shared with other launcher forms'
         warn = warn ? warn + '; ' + degradedWarn : degradedWarn
       }
+      // 迁移失败**不再静默**（与包形态 store.ts 同方向）：旧落点搬不过来 = 项目凭空退回空状态。
+      const migrateNotes = []
+      const mergeWarn = extra => {
+        const parts = []
+        if (warn) parts.push(warn)
+        for (const n of migrateNotes) parts.push(n)
+        if (extra) parts.push(extra)
+        return parts.length ? parts.join('; ') : null
+      }
       let info = await fs.stat(target)
       // 平滑兼容：若外部尚未生成，但项目内存在遗留的 .dsh-collab.json，则自动无缝迁移至外部存储
       if (!info && cwd) {
@@ -137,21 +155,37 @@ return {
             await fs.writeText(target, raw, { kind: 'createIfAbsent' })
             info = await fs.stat(target)
           }
-        } catch (e) {}
+        } catch (e) {
+          migrateNotes.push('legacy migrate failed: ' + describeError(e))
+        }
       }
-      if (!info) return { state: init(), version: null, target: target, stateDir: stateDir, warn: warn }
+      if (!info) return { state: init(), version: null, target: target, stateDir: stateDir, warn: mergeWarn(null) }
       const raw = await fs.readText(target)
       let s
       try { s = Object.assign(init(), JSON.parse(raw)) } catch (e) {
+        // **不许谎报**：备份/重置各自是否成功必须如实写进 warning（与包形态 store.ts 逐字对齐）。
+        // 原实现在两处 catch 都吞掉失败，却照旧写 'reinitialized' / 'backup: <路径>'。
         let backupPath = null
+        let backupFailure = null
         try {
           const backupTarget = await fs.resolve(target.displayPath + '.corrupt-' + now())
           await fs.writeText(backupTarget, raw, { kind: 'createIfAbsent' })
           backupPath = fs.processPath(backupTarget)
-        } catch (backupError) {}
-        try { await fs.writeText(target, JSON.stringify(init()), { kind: 'replaceIfVersion', version: info.version }) } catch (resetError) {}
-        const corruptWarn = 'state corrupted; reinitialized' + (backupPath ? '; backup: ' + backupPath : '')
-        return { state: init(), version: null, target: target, stateDir: stateDir, warn: warn ? warn + '; ' + corruptWarn : corruptWarn }
+        } catch (backupError) { backupFailure = describeError(backupError) }
+        let resetOk = false
+        let resetFailure = null
+        try {
+          await fs.writeText(target, JSON.stringify(init()), { kind: 'replaceIfVersion', version: info.version })
+          resetOk = true
+        } catch (resetError) { resetFailure = describeError(resetError) }
+        // 证据链：如实交代原始损坏内容此刻的下落。
+        const corruptWarn = 'state corrupted'
+          + (resetOk ? '; reinitialized' : '; reinitialize failed: ' + resetFailure)
+          + (backupPath ? '; backup: ' + backupPath : '')
+          + (backupFailure ? '; backup failed: ' + backupFailure : '')
+          + (resetOk ? '' : '; original corrupt content left on disk')
+          + (backupFailure && resetOk ? '; original corrupt content overwritten by the reset' : '')
+        return { state: init(), version: null, target: target, stateDir: stateDir, warn: mergeWarn(corruptWarn) }
       }
       s.claims = Array.isArray(s.claims) ? s.claims : []
       s.messages = Array.isArray(s.messages) ? s.messages : []

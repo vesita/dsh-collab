@@ -1,0 +1,72 @@
+name: CI
+
+# ⑩ 本仓库实际怎么装依赖（判定依据，不是猜的）：
+#   - pnpm-lock.yaml 存在（lockfileVersion 9.0），node_modules 走 .pnpm 虚拟 store，
+#     pnpm-workspace.yaml 里只有 pnpm 配置项（minimumReleaseAgeExclude），**没有** packages:，
+#     所以它是"pnpm 配置 + 单包"，不是 monorepo 工作区。
+#   - 没有 package-lock.json / yarn.lock ⇒ 用 `npm install` 会无视这份锁文件，不可复现。
+#   ⇒ 安装用 pnpm（--frozen-lockfile），再交给 npm 跑 package.json 里的 scripts
+#     （`npm run build` / `npm test` 与包管理器无关）。
+#   本机已验证：`pnpm install --frozen-lockfile --ignore-scripts --store-dir <空 store>`
+#   从 npmjs 冷拉 23 个包成功（pnpm 11.26.0），锁文件与 package.json 一致。
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  node:
+    name: node (build + tests)
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: 安装 pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - name: 安装 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: 安装依赖（严格按 pnpm-lock.yaml）
+        run: pnpm install --frozen-lockfile
+
+      - name: 构建（tsc -> lib/）
+        run: npm run build
+
+      # 10 个 harness；静默跳过已经被改成"默认失败"（只有 COLLAB_ALLOW_SKIP=1 才放行），
+      # 所以这里**不要**给它设 COLLAB_ALLOW_SKIP。
+      - name: 测试
+        run: npm test
+
+  rust:
+    name: rust (crates/collab-cli)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates/collab-cli
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      # rustc 版本要够新（本地验证用 1.98.1；锁定的依赖里有 syn 3.x / serde_derive 1.0.229）。
+      - name: 安装 stable 工具链
+        run: rustup update stable && rustup default stable
+
+      # Cargo.lock 已入库 ⇒ --locked 保证 CI 不会悄悄改锁。
+      # 本机验证：`cargo test --offline`（热 ~/.cargo 缓存）3.68s，5 passed / 0 failed。
+      - name: cargo test
+        run: cargo test --locked

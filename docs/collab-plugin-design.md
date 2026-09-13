@@ -5,10 +5,13 @@
 - 状态：设计规划阶段，未开始实现
 - 关联：调研参考见第 2 节；所有接口均基于本环境 `cordis_inspect_*` 实测结果（见第 5 节）
 
-> **实现现状（v0.4.1，以此为准）**：本文档记录的是设计阶段的方案，实现已按实测演进。
-> 状态落点是 `${DSH_HOME:-$HOME/.dsh}/collab/projects/<项目名>-<哈希>.json` 的**绝对路径**（见 `src/paths.ts`），
-> 锁模式为 `exclusive` / `shared` / `read` 三态，并新增了「多会话实时态势注入」。
-> 面向使用者的现行规范见 [`collab-usage.md`](collab-usage.md)，工程说明见仓库 [`README.md`](../README.md)。
+> **实现现状（当前版本见 [`package.json`](../package.json)，以代码实现为准，不是本文档）**：本文档记录的是设计阶段的方案，
+> 下面各节保留的是**当时的**取舍与命名，**不再代表现状**。0.4 之后实现又陆续加入了 `readable` / `readers` /
+> 释放推送（`notify`）与功能 A / C / D，本文档均未覆盖（本文档只到功能雏形）；锁模式本身仍是
+> `exclusive` / `shared` / `read` 三态。
+> 状态落点是 `${DSH_HOME:-$HOME/.dsh}/collab/projects/<项目名>-<哈希>.json` 的**绝对路径**（见 `src/paths.ts`）。
+> **现行规范只认** [`collab-usage.md`](collab-usage.md)（面向会话的使用指南）与仓库 [`README.md`](../README.md)
+> （工程说明与功能 A/C/D）—— 不要用本文档判断当前实现。
 > 下文出现的 `.dsh-collab/state.json`、`storageDomain` 等描述属于当时的候选方案。
 
 ---
@@ -77,7 +80,9 @@
 1. **进程内事件广播即实时同步**：一个会话 claim，其他会话的插件实例立刻收到事件（`ctx.emit` / `ctx.on`），无需轮询；
 2. **持久化只需一份**：`storageDomain`（部署级 KV 域）或工作区文件，作为跨重启的权威副本。
 
-> 跨进程部署（多个 dsh 进程协作同一工作区）作为扩展点：v1 不支持，设计上预留"文件轮询/版本号乐观并发"的接口位置（见第 10 节）。
+> 跨进程部署（多个 dsh 进程协作同一工作区）当时作为扩展点：v1 不支持。**现状已支持**——状态文件位于
+> `${DSH_HOME:-$HOME/.dsh}/collab/projects/` 的绝对路径下，与进程启动目录无关，写路径带版本号乐观并发重试
+> （见 README「状态目录」与 `src/paths.ts`）。
 
 ### 4.2 组件
 
@@ -159,7 +164,7 @@
 
 **为 Rust 化预留的接口契约**：
 - 注册表文件 `.dsh-collab/state.json`：稳定 JSON Schema v1（claims/messages/holders/seq），版本号字段预留；
-- CLI 形态：`collab-cli list|claim|release|post|read --json`，stdout 输出 JSON，插件可经 `subprocess` 直接调用；
+- CLI 形态：`collab-cli [--json] list|overview|claim|release|board|git-check`（`post` / `read` 已合并为 `board`；`--json` 是全局开关），stdout 输出 JSON，插件可经 `subprocess` 直接调用；
 - 高性能形态（M4 评估）：Rust daemon 持有引擎，插件经 stdin-JSON 或本机 HTTP 调用；替换不影响服务与工具 API。
 
 **v1 决策**：引擎先纯 JS 实现——路径级冲突检测在数百条声明规模下是毫秒级，Node 绰绰有余；Rust 化仅在出现真实瓶颈（如监控巨仓、留言全文检索）时按上述契约进行，插件其余部分不动。
@@ -297,7 +302,7 @@ Holder = {
 
 ### 8.3 可选增强（v2，开关控制）
 
-- 用 `systemPrompt.context()` 在每个模型 step 前注入当前占用摘要（如"⚠️ src/backend/ 被会话 B 占用中"），让 AI 每次决策都自带上下文；需注意这是全局影响面，默认关闭。
+- 用 `systemPrompt.context()` 在每个模型 step 前注入当前占用摘要（如"⚠️ src/backend/ 被会话 B 占用中"），让 AI 每次决策都自带上下文；需注意这是全局影响面。**现状：0.4 起已实现且默认【开启】**（包形态用 `DSH_COLLAB_NO_PROMPT_HINT=1` 关闭；受限动态宿主形态读不到 `process.env`，始终注入）——见 README「多会话态势注入」。本行原写「默认关闭」已作废。
 
 ---
 
@@ -423,7 +428,7 @@ Holder = {
 
 ## 18. M1 实现纪要（2025-09，动态插件原型）
 
-**产物**：动态插件 `coll-1`（当前 pkg-9 运行中），Host 单端，两个模型工具 `collab_lock` / `collab_board`。
+**产物**：动态插件原型 `coll-1` / `pkg-9`（0.4 时代的动态形态；**现行正式形态是包形态**，版本见 `package.json`），Host 单端，两个模型工具 `collab_lock` / `collab_board`。
 
 ### 18.0 代码落库结构（2025-09，随 M3 后提交）
 
@@ -431,22 +436,30 @@ Holder = {
 
 | 路径 | 职责 |
 | --- | --- |
-| `src/collab-core.mjs` | **纯逻辑唯一事实源**。不碰 fs/ctx/sessions，只操作 state，时间可注入。可 import / 可测 / 供未来 CLI、Python、Rust 对照复用 |
-| `src/collab-plugin.host.js` | 自包含 Cordis Host 插件源码，导出 `hostCode` 字符串（直接作为 cordis 的 `code.host`）。因 Cordis 动态插件**不接受 import/打包**，内联与核心一致的纯逻辑 |
+| `src/collab-core.ts` | **纯逻辑唯一事实源**。不碰 fs/ctx/sessions，只操作 state，时间可注入。可 import / 可测 / 供未来 CLI、Python、Rust 对照复用 |
+| `src/collab-plugin.host.ts` | 自包含 Cordis Host 插件源码，导出 `hostCode` 字符串（直接作为 cordis 的 `code.host`）。因 Cordis 动态插件**不接受 import/打包**，内联与核心一致的纯逻辑 |
 | `src/schema/collab.schema.json` | **JSON Schema v1（单一契约）**：`StateDocument`（注册表状态结构）+ `colabLockParams` / `colabBoardParams`（两工具参数）。§5.3 定义 TS/Python/Rust 类型均由此派生 |
 | `docs/collab-usage.md` | 面向任意会话的使用指南 |
 | `tests/collab-pure-logic.mjs` | 纯逻辑 + 宿主一致性的回归测试 |
 | `README.md` | 仓库说明与目录结构 |
 
-> 一致性保障：`collab-plugin.host.js` 内联的 `norm`/`cleanName` 与核心库由对拍测试（`tests/collab-pure-logic.mjs` §9）保证不漂移；正式化进 host 组合后插件改为直接 import 核心模块消除重复。
+> 一致性保障：`collab-plugin.host.ts` 内联的 `norm`/`cleanName` 与核心库由对拍测试（`tests/collab-pure-logic.mjs` §9）保证不漂移；正式化进 host 组合后插件改为直接 import 核心模块消除重复。
+>
+> **0.9.0 起**这条保障被强化成两层：`tests/collab-inline-parity.mjs` 用括号配对扫描从 `hostCode` 里抽出**全部 18 个两形态同名函数**逐输出对拍（原先只有 `clockUtc`/`renderDigest` 两个），并以「实测同名集合必须恰好等于期望集合」做回归守护——任何一侧新增同名函数却忘记接入对拍都会变红。
 
-> **转义注意**：`collab-plugin.host.js` 是 `.js` 模板字符串，内部正则层级与运行中的 `pkg-9` 实际生效正则一致（如 `norm` 中 `/\\/g` 匹配单个反斜杠 → 替换为 `/`）。已用行为级 + 对拍测试双重确认，避免"模板字符串比运行版多一层转义"这类隐蔽漂移。
+> **0.9.0 架构变更**：上表是 M3 当时（0.4 时代）的落库结构。0.9.0 把 1640 行的单体 `src/index.ts`
+> 拆成 **11 个模块**（`contract` / `spec` / `skill` / `store` / `access` / `gate` / `push` / `tools` /
+> `awareness` / `delegation` / `client-route`），`src/index.ts` 变成一个 60 行的**组合根**：
+> 只按依赖顺序调用各 installer，并把上一个 installer 的返回值显式传给下一个（无跨模块可变全局）。
+> **现行源码清单以 `README.md` 的目录树为准**，本节表格仅作历史纪要保留。
+
+> **转义注意**：`collab-plugin.host.ts` 内的 JS 模板字符串，内部正则层级与运行中版本的实际生效正则一致（如 `norm` 中 `/\\/g` 匹配单个反斜杠 → 替换为 `/`）。已用行为级 + 对拍测试双重确认，避免"模板字符串比运行版多一层转义"这类隐蔽漂移。
 
 ### 18.1 与设计的实测偏差（均已验证）
 
 | 设计点 | 实现结论 | 原因 |
 | --- | --- | --- |
-| 状态文件位置 | 会话**工作区根** `.dsh-collab.json`（经 `fs.resolve(FILE, {cwd: session.header.cwd})`） | fs 服务无 mkdir；`.dsh-collab/` 子目录留待有 mkdir 手段后迁移 |
+| 状态文件位置（当时） | 会话**工作区根** `.dsh-collab.json`（经 `fs.resolve(FILE, {cwd: session.header.cwd})`）。**现行落点**是 `${DSH_HOME:-$HOME/.dsh}/collab/projects/<项目名>-<哈希>.json`（见 `src/paths.ts`）；`.dsh-collab.json` 已降级为**只读迁移源** | fs 服务无 mkdir；`.dsh-collab/` 子目录留待有 mkdir 手段后迁移 |
 | 持久化后端 | **文件后端**（fs `writeText` + `replaceIfVersion` 版本守卫做乐观并发，陈旧写自动重试 ≤5 次） | storageDomain 有单开约束、动态插件按会话隔离、且本部署未挂 kv 后端——storageDomain 推迟到 host 组合化形态 |
 | 跨会话同步 | **pull 式**：每次操作读最新文件即见他人变更 | 会话级动态插件 ctx 互不可达，`ctx.emit` 无法跨会话广播；事件/推送留给 M3 面板与正式化 |
 | 身份 | `exec.agent.id` → `sessions.get(id).header.cwd`（状态路径）与 `sessionTitle.get(session)`（显示名） | 工具内部不可传 holder 参数，防冒充 |
@@ -480,7 +493,7 @@ Holder = {
 
 ### 18.5 待办（下一迭代）
 
-- 状态文件迁移到 `.dsh-collab/state.json` 目录形态（需 `shell` mkdir / 确认 fs 行为）；
+- ~~状态文件迁移到 `.dsh-collab/state.json` 目录形态~~ **（已不适用）**：现行落点是 `${DSH_HOME:-$HOME/.dsh}/collab/projects/<项目名>-<哈希>.json`；`.dsh-collab/state.json` 只是**受限动态宿主形态**解析不到 DSH 用户目录时的退化落点（见 `src/collab-plugin.host.ts`），不是待办目标；
 - 进程内事件广播（供同会话 UI / 其他 host 插件消费）；
 - 真实双会话自动化测试（两个会话各挂插件、操作同一工作区，验证注册表/留言共享）；
 - storageDomain 后端接入（host 组合化形态）；
@@ -498,11 +511,11 @@ Holder = {
 | 描述更新 | `collab_lock` 描述纳入 `overview`，`claim` 结果返回 `merged` 标记（同 holder 并入是否发生） |
 
 > **验证方式**：本会话（checkpoint 恢复后）的函数目录为基础集，动态注册的 `collab_lock`/`collab_board` 不在可直接调用的 schema 内，故不用"重复调用"验证，而用 **纯逻辑单元测试 + 真实磁盘工件**：
-> `node tests/collab-pure-logic.mjs`（**25/25 通过**）。该脚本从 pkg-9 复制不变的核心函数（`norm`/`ov`/`claim` 冲突检测/短租约警告/`overview` 分组/到期清理），并以**真实 omni_craft `/home/vesita/coding/hub/omni_craft/.dsh-collab.json` 工件**断言——确认迁移的声明可被 overview 正确分组、路径扁平化、holderId 保留，且既有冲突/合并/过期语义不回归。运行时健康：`coll-1/pkg-9 running`，无 `waitingFor`、无 diagnostics，`overview` 已入工具 enum 并经 `Tool.listTools` 确认注册。
+> `node tests/collab-pure-logic.mjs`（通过数见脚本自身输出；本行不再写死计数 —— 它随实现演进）。该脚本 **import 自核心库**（`lib/collab-core.js`，由 `src/collab-core.ts` 构建；见 §18.6），覆盖 `norm`/`ov`/`claim` 冲突检测/短租约警告/`overview` 分组/到期清理，并以**真实 omni_craft `/home/vesita/coding/hub/omni_craft/.dsh-collab.json` 工件**断言——确认迁移的声明可被 overview 正确分组、路径扁平化、holderId 保留，且既有冲突/合并/过期语义不回归。运行时健康：`coll-1/pkg-9 running`（当时的动态形态），无 `waitingFor`、无 diagnostics，`overview` 已入工具 enum 并经 `Tool.listTools` 确认注册。
 
 ### 18.6 测试资产
 
-- `tests/collab-pure-logic.mjs`：纯逻辑回归（`node tests/collab-pure-logic.mjs`，42/42 通过）。**import 自 `src/collab-core.mjs` 而非复制**，并含主机源码对拍（§9）——从 `collab-plugin.host.js` 提取 `norm`/`cleanName` 与核心库做行为对比，防止内联版与核心库漂移。
+- `tests/collab-pure-logic.mjs`：纯逻辑回归（`node tests/collab-pure-logic.mjs`；通过数以脚本自身输出为准，本文件不写死计数）。**import 自 `lib/collab-core.js`（由 `src/collab-core.ts` 构建）而非复制**，并含主机源码对拍（§9）——从 `lib/collab-plugin.host.js`（源码 `src/collab-plugin.host.ts`）提取 `norm`/`cleanName` 与核心库做行为对比，防止内联版与核心库漂移。
 
 ---
 

@@ -1,3 +1,5 @@
+import { createHarness } from './_harness.mjs'
+
 // collab-hostcode-parity.mjs
 // 动态宿主形态（hostCode）行为对拍测试。
 //
@@ -21,11 +23,8 @@ import os from 'node:os'
 const ROOT = path.dirname(new URL(import.meta.url).pathname)
 const { hostCode } = await import(path.join(ROOT, '../lib/collab-plugin.host.js'))
 
-let pass = 0, fail = 0
-const ok = (cond, label, extra) => {
-  if (cond) { pass++; console.log('  ok  ' + label) }
-  else { fail++; console.log('  FAIL ' + label + (extra ? '  <-- ' + extra : '')) }
-}
+const h = createHarness()
+const { ok } = h
 
 // ---------- fake fs：必须与真实 ctx.fs 的解析语义同构 ----------
 const FAKE_HOME = path.join(os.tmpdir(), 'dsh-collab-hostcode-' + process.pid)
@@ -99,7 +98,7 @@ try {
   ok(false, 'hostCode must load without throwing', String((e && e.stack) || e))
 }
 if (!lock) {
-  console.log(`\nFAILURES: ${pass} passed, ${fail} failed`)
+  console.log(`\nFAILURES: ${h.pass} passed, ${h.fail} failed`)
   process.exit(1)
 }
 
@@ -373,5 +372,108 @@ console.log('# registered awareness provider emits exactly collab-core renderDig
     'injected=' + JSON.stringify(text) + ' expected=' + JSON.stringify(expected))
 }
 
-console.log(`\n${fail === 0 ? 'ALL PASS' : 'FAILURES'}: ${pass} passed, ${fail} failed`)
-process.exit(fail === 0 ? 0 : 1)
+// ---------- 动态形态镜像：损坏自愈/迁移失败同样不许谎报（与包形态 store.ts 对齐） ----------
+// 为什么必须在这里测：hostCode 的 load() 是**另一份实现**（动态插件不接受 import）。
+// 只修包形态的话，动态形态用户仍会被 warning 谎报"已备份/已重新初始化"。
+{
+  console.log('# hostCode: corrupt-state warnings must not lie (mirror of store.ts)')
+  const boot = async (fsImpl, cwd) => {
+    const toolsLocal = []
+    const ctxLocal = {
+      fs: fsImpl,
+      timer: { timeout: (ms) => new Promise((r) => setTimeout(r, ms)), interval: () => () => {} },
+      effect: (fn) => { const d = fn(); return typeof d === 'function' ? d : () => {} },
+      on: () => () => {},
+      get: (name) => {
+        if (name === 'settings') return { prepareDocument: async () => SETTINGS_DOC }
+        if (name === 'sessions') return { get: () => ({ header: { cwd } }) }
+        if (name === 'sessionTitle') return { get: () => ({ title: 'Corrupt Worker' }) }
+        return undefined
+      }
+    }
+    const pluginLocal = new Function('harness', 'ctx', hostCode)({ defineTool: (d) => d, registerTool: (_c, t) => { toolsLocal.push(t); return () => {} }, handle: () => () => {} }, ctxLocal)
+    await pluginLocal.apply(ctxLocal)
+    return toolsLocal.find((t) => t.name === 'collab_lock')
+  }
+  const healFs = (map, opts = {}) => ({
+    resolve: (p, o) => {
+      const abs = path.isAbsolute(p) ? p : path.resolve(o && o.cwd ? o.cwd : process.cwd(), p)
+      return makeTarget(abs)
+    },
+    stat: async (t) => (map.has(t.path) ? { version: 1 } : undefined),
+    readText: async (t) => map.get(t.path) || '',
+    writeText: async (t, content, o) => {
+      if (opts.failAllWrites) throw new Error('disk on fire')
+      if (opts.failReplace && o && o.kind === 'replaceIfVersion') throw new Error('reset exploded')
+      map.set(t.path, content)
+      return { operation: 'create', version: 1 }
+    },
+    processPath: (t) => t.path,
+    listDir: async () => []
+  })
+  const warnOf = async (lockLocal, agent) => {
+    const r = await lockLocal.execute({ op: 'list' }, agent)
+    return { r, w: String((r && r.data && r.data.warning) || '') }
+  }
+
+  // (a) 备份与重置全失败：不得出现成功措辞，且必须报出失败原因
+  {
+    const map = new Map()
+    const lockLocal = await boot(healFs(map, { failAllWrites: true }), '/fake/host/corrupt-a')
+    const r0 = await lockLocal.execute({ op: 'list' }, A)
+    map.set(r0.data.statePath, 'not-json{{{')
+    const { w } = await warnOf(lockLocal, A)
+    ok(w.includes('corrupted'), 'hostCode: corrupt state is still surfaced', JSON.stringify(w))
+    ok(!/;\s*backup:\s/.test(w), 'hostCode: a failed backup must NOT be reported as "backup: <path>"', JSON.stringify(w))
+    ok(!/reinitialized/.test(w), 'hostCode: a failed reset must NOT be reported as "reinitialized"', JSON.stringify(w))
+    ok(/backup failed: disk on fire/.test(w), 'hostCode: warning states the backup failure and its cause', JSON.stringify(w))
+    ok(/reinitialize failed: disk on fire/.test(w), 'hostCode: warning states the reset failure and its cause', JSON.stringify(w))
+    ok(/original corrupt content left on disk/.test(w), 'hostCode: warning tells where the corrupt content now lives', JSON.stringify(w))
+    ok(map.get(r0.data.statePath) === 'not-json{{{', 'hostCode: original corrupt bytes are left on disk')
+  }
+  // (b) 只有重置失败：备份路径如实给出，同时不得宣称"已重新初始化"
+  {
+    const map = new Map()
+    const lockLocal = await boot(healFs(map, { failReplace: true }), '/fake/host/corrupt-b')
+    const r0 = await lockLocal.execute({ op: 'list' }, A)
+    const key = r0.data.statePath
+    map.set(key, 'not-json{{{')
+    const { w } = await warnOf(lockLocal, A)
+    const backupKeys = [...map.keys()].filter((k) => k.includes('.corrupt-'))
+    ok(backupKeys.length === 1 && map.get(backupKeys[0]) === 'not-json{{{', 'hostCode: the backup really holds the corrupt bytes', JSON.stringify(backupKeys))
+    ok(w.includes('backup: ' + backupKeys[0]), 'hostCode: a successful backup still reports its real path', JSON.stringify(w))
+    ok(!/reinitialized/.test(w) && /reinitialize failed: reset exploded/.test(w), 'hostCode: the failed reset is reported honestly', JSON.stringify(w))
+  }
+  // (c) 回归：全成功时文案与此前逐字一致（只允许失败时改文案）
+  {
+    const map = new Map()
+    const lockLocal = await boot(healFs(map), '/fake/host/corrupt-c')
+    const r0 = await lockLocal.execute({ op: 'list' }, A)
+    const key = r0.data.statePath
+    map.set(key, 'not-json{{{')
+    const { w } = await warnOf(lockLocal, A)
+    ok(/^state corrupted; reinitialized; backup: /.test(w), 'hostCode: the all-success wording is byte-compatible with before', JSON.stringify(w))
+    ok(!/failed/.test(w), 'hostCode: no failure wording on the success path', JSON.stringify(w))
+  }
+  // (d) 旧状态文件迁移写入失败必须留痕
+  {
+    const cwd = '/fake/host/legacy-fail'
+    const legacyPath = path.join(cwd, '.dsh-collab.json')
+    const legacyDoc = JSON.stringify({ schemaVersion: 1, seq: 0, claims: [], messages: [], holders: [] })
+    const map = new Map([[legacyPath, legacyDoc]])
+    const fsImpl = {
+      resolve: (p, o) => makeTarget(path.isAbsolute(p) ? p : path.resolve(o && o.cwd ? o.cwd : process.cwd(), p)),
+      stat: async (t) => (map.has(t.path) ? { version: 1 } : undefined),
+      readText: async (t) => map.get(t.path) || '',
+      writeText: async () => { throw new Error('migrate write exploded') },
+      processPath: (t) => t.path,
+      listDir: async () => []
+    }
+    const lockLocal = await boot(fsImpl, cwd)
+    const { w } = await warnOf(lockLocal, A)
+    ok(/legacy migrate failed: migrate write exploded/.test(w), 'hostCode: a failed legacy migration is surfaced as "legacy migrate failed: <cause>"', JSON.stringify(w))
+    ok(map.get(legacyPath) === legacyDoc, 'hostCode: a failed migration leaves the legacy file untouched')
+  }
+}
+
+h.finish()

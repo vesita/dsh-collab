@@ -1,3 +1,5 @@
+import { createHarness, skippedOrRejected } from './_harness.mjs'
+
 // collab-skill-real.mjs
 // 委托纪律（随包 skill + 常驻 PromptContext + dsh-collab 偏好设置）的**真实服务**端到端测试。
 //
@@ -10,8 +12,9 @@
 //     未设置时退回到本机默认路径（/usr/lib/node_modules/@deepseek-ai/dsh/node_modules）。
 //   - 插件从**本仓库自己的构建产物**加载（默认 ../lib/index.js，可用
 //     `DSH_COLLAB_PLUGIN_ENTRY` 覆盖，便于对打包产物做同样一遍验证）。
-//   - 找不到部署或构建产物时，打印一行明确的 SKIPPED 并以 0 退出——本文件不得在
-//     没有装 dsh 的机器上失败。运行方式：`npm run test:real`（会先 build）。
+//   - 找不到部署或构建产物时**默认按失败退出（exit 1）**——"没跑"不伪装成"通过"。
+//     只有显式 `COLLAB_ALLOW_SKIP=1` 才放行（exit 0），并打印含"未验证"字样的横幅。
+//     运行方式：`node tests/collab-skill-real.mjs`（需先 npm run build）。
 //
 // 为什么单独存在：tests/collab-skill.mjs 的 57 条断言全部基于**假** settings 服务，
 // 只验证本插件自己的契约；真实 `installSection` 的 setSource/onChange 接线与真实
@@ -39,14 +42,24 @@ const REQUIRED = [
 ]
 const missing = REQUIRED.filter((p) => !fs.existsSync(p))
 if (missing.length) {
-  console.log('SKIPPED: no dsh deployment at ' + DEPLOY)
-  console.log('  set DSH_DEPLOY_NODE_MODULES to a dsh deployment node_modules directory to run this test')
+  // ⑷ 跳过默认是**失败**：只有 COLLAB_ALLOW_SKIP=1 显式放行才以 0 退出（并打"未验证"横幅）。
+  if (skippedOrRejected('no dsh deployment at ' + DEPLOY)) {
+    // skippedOrRejected 已打过"未验证"横幅 + 一行 `SKIPPED: …`，这里只补上下文。
+    console.log('  set DSH_DEPLOY_NODE_MODULES to a dsh deployment node_modules directory to run this test')
+    for (const p of missing) console.log('  missing: ' + p)
+    process.exit(0)
+  }
+  console.log('FAILED: no dsh deployment at ' + DEPLOY + '（未验证即失败；设 COLLAB_ALLOW_SKIP=1 才放行）')
   for (const p of missing) console.log('  missing: ' + p)
-  process.exit(0)
+  process.exit(1)
 }
 if (!fs.existsSync(PLUGIN_ENTRY)) {
-  console.log('SKIPPED: plugin build output missing at ' + PLUGIN_ENTRY + ' (run npm run build first)')
-  process.exit(0)
+  const why = 'plugin build output missing at ' + PLUGIN_ENTRY + ' (run npm run build first)'
+  if (skippedOrRejected(why)) {
+    process.exit(0)
+  }
+  console.log('FAILED: ' + why + '（未验证即失败；设 COLLAB_ALLOW_SKIP=1 才放行）')
+  process.exit(1)
 }
 
 const { Context } = await import(path.join(DEPLOY, '@deepseek-ai/cordis/lib/index.js'))
@@ -56,11 +69,8 @@ const plugin = (await import(PLUGIN_ENTRY)).default
 
 const SKILL_PATH = path.join(ROOT, '../skills/subagent-delegation/SKILL.md')
 
-let pass = 0, fail = 0
-const ok = (cond, label, extra) => {
-  if (cond) { pass++; console.log('  ok  ' + label) }
-  else { fail++; console.log('  FAIL ' + label + (extra ? '  <-- ' + extra : '')) }
-}
+const h = createHarness()
+const { ok } = h
 const settle = (ms = 150) => new Promise((r) => setTimeout(r, ms))
 
 // 临时设置文档：本测试自己建、自己删，不依赖任何外部路径。
@@ -140,5 +150,4 @@ try {
   fs.rmSync(tmpDir, { recursive: true, force: true })
 }
 
-console.log(`\n${fail === 0 ? 'ALL PASS' : 'FAILURES'}: ${pass} passed, ${fail} failed`)
-process.exit(fail === 0 ? 0 : 1)
+h.finish()

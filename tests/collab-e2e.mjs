@@ -30,6 +30,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import assert from 'node:assert'
+import { skippedOrRejected } from './_harness.mjs'
 
 // ════════════════════════════════════════════════════════════════════════
 // 0. 隔离环境
@@ -41,6 +42,12 @@ fs.mkdirSync(DSH_HOME, { recursive: true })
 fs.mkdirSync(FAKE_HOME, { recursive: true })
 process.env.DSH_HOME = DSH_HOME
 process.env.HOME = FAKE_HOME
+// ⑪ 测试自己建的临时目录，测试自己清理（退出时）。只有失败路径保留**这一个**现场供排障。
+let KEEP_SITE = true
+process.on('exit', () => {
+  if (KEEP_SITE) return
+  try { fs.rmSync(TMP_ROOT, { recursive: true, force: true }) } catch { /* 清理失败不该掩盖测试结果 */ }
+})
 const START_CWD = process.cwd()
 const EXPECTED_DIR = path.join(DSH_HOME, 'collab', 'projects')
 
@@ -144,6 +151,8 @@ function makeCtx(sessionCwd, tools) {
 // ════════════════════════════════════════════════════════════════════════
 class CheckFail extends Error {}
 class KnownUnimplemented extends Error {}
+/** 用例前置条件不满足（例如构建产物缺失）。**不是**静默通过：默认按 FAIL 记。 */
+class Skipped extends Error {}
 
 function expect(cond, msg, detail) {
   if (!cond) throw new CheckFail(msg + (detail ? '\n      ↳ ' + detail : ''))
@@ -153,7 +162,10 @@ const TILDE_MSG = "statePath 含 '~' 路径段（~ 未展开的 bug 落点）"
 
 const records = []
 function printRecord(r) {
-  const tag = r.status === 'PASS' ? 'PASS' : r.status === 'KNOWN' ? 'KNOWN-UNIMPLEMENTED' : 'FAIL'
+  const tag = r.status === 'PASS' ? 'PASS'
+    : r.status === 'KNOWN' ? 'KNOWN-UNIMPLEMENTED'
+      : r.status === 'SKIP' ? 'SKIPPED-UNVERIFIED'
+        : 'FAIL'
   console.log(`[${r.id}] ${tag}  ${r.title}`)
   for (const n of r.notes) console.log('      · ' + n)
   if (r.err) console.log('      ✗ ' + String(r.err.message || r.err).split('\n').join('\n      '))
@@ -165,6 +177,12 @@ async function runTest(id, title, fn) {
   try { await fn(notes) }
   catch (e) {
     if (e instanceof KnownUnimplemented) { status = 'KNOWN'; known = e.message }
+    else if (e instanceof Skipped) {
+      // ⑷ 跳过默认是**失败**：旧代码 `return` 会把"没测"记成 PASS。
+      // 只有 COLLAB_ALLOW_SKIP=1 显式放行才记 SKIP（skippedOrRejected 会打"未验证"横幅）。
+      if (skippedOrRejected('[' + id + '] ' + title + '：' + e.message)) { status = 'SKIP'; known = e.message }
+      else { status = 'FAIL'; err = new Error('该用例未执行（未验证即失败）：' + e.message) }
+    }
     else { status = 'FAIL'; err = e }
   }
   const rec = { id, title, status, notes, err, known }
@@ -410,8 +428,9 @@ await runTest('T9', 'hostCode 形态：状态目录绝对、不含 ~、且走 se
     const mod = await import(new URL('../lib/collab-plugin.host.js', import.meta.url))
     hostCode = mod.hostCode
   } catch (e) {
-    notes.push('lib/collab-plugin.host.js 不存在或不可加载，跳过：' + String(e && e.message || e))
-    return // SKIP：按任务要求不报错
+    // ⑷ 不再静默 return（旧写法：直接 return ⇒ 该用例记 PASS ⇒ ALL PASS 却什么都没测）。
+    // 默认 ⇒ FAIL；只有 COLLAB_ALLOW_SKIP=1 才记 SKIP + "未验证"横幅。
+    throw new Skipped('lib/collab-plugin.host.js 不存在或不可加载：' + String(e && e.message || e))
   }
   assert.ok(typeof hostCode === 'string', 'hostCode 不是字符串')
   const st = fs.statSync(new URL('../lib/collab-plugin.host.js', import.meta.url))
@@ -511,9 +530,11 @@ const total = records.length
 const pass = records.filter((r) => r.status === 'PASS').length
 const fail = records.filter((r) => r.status === 'FAIL').length
 const known = records.filter((r) => r.status === 'KNOWN').length
+const skippedUnverified = records.filter((r) => r.status === 'SKIP').length
 
 console.log('════════════════════ SUMMARY ════════════════')
-console.log(`PASS ${pass}/${total}   FAIL ${fail}/${total}   KNOWN-UNIMPLEMENTED ${known}/${total}`)
+console.log(`PASS ${pass}/${total}   FAIL ${fail}/${total}   KNOWN-UNIMPLEMENTED ${known}/${total}`
+  + (skippedUnverified ? `   SKIPPED-UNVERIFIED ${skippedUnverified}/${total}` : ''))
 if (fail) {
   console.log('\nFAILED:')
   for (const r of records.filter((x) => x.status === 'FAIL')) {
@@ -525,6 +546,8 @@ if (known) {
   console.log('\nKNOWN-UNIMPLEMENTED (非 harness 失败，修复后应转 PASS):')
   for (const r of records.filter((x) => x.status === 'KNOWN')) console.log(`  [${r.id}] ${r.known}`)
 }
-console.log('\n临时目录（现场保留）: ' + TMP_ROOT)
+// ⑪ 退出时清理自己建的临时目录（成功路径必清）；失败时保留**唯一一个**现场，便于排障。
+KEEP_SITE = fail > 0
+console.log('\n临时目录（' + (KEEP_SITE ? '失败路径，保留现场' : '成功路径，已清理') + '）: ' + TMP_ROOT)
 console.log(fail ? 'RESULT: FAIL' : 'RESULT: PASS')
 process.exitCode = fail ? 1 : 0

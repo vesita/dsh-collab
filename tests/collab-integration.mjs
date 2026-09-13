@@ -123,4 +123,118 @@ const healed = await lockTool.execute({ op: 'list' }, exec2)
 if (!healed.ok) throw new Error('corrupt state must self-heal, got ' + JSON.stringify(healed))
 if (!String(healed.data.warning || '').includes('corrupted')) throw new Error('self-heal must surface a warning')
 
+// 10. A/B 组：损坏自愈与旧落点迁移的失败必须**如实**（不得谎报备份/重置成功、不得静默丢迁移失败）
+//     手法统一：起一个**独立 ctx**（installStore 在 apply 时捕获 ctx，故每个案例各自实例化），
+//     注入一个会抛错的 fs，然后跑一次 list，读回 data.warning。
+//     断言**全部求值后再统一判定**：负向对照时一次就能看到每一条断言各自红在哪，
+//     而成功路径的输出与改动前逐字一致（仍是同一行 PASS）。
+const newFailures = []
+const ok = (label, cond, extra) => {
+  if (cond) { console.log('  ok  ' + label); return }
+  newFailures.push(label + (extra ? '  <-- ' + extra : ''))
+  console.log('  FAIL ' + label + (extra ? '  <-- ' + extra : ''))
+}
+const bootWithFs = async (fsImpl, cwd) => {
+  const c = new Context()
+  for (const serviceName of ['tools', 'timer', 'fs', 'sessions', 'sessionTitle']) c.provide(serviceName)
+  const tools = []
+  c.set('tools', { register: (t) => { tools.push(t); return () => {} } })
+  c.set('timer', { timeout: (ms) => new Promise((r) => setTimeout(r, ms)), interval: () => () => {} })
+  c.set('fs', fsImpl)
+  c.set('sessions', { get: () => ({ header: { cwd } }) })
+  c.set('sessionTitle', { get: () => ({ title: 'Heal Worker' }) })
+  await c.plugin(collabPlugin)
+  return tools.find((t) => t.name === 'collab_lock')
+}
+const healFs = (map, opts = {}) => ({
+  resolve: async (p) => ({ displayPath: p, path: p }),
+  stat: async (t) => (map.has(t.path) ? { version: 1 } : null),
+  readText: async (t) => map.get(t.path) || '',
+  writeText: async (t, content, o) => {
+    if (opts.failAllWrites) throw new Error('disk on fire')
+    if (opts.failReplace && o && o.kind === 'replaceIfVersion') throw new Error('reset exploded')
+    if (opts.failLegacyMigrate && o && o.kind === 'createIfAbsent') throw new Error('migrate write exploded')
+    map.set(t.path, content)
+    return { operation: 'create', version: 1 }
+  },
+  processPath: (t) => t.path
+})
+const listWarning = async (lock, agentId) => {
+  const r = await lock.execute({ op: 'list' }, { agent: { id: agentId } })
+  if (!r.ok) throw new Error('list must still succeed, got ' + JSON.stringify(r))
+  return String((r.data && r.data.warning) || '')
+}
+
+// 10a. A1（item 1）：备份写失败 —— warning 不得宣称"已备份"，必须如实说备份失败 + 交代损坏内容的下落
+{
+  const cwd = '/test/heal/backup-fail'
+  const key = projectStateFile(cwd)
+  const map = new Map([[key, 'not-json{{{']])
+  const lock = await bootWithFs(healFs(map, { failAllWrites: true }), cwd)
+  const w = await listWarning(lock, 'agent-a1')
+  ok('item 1/A1: 损坏必须仍然被报出来', w.includes('corrupted'), JSON.stringify(w))
+  ok('item 1/A1: 备份失败时不得宣称"已备份到 <路径>"', !/;\s*backup:\s/.test(w), JSON.stringify(w))
+  ok('item 1/A1: warning 必须如实说明备份失败及其原因', /backup failed: disk on fire/.test(w), JSON.stringify(w))
+  ok('item 1/A1: 必须交代原始损坏内容的下落（证据链）', /original corrupt content left on disk/.test(w), JSON.stringify(w))
+  ok('item 2/A1: 重置失败时不得宣称"已重新初始化"', !/reinitialized/.test(w), JSON.stringify(w))
+  ok('item 2/A1: warning 必须如实说明重置失败及其原因', /reinitialize failed: disk on fire/.test(w), JSON.stringify(w))
+  ok('item 2/A1: 重置失败时原始损坏内容必须原样留在磁盘上', map.get(key) === 'not-json{{{', JSON.stringify(map.get(key)))
+}
+
+// 10b. A2（item 2）：备份成功但重置失败 —— 备份路径如实给出，同时不得宣称"已重新初始化"
+{
+  const cwd = '/test/heal/reset-fail'
+  const key = projectStateFile(cwd)
+  const map = new Map([[key, 'not-json{{{']])
+  const lock = await bootWithFs(healFs(map, { failReplace: true }), cwd)
+  const w = await listWarning(lock, 'agent-a2')
+  const backupKeys = [...map.keys()].filter((k) => k.includes('.corrupt-'))
+  ok('item 2/A2: 备份必须真的写出原始损坏内容', backupKeys.length === 1 && map.get(backupKeys[0]) === 'not-json{{{',
+    JSON.stringify({ backupKeys, content: map.get(backupKeys[0]) }))
+  ok('item 1/A2: 备份成功时 warning 必须给出真实备份路径', w.includes('backup: ' + backupKeys[0]), JSON.stringify(w))
+  ok('item 2/A2: warning 必须如实说明重置失败', /reinitialize failed: reset exploded/.test(w), JSON.stringify(w))
+  ok('item 2/A2: 重置失败却宣称"已重新初始化"（谎报）', !/reinitialized/.test(w), JSON.stringify(w))
+  ok('item 2/A2: 重置失败时损坏内容仍在磁盘上，warning 必须这么写', /original corrupt content left on disk/.test(w), JSON.stringify(w))
+  ok('item 2/A2: 重置失败后主文件必须保持原样（证据仍在）', map.get(key) === 'not-json{{{', JSON.stringify(map.get(key)))
+}
+
+// 10c. 回归：两处都成功时，成功措辞必须与此前**逐字一致**（只允许失败时改文案）
+{
+  const cwd = '/test/heal/both-ok'
+  const key = projectStateFile(cwd)
+  const map = new Map([[key, 'not-json{{{']])
+  const lock = await bootWithFs(healFs(map), cwd)
+  const w = await listWarning(lock, 'agent-a3')
+  const backupKeys = [...map.keys()].filter((k) => k.includes('.corrupt-'))
+  ok('item 1+2/10c: 全成功时的 warning 仍是 "state corrupted; reinitialized; backup: <路径>"',
+    /^state corrupted; reinitialized; backup: /.test(w) && w.includes('backup: ' + backupKeys[0]), JSON.stringify(w))
+  ok('item 1+2/10c: 全成功时不得出现任何失败措辞', !/failed/.test(w), JSON.stringify(w))
+}
+
+// 10d. B（item 3）：旧落点（项目内 .dsh-collab.json）迁移写入失败必须留痕，且不阻断工具
+{
+  const cwd = '/test/heal/legacy-fail'
+  const legacyPath = cwd + '/.dsh-collab.json'
+  const legacyDoc = JSON.stringify({ schemaVersion: 1, seq: 1, claims: [], messages: [], holders: [] })
+  const map = new Map([[legacyPath, legacyDoc]])
+  const fsImpl = {
+    resolve: async (p, o) => ({ displayPath: p, path: p.startsWith('/') ? p : ((o && o.cwd ? o.cwd : '') + '/' + p) }),
+    stat: async (t) => (map.has(t.path) ? { version: 1 } : null),
+    readText: async (t) => map.get(t.path) || '',
+    writeText: async () => { throw new Error('migrate write exploded') },
+    processPath: (t) => t.path
+  }
+  const lock = await bootWithFs(fsImpl, cwd)
+  const w = await listWarning(lock, 'agent-b1')
+  ok('item 3/B: 迁移失败必须在 warning 里留痕（legacy migrate failed: <原因>）',
+    /legacy migrate failed: migrate write exploded/.test(w), JSON.stringify(w))
+  ok('item 3/B: 迁移失败不得动到旧文件本身', map.get(legacyPath) === legacyDoc)
+}
+
+if (newFailures.length) {
+  console.log('')
+  for (const f of newFailures) console.log('NEW ASSERTION FAILED: ' + f)
+  throw new Error(newFailures.length + ' new assertion(s) failed')
+}
+
 console.log('PASS: Cordis plugin integration test passed (0.1.5-rc.1 runtime)')

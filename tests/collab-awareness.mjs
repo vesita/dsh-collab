@@ -1,3 +1,5 @@
+import { createHarness } from './_harness.mjs'
+
 // collab-awareness.mjs
 // 多 DSH 会话协同的**实时态势注入**回归测试。
 //
@@ -23,11 +25,8 @@ const { projectStateFile } = await import(path.join(ROOT, '../lib/paths.js'))
 const { init } = await import(path.join(ROOT, '../lib/collab-core.js'))
 const collabPlugin = (await import(path.join(ROOT, '../lib/index.js'))).default
 
-let pass = 0, fail = 0
-const ok = (cond, label, extra) => {
-  if (cond) { pass++; console.log('  ok  ' + label) }
-  else { fail++; console.log('  FAIL ' + label + (extra ? '  <-- ' + extra : '')) }
-}
+const h = createHarness()
+const { ok } = h
 
 const tmp = path.join(os.tmpdir(), 'collab-awareness-' + process.pid)
 process.env.DSH_HOME = tmp
@@ -74,7 +73,7 @@ ok(!!capturedPromptContext, 'plugin registers the awareness PromptContext')
 ok(!!capturedPromptContext && capturedPromptContext.name === 'dsh-collab/awareness', 'context name is dsh-collab/awareness')
 ok(!!capturedPromptContext && capturedPromptContext.order === 130, 'context order is 130 (after sandbox/approval/subagent-delegation)')
 ok(!!capturedPromptContext && typeof capturedPromptContext.text === 'function', 'context text is a live provider function')
-if (!capturedPromptContext) { console.log(`\nFAILURES: ${pass}, ${fail}`); process.exit(1) }
+if (!capturedPromptContext) { console.log(`\nFAILURES: ${h.pass}, ${h.fail}`); process.exit(1) }
 
 const statePath = projectStateFile(PROJECT_CWD)
 const now = Date.now()
@@ -156,5 +155,4 @@ console.log('# opt-out: DSH_COLLAB_NO_PROMPT_HINT=1 registers no context')
   delete process.env.DSH_COLLAB_NO_PROMPT_HINT
 }
 
-console.log(`\n${fail === 0 ? 'ALL PASS' : 'FAILURES'}: ${pass} passed, ${fail} failed`)
-process.exit(fail === 0 ? 0 : 1)
+h.finish()

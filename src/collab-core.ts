@@ -433,7 +433,12 @@ export function renderAccessNotice(claims: Claim[]): string {
     const mins = Math.max(1, Math.round((c.ttlSec || 0) / 60))
     const paths = c.paths.slice(0, 2).join(' ') + (c.paths.length > 2 ? ' 等 ' + c.paths.length + ' 条' : '')
     const start = clockUtc(typeof c.createdAt === 'number' ? c.createdAt : c.expiresAt - (c.ttlSec || 0) * 1000)
-    return (c.holderName || c.holderId) + '（' + c.mode + '，' + (isReadable(c) ? '可读' : '不可读') + '）占用 ' + paths +
+    // 可读性**只对 exclusive 有门控意义**：writeGate 的 collect() 对 shared/read 一律 `continue`
+    // 放行（src/index.ts）。所以只在 exclusive 上渲染「可读 / 不可读」—— 对 shared/read 标
+    // 「不可读」是句假话，读根本不会被拦。而 OPEN_HINT 恰好推荐"只读调研用 mode=read"，
+    // 一个只读声明却被通知写成「不可读」，误导概率最高。
+    const readableTag = c.mode === 'exclusive' ? '，' + (isReadable(c) ? '可读' : '不可读') : ''
+    return (c.holderName || c.holderId) + '（' + c.mode + readableTag + '）占用 ' + paths +
       '，租约 ' + mins + ' 分（' + start + '–' + clockUtc(c.expiresAt) + '）'
   })
   const more = ordered.length > 2 ? '；另有 ' + (ordered.length - 2) + ' 条' : ''

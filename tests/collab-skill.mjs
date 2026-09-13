@@ -1,3 +1,5 @@
+import { createHarness } from './_harness.mjs'
+
 // collab-skill.mjs
 // 随包发布的 subagent-delegation skill + 委托纪律常驻上下文 + dsh-collab 偏好设置的回归测试。
 //
@@ -33,11 +35,8 @@ const SKILL_PATH = path.join(ROOT, '../skills/subagent-delegation/SKILL.md')
 const SKILL_DIR = path.dirname(SKILL_PATH)
 const collabPlugin = (await import(path.join(ROOT, '../lib/index.js'))).default
 
-let pass = 0, fail = 0
-const ok = (cond, label, extra) => {
-  if (cond) { pass++; console.log('  ok  ' + label) }
-  else { fail++; console.log('  FAIL ' + label + (extra ? '  <-- ' + extra : '')) }
-}
+const h = createHarness()
+const { ok } = h
 
 // 不要把状态写到真实的 ~/.dsh；也确保包形态的总开关处于默认（开）。
 process.env.DSH_HOME = path.join(os.tmpdir(), 'collab-skill-' + process.pid)
@@ -274,5 +273,4 @@ console.log('# degradation: missing skill file / broken services cannot break pl
   ok(captured.tools.map((t) => t.name).includes('collab_lock'), 'collab_lock survives a throwing skills.register')
 }
 
-console.log(`\n${fail === 0 ? 'ALL PASS' : 'FAILURES'}: ${pass} passed, ${fail} failed`)
-process.exit(fail === 0 ? 0 : 1)
+h.finish()

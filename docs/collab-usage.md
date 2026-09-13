@@ -52,9 +52,11 @@ ${DSH_HOME:-$HOME/.dsh}/collab/projects/<项目名>-<哈希>.json
 
 ### 1.4 委托纪律，以及在哪里关掉它
 
-除态势摘要外，插件还注入一段常驻的**委托与验收纪律**，并随包注册 `subagent-delegation` 技能，默认开启。它是包形态的一项设置：**设置 → 插件**（Settings → Plugins）里 `dsh-collab` 卡片上的复选框，对应字段 `exposeDelegationDiscipline`（`${DSH_HOME:-$HOME/.dsh}/settings.yaml`，布尔，默认 `true`）。
+除态势摘要外，插件还注入一段常驻的**委托与验收纪律**，并随包注册 `subagent-delegation` 技能，默认开启。它是包形态的一项设置：**设置 → 插件**（Settings → Plugins）里 `dsh-collab` 卡片上的下拉选择框（集群协作 / 关闭），对应字段 `exposeDelegationDiscipline`（`${DSH_HOME:-$HOME/.dsh}/settings.yaml`，布尔，默认 `true`）。
 
-取消勾选后，纪律文本与随包技能都不再注册，**中央注册锁与协作留言板照常可用**。设置是活读的，改完立即生效，无需重启 dsh。完整说明见 README 的「委托纪律偏好与设置卡片」。
+不选「关闭」时，纪律文本与随包技能都不再注册，**中央注册锁与协作留言板照常可用**。设置是活读的，改完立即生效，无需重启 dsh。完整说明见 README 的「委托纪律偏好与设置卡片」。
+
+同一张卡片上还有「原生写保护」下拉（拦截 / 不拦截，字段 `enforceWriteLock`，默认 `true`，同样活读）：开启时，写 / 改目标路径被**他人未过期的 `exclusive` 声明覆盖**会走原生审批路径拦截（本类部署通常没有审批提示，`ask` 等价于硬拒绝）；`shared` / `read` 声明不产生任何门控。`bash` / `pwsh` 没有目标路径参数，不受该门控保护。详见 README「功能 C」。
 
 ---
 
@@ -70,6 +72,7 @@ collab_lock op=claim paths=["src/backend/models/"] mode=exclusive ttlSec=1800 no
 - `mode`：三态，见下表。
 - `ttlSec`：租约秒数 `5–86400`，默认 `1800`（30 分钟）。`< 60` 时返回 **short-lease 警告**，提示按时心跳。
 - `note`：占用说明（最多 500 字）。
+- `readable`：可读性，默认 `true`。**写入对非持有者永远要协商；读取默认放行，只有持有者显式 `readable: false` 才要协商。** 该维度只对他人的 `exclusive` 声明生效 —— `shared` / `read` 声明上的 `readable: false` 既不拦写也不拦读。合并声明时不带 `readable` 不会重置已有取值（缺省≠改写）。
 
 | mode | 用途 | 阻塞他人 | 被他人阻塞 |
 | --- | --- | --- | --- |

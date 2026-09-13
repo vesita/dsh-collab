@@ -1,3 +1,5 @@
+import { createHarness } from './_harness.mjs'
+
 // collab-digest-stability.mjs
 // 态势摘要**文本时间稳定性**回归测试 —— 针对一个实测过的真实退化。
 //
@@ -18,11 +20,8 @@
 
 import { renderDigest, clockUtc } from '../lib/collab-core.js'
 
-let pass = 0, fail = 0
-const ok = (cond, label, extra) => {
-  if (cond) { pass++; console.log('  ok  ' + label) }
-  else { fail++; console.log('  FAIL ' + label + (extra ? '  <-- ' + extra : '')) }
-}
+const h = createHarness()
+const { ok } = h
 
 // 固定绝对时刻，测试完全不依赖真实时钟。
 const T0 = Date.UTC(2026, 0, 2, 3, 4, 37)
@@ -138,5 +137,4 @@ console.log('# f. the digest still points at the negotiation tools')
   ok(/。$/.test(text), 'digest is one sentence block ending in 。', text)
 }
 
-console.log(`\n${fail === 0 ? 'ALL PASS' : 'FAILURES'}: ${pass} passed, ${fail} failed`)
-process.exit(fail === 0 ? 0 : 1)
+h.finish()

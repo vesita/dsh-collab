@@ -26,18 +26,29 @@
 ├── crates/
 │   └── collab-cli/               # Rust 高性能 CLI 与 Git-aware 冲突预警工具
 ├── docs/
-│   ├── collab-plugin-design.md   # 完整设计文档（13 章 + 决策记录 + M1-M3 实现纪要）
-│   └── collab-usage.md           # 面向任意会话的使用指南
+│   ├── collab-plugin-design.md   # 完整设计文档（18 节 + 决策记录 + M1-M3 实现纪要）
+│   ├── collab-usage.md           # 面向任意会话的使用指南
+│   └── collab-ux-backlog.md      # 使用不便清单与优化方向（含实测使用统计）
 ├── scripts/
 │   ├── collab_models.py          # Python dataclass 模型定义（Schema 派生）
 │   └── simulate_collab.py        # Python (uv) 多 Agent 高并发冲突仿真与压测脚本
 ├── src/                          # TypeScript 源码（NodeNext 风格，import 写 ./x.js）
-│   ├── index.ts                  # 包入口：注册工具 + 注入协作态势 + 访问通知/写保护/读者推送
-│   ├── client.ts                 # 浏览器半边：Settings → Plugins 下的 dsh-collab 设置卡片
+│   ├── index.ts                  # **组合根**（60 行）：只做接线，按依赖顺序调用各 installer
+│   ├── contract.ts               # 对外契约类型（工具/服务/返回结构的类型面）
+│   ├── spec.ts                   # 纯常量与纯函数（工具路径规格、状态目录文案、sessionIdOf…）
 │   ├── collab-core.ts            # 纯逻辑唯一事实源（可 import / 可测 / 供多语言对照）
-│   ├── plugin-message.ts         # 插件通知消息（逐字复刻 dsh-llm 的 createUserMessage 语义）
-│   ├── collab-plugin.host.ts     # 自包含 Cordis Host 插件源码（导出 hostCode 字符串，可直接作为 code.host）
 │   ├── paths.ts                  # 状态目录的唯一路径事实源（绝对路径推导 + 历史落点）
+│   ├── store.ts                  # 状态文件存取 + 只读 op（list/overview/status/msgs/wait）
+│   ├── tools.ts                  # collab_lock / collab_board 注册（消费 store + push）
+│   ├── access.ts                 # 功能 A：访问通知（逐事件经 agent.inject 投递 form:'notice' 的显式来源消息）+ 读者反向注册（tools/post-execute）
+│   ├── gate.ts                   # 功能 C：写/读的原生审批门控（tools/pre-execute）
+│   ├── push.ts                   # 功能 D：释放推送 + 子代理回退通道 + agent/disposed 生命周期
+│   ├── awareness.ts              # 协作态势注入（运行时上下文 order 130）
+│   ├── delegation.ts             # 委托纪律：settings 偏好 + 随包 skill + 常驻纪律块（order 131）
+│   ├── skill.ts                  # 随包 skill 读盘与 buildSkillIndex（delegation 与路由共用）
+│   ├── client-route.ts           # 浏览器半边只读 loopback 路由（技能索引）
+│   ├── client.ts                 # 浏览器半边：Settings → Plugins 下的 dsh-collab 设置卡片
+│   ├── collab-plugin.host.ts     # 自包含 Cordis Host 插件源码（导出 hostCode 字符串，可直接作为 code.host）
 │   ├── schema/
 │   │   └── collab.schema.json    # JSON Schema v1：状态文档 + 工具参数（单一契约）
 │   └── types/
@@ -47,13 +58,21 @@
 │   └── subagent-delegation/
 │       └── SKILL.md              # 随包发布的委托与验收纪律技能
 └── tests/
+    ├── _harness.mjs                 # 共用断言脚手架（ok / skip / 汇总 / 退出码）
     ├── collab-pure-logic.mjs        # 纯逻辑回归 + hostCode 内联副本漂移守护
     ├── collab-integration.mjs       # Cordis 插件端到端（fake ctx）
-    ├── collab-hostcode-parity.mjs   # 动态宿主形态行为对拍（路径 + 三态语义 + holder 回收）
+    ├── collab-hostcode-parity.mjs   # 动态宿主形态**行为**对拍（路径 + 三态语义 + holder 回收）
+    ├── collab-inline-parity.mjs     # 两形态**同名函数**逐输出对拍（18 个，含集合回归守护）
+    ├── collab-contract-derivation.mjs # 契约派生守卫（schema ⇄ d.ts ⇄ Python ⇄ Rust ⇄ 真实工具 schema）
+    ├── collab-message-provenance.mjs # 规范守卫：严禁冒充用户（AGENTS.md §1）
+    ├── collab-digest-stability.mjs  # 态势摘要文本时间稳定性回归（运行时快照去重）
     ├── collab-awareness.mjs         # 多会话态势注入回归
-    ├── collab-access-gate.mjs       # 访问通知（post-execute）与原生写保护（pre-execute）回归
-    ├── collab-readers-push.mjs      # 读者反向注册 + 释放推送（含与真实 dsh-llm 的对拍）
-    └── collab-e2e.mjs               # 真实 fs + 临时 DSH_HOME 的端到端回归
+    ├── collab-access-gate.mjs       # 访问通知（agent.inject 的 notice 载体）与原生写保护（pre-execute）回归
+    ├── collab-readers-push.mjs      # 读者反向注册 + 释放推送 + 子代理回退 + 通知载体回归
+    ├── collab-e2e.mjs               # 真实 fs + 临时 DSH_HOME 的端到端回归
+    ├── collab-skill.mjs             # 随包 skill + 委托纪律 + 偏好设置回归
+    ├── collab-client-route.mjs      # Host 端技能索引路由（GET /dsh-collab/skill-index）回归
+    └── collab-skill-real.mjs        # 真实 DSH 部署上的委托纪律端到端（`npm run test:real`，不在 npm test 内）
 ```
 
 ---
@@ -65,7 +84,7 @@
 ```ts
 collabDir(env?)              // <dshHome>/collab/projects（绝对路径）
 projectStateFile(cwd, env?)  // 上面目录 + <项目名>-<哈希>.json
-legacyCollabDirs(env?)       // 历史落点，用于一次性迁移
+legacyCollabDirs(env?)       // 历史落点，用于一次性迁移（env 仅为契约对称保留，实现显式忽略它）
 ```
 
 该路径是**绝对路径**，因此与 DSH 进程的启动目录无关：从任何目录启动的 dsh 实例，同一项目都落到同一个文件。`<哈希>` 由会话 cwd（项目根绝对路径）确定性派生。
@@ -115,6 +134,10 @@ agents.currentInitiator()            → 正在装配的那个会话
 
 关闭方式：包形态设置环境变量 `DSH_COLLAB_NO_PROMPT_HINT=1`。受限的动态宿主形态读不到 `process.env`，因此它**始终注入**；需要彻底关闭时请使用包形态。
 
+同一个开关也管住**功能 A 的访问通知**（`plugin: 'dsh-collab'`、`form: 'notice'` 的消息）：它是运行时状态派生出来、再注入进会话的内容，所以 `DSH_COLLAB_NO_PROMPT_HINT=1` 下**不投递**。只关投递 —— 读者反向登记（功能 D）照常发生。这一条由 `tests/collab-access-gate.mjs` 钉住，并配了负向对照（摘掉开关判定 -> 该断言精确变红）。
+
+（受限的**动态宿主形态**不接线 `tools/pre-execute` / `tools/post-execute`，因此它本来就没有访问通知与原生写保护 —— 那是既定环境限制，与这个开关无关。见 `src/collab-plugin.host.ts`。）
+
 ---
 
 ## 委托纪律偏好与设置卡片
@@ -154,9 +177,42 @@ agents.currentInitiator()            → 正在装配的那个会话
 
 插件的**动态宿主形态**（`hostCode` 字符串）刻意不注册该技能：受限动态环境没有包目录、也没有 `import`，无法定位 `<pkg>/skills/subagent-delegation/SKILL.md`。这是环境限制，不是遗漏。
 
-包形态的 `DSH_COLLAB_NO_PROMPT_HINT=1` 关掉**所有**运行时上下文注入，纪律文本一并关闭（它不影响技能注册）。
+包形态的 `DSH_COLLAB_NO_PROMPT_HINT=1` 关掉**所有**运行时注入 —— 态势上下文、委托纪律文本、以及功能 A 的访问通知（后者也是运行时派生再注入进会话的内容）。它不影响技能注册。
 
 ---
+
+## 0.9.0：架构拆分、契约守卫与「跳过即失败」
+
+这一版**没有新增用户可见功能**，全是在夯地基——目标是让「两形态漂移」「契约漂移」「静默失败」
+这三类问题在**下一次改动时当场变红**，而不是靠事后排查。
+
+**架构**：1640 行的单体 `src/index.ts` 拆成 **11 个模块**，入口变成 60 行的**组合根**：只按依赖顺序
+调用各 installer，并把上一个 installer 的返回值显式传给下一个（**没有跨模块可变全局**）。
+对外导出面逐名不变。
+
+**三道新的守卫**（都进了 `npm test`）：
+
+- `tests/collab-inline-parity.mjs`：从动态形态的 `hostCode` 字符串里用**括号配对扫描**抽出
+  **全部 18 个两形态同名函数**逐输出对拍。此前只有 `clockUtc` / `renderDigest` 两个被比对；
+  并用「实测同名集合必须**恰好等于**期望集合」做回归守护——任何一侧新增同名函数却忘记接进对拍都会红。
+- `tests/collab-contract-derivation.mjs`：把「schema 是单一事实源」从**声称**变成**可执行**——
+  逐字段核对 `$defs` ⇄ `src/types/collab.d.ts` ⇄ `scripts/collab_models.py` ⇄
+  `crates/collab-cli/src/main.rs` ⇄ **真实注册**的工具 schema。
+- `.github/workflows/ci.yml`：Node 与 Rust 两个 job。
+
+**「跳过即失败」**：测试里任何「环境不满足所以跳过」的路径**默认判失败**；只有显式设
+`COLLAB_ALLOW_SKIP=1` 才放行，且会打印含「未验证」字样的横幅。绿的不等于验证过的。
+
+**不再谎报**：状态文件损坏自愈时，备份/重置的失败原先被静默吞掉、warning 却宣称
+「已备份 / 已重新初始化」；现在**如实**说明失败原因与**原始损坏内容此刻的下落**
+（已备份 / 被重置覆盖 / 仍原样留在磁盘上）。包形态与动态宿主形态**同步**修好，避免两形态在
+「损坏自愈是否谎报」上分叉。
+
+**契约修复**：Rust CLI 的 `Mode` 缺 `Read` —— 只要项目里有**一个**会话用过 `mode=read`
+（而插件自己就推荐只读调研用它），整个状态文件就会被 `Failed to parse JSON` 拒绝。已修，
+并补齐 `ConflictInfo` / `SuggestedAction` 与往返测试。
+
+**使用上已知的别扭之处与优化方向**：见 `docs/collab-ux-backlog.md`。
 
 ## 0.8.0：访问通知、原生写保护与读者推送
 
@@ -186,13 +242,32 @@ agents.currentInitiator()            → 正在装配的那个会话
 > 之后，所有人的写入都会被硬拒绝（本部署 `ask` = deny），`shared` 的两个共享方也会互相挡死。
 > 0.8.1 让门控与 `claim()` 用同一判据：**只有他人的 `exclusive` 声明阻塞他人**。
 
-### 功能 A — 访问时的路径相关通知（旁路投递）
+### 功能 A — 访问时的路径相关通知（逐事件经 `agent.inject` 投递 notice）
 
 插件监听 `tools/post-execute`：从本次调用的参数里递归提取候选路径（非空字符串 / 字符串数组），
 与共享状态里**他人的未过期声明**按「同父目录的旁支及其后代，或目标路径的祖先」匹配。
-命中且与上一次投递给同一个 agent 的内容不同时，把一条 `source.form = 'notice'` 的插件消息
-**前插**进该工具结果的 `additionalContexts`（不改 `content` / `value`，`block` 决策单独分支）。
-一次调用最多合并一条；内容逐字相同时原样放行；任何异常都等价于"这次没有通知"，绝不进入 waterfall。
+命中且与上一次投递给同一个 agent 的占用集合（`accessSignature`）不同时，经 `agent.inject` **逐事件**
+投递一条**显式标注来源**的 notice 消息：
+`createUserMessage({ content, source })`，其中
+`source = { kind: 'plugin', plugin: 'dsh-collab', form: 'notice', summary: boundContextSummary(...) }`。
+客户端按 `source.kind !== 'user'` 把它渲染成 **notice 行、不是用户气泡** —— 来源是明示的，
+冒充不了真人；`summary` 缺失时才会退化成 **opaque** 行，所以它必须非空（≤ 120 字符）。
+工具结果**原样返回**（`post-execute` 返回 `downstream` 本身，不产生 `content` / `value` /
+`additionalContexts` 任何改动）；一次调用最多投递一条；同一 agent 对同一组占用重复命中**不再投递**；
+`agent` 不存在或没有 `inject` 函数时**不投递**，且绝不退回"自己造一条消息"；
+任何异常都等价于"这次没有通知"，绝不进入 waterfall。
+
+> **规范**：**严禁冒充用户**（见 `AGENTS.md` §1）—— 消息可以投，来源必须诚实。
+> 这里曾经逐字复刻 `dsh-llm` 的 `createUserMessage`，并把消息塞进 `additionalContexts`；
+> 该副本（`src/plugin-message.ts`）已删除，且由 `tests/collab-message-provenance.mjs`
+> 守着不许复活。构造一律走**真实的** `@deepseek-ai/dsh-llm`：`id` / `role` / 深冻结
+> 全部由构造函数补。
+>
+> **历史教训**：这条规范一度被读成"**一份也不许构造**"，于是访问通知被逼去挤
+> `systemPrompt.context` 的运行时快照 —— 提交单位从"一行"变成**整份合并快照**
+> （持久化事件 581 B → 3124 B）、投递**依赖 `systemPrompt` 服务可用**、通知**没有自己的一行**。
+> 收窄到"禁止冒充"之后回到了生态的通行写法（对照 `dsh-tool-jobs:208-226` 的作业完成通知）。
+> 完整的代价与取舍数字见 `AGENTS.md` §1。
 
 通知文案与态势摘要同源：只用**绝对 UTC 租约窗口**，不含倒计时。
 
@@ -223,7 +298,7 @@ claim 增加可读性维度（`readable`，默认 `true`；缺字段的老状态
 
 ### 功能 D — 读者反向注册 + 释放推送
 
-每条 claim 增加 `readers`（holderId 列表，默认 `[]`）。**被通知这个动作本身就完成登记**：
+每条 claim 增加 `readers`（holderId 列表；**由 `publish()` / `readersOf()` 归一输出** `[]` —— 新 claim 初始为空，缺字段的老状态文件按空处理；schema 里的 `default: []` 只是文档性声明，运行时不回填它）。**被通知这个动作本身就完成登记**：
 功能 A 投递通知时把被通知者写入该 claim 的 `readers`（去重）。移除读者的路径**只有两条**：
 持有者释放，以及 `agent/disposed`（真正的会话结束，同时释放该 holder 的声明）。
 
@@ -258,7 +333,7 @@ claim 增加可读性维度（`readable`，默认 `true`；缺字段的老状态
   "released": [ /* 原样，未改动 */ ],
   "serverTime": 1789293294682,
   "notify": {
-    "readers": 2,                       // 该次涉及的去重读者数（pushed + skipped 的候选）
+    "readers": 2,                       // 该次涉及的读者数：按 sessionId 去重、非 agent holder 不计入（与下面 pushed/skipped 的逐 (claim, reader) 口径不同）
     "pushed": ["ses_me"],               // 真正投递成功的 sessionId
     "skipped": [
       { "sessionId": "ses_idle", "reason": "not-live" },              // 刻意不唤醒
@@ -269,9 +344,10 @@ claim 增加可读性维度（`readable`，默认 `true`；缺字段的老状态
 }
 ```
 
-`reason` 只有 `not-live` / `already-pushed` / `prompt-failed` 三种取值；`error` 只在
-`prompt-failed` 时出现，携带真实错误文本（`'timeout'`、`'no-session-controller'` 或 `prompt`
-抛出的原始 message）。凡是失败都仍是 best-effort：`release` 一定仍是 `ok:true`，绝不抛出。
+`reason` 在 0.8.3 只有 `not-live` / `already-pushed` / `prompt-failed` 三种取值；0.8.4 追加
+`not-adjacent` / `subagent-failed`（见下文），共 **5** 种。`error` 出现在后三种失败取值上，携带真实
+错误文本（`'timeout'`、`'no-session-controller'` 或 `prompt` 抛出的原始 message）；`not-live` /
+`already-pushed` 不带。凡是失败都仍是 best-effort：`release` 一定仍是 `ok:true`，绝不抛出。
 
 **子代理投递回退通道（0.8.4）**：读者如果是一个**由 subagent 路由托管的会话**，原生
 `prompt` 会被 DSH 结构化拒绝，错误与 DSH 自己给的指示（实测 + 源码 `dsh-api-session-controller/lib/index.js:137`）是：
@@ -346,16 +422,26 @@ npm test                # 依次运行下列全部测试
 
 node tests/collab-pure-logic.mjs       # 纯逻辑 + hostCode 漂移守护
 node tests/collab-integration.mjs      # Cordis 插件端到端（fake ctx）
-node tests/collab-hostcode-parity.mjs  # 动态宿主形态行为对拍
+node tests/collab-hostcode-parity.mjs  # 动态宿主形态**行为**对拍
+node tests/collab-inline-parity.mjs    # 两形态**同名函数**逐输出对拍（18 个 + 集合回归守护）
+node tests/collab-contract-derivation.mjs # 契约派生守卫（schema ⇄ d.ts ⇄ Python ⇄ Rust ⇄ 真实工具 schema）
+node tests/collab-message-provenance.mjs # 规范守卫：严禁冒充用户（AGENTS.md §1）
+node tests/collab-digest-stability.mjs # 态势摘要文本时间稳定性
 node tests/collab-awareness.mjs        # 多会话态势注入
-node tests/collab-access-gate.mjs      # 访问通知 + 原生写保护（真实 cordis waterfall）
-node tests/collab-readers-push.mjs     # readers 反向注册 + 释放推送 + 子代理回退通道 + 消息形状对拍
+node tests/collab-access-gate.mjs      # 访问通知（agent.inject 的 notice 载体）+ 原生写保护（真实 cordis waterfall）
+node tests/collab-readers-push.mjs     # readers 反向注册 + 释放推送 + 子代理回退通道 + 通知载体
 node tests/collab-e2e.mjs              # 真实 fs 路径/语义端到端（临时 DSH_HOME）
+node tests/collab-skill.mjs            # 随包 skill + 委托纪律 + 偏好设置
+node tests/collab-client-route.mjs     # Host 端技能索引路由（GET /dsh-collab/skill-index）
 
 pnpm run test:types                    # TypeScript 契约静态检查
+pnpm run test:real                     # 真实 DSH 部署上的委托纪律端到端（不在 npm test 内）
 uv run python scripts/simulate_collab.py
 cargo test --manifest-path crates/collab-cli/Cargo.toml
 ```
+
+**跳过即失败**：测试里任何"环境不满足所以跳过"的路径**默认判失败**。只有显式设
+`COLLAB_ALLOW_SKIP=1` 才放行，且会打印含「未验证」字样的横幅——绿的不等于验证过的。
 
 ---
 
@@ -366,12 +452,12 @@ cargo test --manifest-path crates/collab-cli/Cargo.toml
 | 行为 | 阈值 | 说明 |
 | --- | --- | --- |
 | 过期声明回收 | 租约到期 | 过期声明随每次读取失效，不再阻塞他人 |
-| 留言保留 | 最近 `MAX_MESSAGES = 2000` 条 | 超出部分从最旧的开始丢弃，写入时回报 `swept.droppedMessages` |
+| 留言保留 | 最近 `MAX_MESSAGES = 2000` 条 | 超出部分从最旧的开始丢弃，写入时回报 `swept.droppedMessages`（`swept` 是**条件字段**：仅当本次 `droppedMessages > 0` 或 `prunedHolders > 0` 时才出现在返回里，且不含 readers 相关字段） |
 | 陈旧 holder 回收 | 无活跃声明且 `HOLDER_TTL_MS = 24h` 未出现 | 回收由 `sweep()` 执行；`list` 另用 `holderView()` 给出 `ageSec` / `active` / `stale` 与 `staleHolders` |
 | holder 废弃预警 | 无活跃声明且静默 `HOLDER_STALE_WARN_MS = 1h` | `stale` 走这条更短的阈值，因此它是"看起来已废弃"的先行信号，在 `list` 上始终可达 |
 | 损坏状态自愈 | JSON 解析失败 | 备份为 `<state>.corrupt-<ts>` 后重置为空状态，并以 `warning` 上报 |
 
-工具返回统一信封：失败时 `error` / `message` 在顶层（`bad-request`、`not-found`、`conflict`、`forbidden`、`timeout`）。
+工具返回统一信封：失败时 `error` / `message` 在顶层（`bad-request`、`not-found`、`conflict`、`forbidden`、`timeout`、`concurrent-modification`、`internal`）。
 
 ---
 
@@ -399,3 +485,15 @@ pnpm pack --pack-destination <dist-dir>      # 生成 dsh-collab-<version>.tgz
 pnpm install --dir ~/.dsh/profiles/<profile>
 # 重启 dsh
 ```
+
+**坑（实测）**：**版本号不变**、只是重新打包时，`pnpm install --force` 会报
+"Already up to date / added 0"，`node_modules` 里**仍然是旧内容** —— lockfile 的 integrity
+已经更新成新包，但目录没有被重新链接。先删掉再装才可靠：
+
+```bash
+rm -rf ~/.dsh/profiles/<profile>/node_modules/dsh-collab
+pnpm install --dir ~/.dsh/profiles/<profile>
+```
+
+装完用 `diff -r lib ~/.dsh/profiles/<profile>/node_modules/dsh-collab/lib` 确认逐字节一致 ——
+「装了」和「装对了」是两件事。

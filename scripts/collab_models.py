@@ -8,7 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Optional, Literal
 
-Mode = Literal["exclusive", "shared"]
+Mode = Literal["exclusive", "shared", "read"]
 OpLock = Literal["claim", "release", "list", "overview", "status", "heartbeat", "wait"]
 OpBoard = Literal["post", "read"]
 SuggestedAction = Literal["wait", "negotiate", "switch_path"]
@@ -46,19 +46,18 @@ class Holder:
     name: str
     kind: Literal["agent", "human"]
     sessionId: Optional[str] = None
-    preset: Optional[str] = None
     lastSeenAt: Optional[int] = None
 
 @dataclass
 class StateDocument:
     schemaVersion: int
     seq: int
-    claims: List[Claim] = field(default_factory=list)
-    messages: List[Message] = field(default_factory=list)
-    holders: List[Holder] = field(default_factory=list)
+    claims: List[Claim]
+    messages: List[Message]
+    holders: List[Holder]
 
 @dataclass
-class Conflict:
+class ConflictInfo:
     claimId: str
     holderId: str
     path: str

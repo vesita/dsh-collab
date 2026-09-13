@@ -1,3 +1,5 @@
+import { createHarness } from './_harness.mjs'
+
 // collab-client-route.mjs
 // 浏览器半边唯一的 Host 依赖面：只读技能索引路由 GET /dsh-collab/skill-index 的回归测试。
 //
@@ -31,11 +33,8 @@ const mod = await import(path.join(ROOT, '../lib/index.js'))
 const collabPlugin = mod.default
 const { buildSkillIndex, CLIENT_SKILL_ROUTE, DELEGATION_SETTINGS_NAMESPACE } = mod
 
-let pass = 0, fail = 0
-const ok = (cond, label, extra) => {
-  if (cond) { pass++; console.log('  ok  ' + label) }
-  else { fail++; console.log('  FAIL ' + label + (extra ? '  <-- ' + extra : '')) }
-}
+const h = createHarness()
+const { ok } = h
 
 // 不要写真实的 ~/.dsh；并确保包形态总开关处于默认（开）。
 process.env.DSH_HOME = path.join(os.tmpdir(), 'collab-route-' + process.pid)
@@ -224,5 +223,4 @@ console.log('# (g) optional services: no webServer -> no route and no throw; no 
   await fiber.dispose()
 }
 
-console.log(`\n${fail === 0 ? 'ALL PASS' : 'FAILURES'}: ${pass} passed, ${fail} failed`)
-process.exit(fail === 0 ? 0 : 1)
+h.finish()

@@ -1,3 +1,5 @@
+import { createHarness } from './_harness.mjs'
+
 // collab-readers-push.mjs
 // 功能 D：锁上的读者反向注册（readers）+ 释放后的原生推送（sessionController.prompt）
 //         + 0.8.4 的子代理投递回退通道（subagents.sendMessage）。
@@ -17,19 +19,26 @@
 //      pushedVia 标出通道；不邻接 -> reason 'not-adjacent'；其它回退失败 -> 'subagent-failed'；
 //      服务缺失 / 拿不到活 Agent -> 一次都不尝试；**非路由**的 prompt 失败（含同 code 的
 //      'prompt rejected'）不触发回退；
-//   9) 通知消息本身与真实 @deepseek-ai/dsh-llm 的 createUserMessage **现场对拍**
-//      （解析不到真身时显式 SKIP，不伪装成通过）。
+//   9) 通知**载体**：不再**手抄** UserMessage 构造函数、也不再有副本（AGENTS.md §1「严禁冒充用户」）
+//      —— 构造一律走真实的 `@deepseek-ai/dsh-llm`，只是 source 必须显式非 user；
+//      `src/plugin-message.ts` 与 `lib/plugin-message.js` 都已删除；post-execute 的决策对象上
+//      **没有** additionalContexts 键、且**原样返回 downstream**；通知改由 `agent.inject` 逐事件
+//      投递一条**显式标注来源**的 notice（`source = {kind:'plugin', plugin:'dsh-collab',
+//      form:'notice', summary}`）—— 客户端按 `source.kind !== 'user'` 渲染成 **notice 行、
+//      不是用户气泡**，`summary` 缺失才会退化成 opaque 行。
 //
 // 明确不覆盖（无法在没有活部署时验证）：真实 sessionController.prompt 的端到端投递、
 // **真实 subagents.sendMessage 的端到端投递**（邻接判定、cold-resume、sender 同一性都只有
-// DSH 自己那份实现说了算）、真实 agents 注册表的活性语义、真实会话被 steer/queue 后的行为。
-// 下面的 subagents 是**假服务**，验证的是本插件侧的契约（调用时机 / 参数形状 / 记账），
-// 不是"真机上一定能投到"。见文件末尾的说明与报告。
+// DSH 自己那份实现说了算）、真实 agents 注册表的活性语义、真实会话被 steer/queue 后的行为、
+// 以及"agent.inject 的消息真的进了 next-step 收件箱"（那要活部署的会话日志）。下面的 subagents、
+// systemPrompt 与 agent 上的 inject 都是**假服务**，验证的是本插件侧的契约
+// （调用时机 / 参数形状 / 记账 / 注册形状），不是"真机上一定能投到"。见文件末尾的说明与报告。
 //
 // 运行：node tests/collab-readers-push.mjs
 
 import path from 'node:path'
 import os from 'node:os'
+import { readFileSync, existsSync } from 'node:fs'
 
 const cordis = await import('@deepseek-ai/cordis').catch(() => import('../node_modules/.pnpm/node_modules/@deepseek-ai/cordis/lib/index.js'))
 const { Context } = cordis
@@ -45,12 +54,11 @@ const collabPlugin = mod.default
 const { sessionIdOf } = mod
 const { registerReader, dropHolder, readersOf, sweep, init } = core
 
-let pass = 0, fail = 0, skipped = 0
-const ok = (cond, label, extra) => {
-  if (cond) { pass++; console.log('  ok  ' + label) }
-  else { fail++; console.log('  FAIL ' + label + (extra ? '  <-- ' + extra : '')) }
-}
-const skip = (label) => { skipped++; console.log('  SKIP ' + label) }
+const h = createHarness({ skipped: true })
+// 本文件已无任何"跳过"分支（真身对拍随 src/plugin-message.ts 一起删除了），
+// 因此不再解构 skip()：留着它就是死代码，且会暗示这里还有未验证项。
+// 汇总行仍由 harness 打印 ", 0 skipped" —— 在没有跳过项时这是实话。
+const { ok } = h
 
 const CWD = '/fake/project/readers'
 const HOUR = 3600 * 1000
@@ -214,6 +222,9 @@ const subagentError = (code, message) => {
  * @param opts.sendHangs    subagents.sendMessage 永不 resolve（验证回退超时护栏）
  * @param opts.withController 是否提供 sessionController
  * @param opts.withSubagents  是否提供 subagents（默认提供；false = 服务缺失）
+ * @param opts.agentsGetThrows agents.get 是否抛异常（存活判据本身坏了 — 基础设施故障）
+ * @param opts.timerThrowsWhenArmed ctx.timer.timeout 在 armTimer() 之后是否抛异常
+ *        （在**读者处理途中**制造一个未预期异常，用来验证 notifyReaders 的整体兜底会不会记账）
  */
 async function makeHarness(opts = {}) {
   const store = new Map()
@@ -221,6 +232,7 @@ async function makeHarness(opts = {}) {
   const tools = []
   const prompts = []
   const sends = []
+  const timerState = { armed: false }
   const statePath = projectStateFile(CWD)
   if (opts.claims) {
     store.set(statePath, JSON.stringify({ schemaVersion: 1, seq: opts.claims.length, claims: opts.claims, messages: [], holders: [] }))
@@ -229,18 +241,39 @@ async function makeHarness(opts = {}) {
   const ctx = new Context()
   const withController = opts.withController !== false
   const withSubagents = opts.withSubagents !== false
-  for (const n of ['tools', 'timer', 'fs', 'sessions', 'sessionTitle', 'agents']) ctx.provide(n)
+  for (const n of ['tools', 'timer', 'fs', 'sessions', 'sessionTitle', 'agents', 'systemPrompt']) ctx.provide(n)
   if (withController) ctx.provide('sessionController')
   if (withSubagents) ctx.provide('subagents')
   ctx.set('tools', { register: (t) => { tools.push(t); return () => {} } })
-  ctx.set('timer', { timeout: (ms) => new Promise((r) => setTimeout(r, ms)), interval: () => () => {} })
+  ctx.set('timer', {
+    timeout: (ms) => {
+      // 只在显式 arm 之后抛：插件装载期与其它 op 的 timer 调用不受影响。
+      if (opts.timerThrowsWhenArmed && timerState.armed) throw new Error('timer service exploded')
+      return new Promise((r) => setTimeout(r, ms))
+    },
+    interval: () => () => {}
+  })
   ctx.set('fs', makeFs(store, versions))
   ctx.set('sessions', { get: () => ({ header: { cwd: CWD } }) })
   ctx.set('sessionTitle', { get: () => ({ title: 'Push Worker' }) })
   ctx.set('agents', {
     currentInitiator: () => undefined,
     list: () => [],
-    get: (id) => ((opts.liveSessions || []).includes(id) ? { id } : undefined)
+    get: (id) => {
+      if (opts.agentsGetThrows) throw new Error('agents registry exploded')
+      return (opts.liveSessions || []).includes(id) ? { id } : undefined
+    }
+  })
+  // 假 systemPrompt：只记录注册进来的运行时上下文段（与 tests/collab-awareness.mjs、
+  // tests/collab-skill.mjs 的假服务同形），disposer 从活集合里摘掉该段。
+  // 本文件只关心**注册形状**（名称 / order），不在这里跑 text() 的取用逻辑
+  // （那属于 collab-access-gate.mjs）。
+  const contexts = new Map()
+  ctx.set('systemPrompt', {
+    context: (c) => {
+      contexts.set(c.name, c)
+      return () => { if (contexts.get(c.name) === c) contexts.delete(c.name) }
+    }
   })
   if (withController) {
     ctx.set('sessionController', {
@@ -279,11 +312,30 @@ async function makeHarness(opts = {}) {
     const agent = agentId && typeof agentId === 'object' ? agentId : { id: agentId, session: { header: { cwd: CWD } } }
     return lock.execute(args, { agent })
   }
-  const post = (exec) => ctx.waterfall('tools/post-execute', exec, { kind: 'accept' }, () => Promise.resolve({ kind: 'accept' }))
-  return { ctx, tools, lock, prompts, sends, store, statePath, readState, writeState, callLock, post }
+  /** 驱动 post-execute 瀑布：返回 { decision, downstream, nextCalls }（与 collab-access-gate.mjs 同形）。 */
+  const post = async (exec, downstream = { kind: 'accept' }) => {
+    const produced = { ...downstream }
+    let nextCalls = 0
+    const decision = await ctx.waterfall('tools/post-execute', exec, produced, () => {
+      nextCalls++
+      return Promise.resolve(produced)
+    })
+    return { decision, downstream: produced, nextCalls }
+  }
+  return { ctx, tools, lock, prompts, sends, store, statePath, readState, writeState, callLock, post, contexts, armTimer: () => { timerState.armed = true } }
 }
 
-const AGENT_ME = { id: 'me', session: { header: { cwd: CWD } } }
+// ── agent.inject 捕获：通知载体（`form:'notice'` 的显式来源消息）的观测点 ──
+// 第 3 节用它断言"通知真的逐事件经 agent.inject 投出、且来源显式非 user"。
+// 第 2 节只关心 readers 反向登记，不看 inject。
+let injectLog = []
+const resetInject = () => { injectLog = [] }
+/** 从 inject 记录里取正文（防御性：拿不到就返回空串，让断言失败而不是抛）。 */
+const noticeText = (entry) => (entry && entry.message && entry.message.content && entry.message.content[0] && entry.message.content[0].text) || ''
+/** 带记录器的假 agent：inject 把每次调用记进 injectLog。 */
+const withInject = (id) => ({ id, session: { header: { cwd: CWD } }, inject: (m) => injectLog.push({ agent: id, message: m }) })
+
+const AGENT_ME = withInject('me')
 const readExec = (filePath, agent = AGENT_ME) => ({ name: 'read', arguments: { file_path: filePath }, agent })
 
 console.log('# 通知 = 反向注册：被通知的 agent 进入 claim.readers，且不重复')
@@ -691,47 +743,172 @@ console.log('# 已知限制：TTL 自然到期不推送（没有事件源）')
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// 3. 通知消息与真实 @deepseek-ai/dsh-llm 对拍
+// 2.5 内部故障必须可解释：兜底记账 / 存活判据三态 / tools.ts 兜底形状
 // ════════════════════════════════════════════════════════════════════════
-console.log('# createUserMessage 与真实 dsh-llm 现场对拍')
+console.log('# 推送链路的整体兜底：读者处理途中抛异常必须记账（item 4）')
 {
-  const ours = await import(path.join(ROOT, '../lib/plugin-message.js'))
-  const input = {
-    content: [{ type: 'text', text: 'hello' }],
-    source: { kind: 'plugin', plugin: 'dsh-collab', form: 'notice', summary: 'sum' }
-  }
-  const real = await import('@deepseek-ai/dsh-llm')
-    .catch(() => import('../node_modules/.pnpm/node_modules/@deepseek-ai/dsh-llm/lib/index.js'))
-    .catch(() => null)
-  const mine = ours.createUserMessage(input)
-  if (!real || typeof real.createUserMessage !== 'function' || typeof real.freezeMessage !== 'function') {
-    // 显式 SKIP：不把"对拍不了"伪装成通过。此时仍有形状断言兜底。
-    skip('无法解析到 @deepseek-ai/dsh-llm（真身），对拍未执行 —— 只跑下方的形状断言')
-    ok(Object.keys(mine).sort().join(',') === 'content,id,role,source', '（无真身时）形状断言：键集合', Object.keys(mine).join(','))
-  } else {
-    const theirs = real.createUserMessage(JSON.parse(JSON.stringify(input)))
-    ok(Object.keys(mine).sort().join(',') === Object.keys(theirs).sort().join(','),
-      '键集合与真身一致', Object.keys(mine).sort().join(',') + ' vs ' + Object.keys(theirs).sort().join(','))
-    ok(mine.role === theirs.role && mine.role === 'user', 'role 一致且为 user')
-    ok(JSON.stringify(mine.content) === JSON.stringify(theirs.content), 'content 一致')
-    ok(JSON.stringify(mine.source) === JSON.stringify(theirs.source), 'source 一致', JSON.stringify(mine.source))
-    ok(typeof mine.id === 'string' && mine.id.length === theirs.id.length, 'id 长度一致（uuid 字符串）', String(mine.id) + ' vs ' + String(theirs.id))
-    ok(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(mine.id), "id 是 v4 uuid（与真身同形）")
-    const frozen = (o) => Object.isFrozen(o) && Object.isFrozen(o.content) && Object.isFrozen(o.content[0]) && Object.isFrozen(o.source)
-    ok(frozen(mine) === true, '我们的实现深冻结（与 freezeMessage 语义一致）')
-    ok(frozen(theirs) === true, '真身的输出同样深冻结（证明对拍的是同一语义）')
-    // freezeMessage：保身份地深冻结（不换 id）
-    const kept = real.freezeMessage({ id: 'fixed-id', role: 'user', content: [{ type: 'text', text: 'x' }], source: { kind: 'user' } })
-    ok(kept.id === 'fixed-id' && Object.isFrozen(kept), '真身 freezeMessage 保留身份并冻结')
-    const ourKept = ours.freezeMessage({ id: 'fixed-id', role: 'user', content: [{ type: 'text', text: 'x' }], source: { kind: 'user' } })
-    ok(ourKept.id === 'fixed-id' && Object.isFrozen(ourKept), '我们的 freezeMessage 同样保留身份并冻结')
-    ok(JSON.stringify(ourKept) === JSON.stringify(kept), 'freezeMessage 的输出逐字节一致')
-    // 摘要上限：真身 120 字符（CONTEXT_SUMMARY_MAX_CHARS）
-    ok(real.CONTEXT_SUMMARY_MAX_CHARS === ours.CONTEXT_SUMMARY_MAX_CHARS, '摘要上限常量与真身一致', String(real.CONTEXT_SUMMARY_MAX_CHARS))
-    const long = 'x'.repeat(200)
-    ok(ours.boundContextSummary(long) === long.slice(0, 119) + '…', 'boundContextSummary 截断到 120 字符')
-  }
+  const foreign = mkClaim({ claimId: 'c_boom', holderId: 'agent:owner', holderName: 'Owner', paths: ['src/a/'], readers: ['agent:me'], expiresAt: Date.now() + HOUR })
+  // timer.timeout 在 arm 之后抛：这条异常发生在**读者处理途中**（pushOne 里建超时护栏那一步），
+  // 真缺陷下它会被整体兜底静默吞掉 —— 于是 readers=1 却 pushed+skipped=0，无人能解释。
+  const hb = await makeHarness({ claims: [foreign], liveSessions: ['me'], timerThrowsWhenArmed: true })
+  hb.armTimer()
+  const res = await hb.callLock({ op: 'release', claimId: 'c_boom' }, 'owner')
+  const n = res && res.data && res.data.notify
+  ok(res.ok === true, 'release 本身仍然成功（推送是旁路，兜底不得影响工具结果）', JSON.stringify(res && { ok: res.ok }))
+  ok(n && n.readers === 1 && n.pushed.length === 0, '候选读者 1 人、成功投递 0 条', JSON.stringify(n))
+  ok(n && n.pushed.length + n.skipped.length === 1,
+    'item 4：pushed + skipped 与候选条数对得上（整体兜底不再静默截断）',
+    JSON.stringify(n && { pushed: n.pushed, skipped: n.skipped }))
+  ok(n && n.skipped.length === 1 && n.skipped[0].reason === 'internal',
+    'item 4：兜底补记的是 reason=internal 的记录', JSON.stringify(n && n.skipped))
+  ok(n && n.skipped.length === 1 && String(n.skipped[0].error || '').includes('timer service exploded'),
+    'item 4：internal 记录带真实错误文本', JSON.stringify(n && n.skipped))
 }
 
-console.log(`\n${fail === 0 ? 'ALL PASS' : 'FAILURES'}: ${pass} passed, ${fail} failed, ${skipped} skipped`)
-process.exit(fail === 0 ? 0 : 1)
+console.log('# tools.ts 的 release 兜底：内部错误与「没有读者」必须可区分（item 5 / item 7）')
+{
+  const { installStore } = await import(path.join(ROOT, '../lib/store.js'))
+  const { installTools } = await import(path.join(ROOT, '../lib/tools.js'))
+  const { installPush } = await import(path.join(ROOT, '../lib/push.js'))
+  // 直接装 store + tools，并把 notifyReaders 换成**必抛**的假实现：
+  // 这是唯一能命中 releaseWithNotify 兜底 catch 的路径（真实 notifyReaders 已经自己记账、不再抛）。
+  const boot = async (readerList, pushFactory) => {
+    const store = new Map()
+    const versions = new Map()
+    const statePath = projectStateFile(CWD)
+    store.set(statePath, JSON.stringify({
+      schemaVersion: 1, seq: 1,
+      claims: [mkClaim({ claimId: 'c_x', holderId: 'agent:owner', holderName: 'Owner', paths: ['src/a/'], readers: readerList, expiresAt: Date.now() + HOUR })],
+      messages: [], holders: []
+    }))
+    versions.set(statePath, 1)
+    const tools = []
+    const ctx = new Context()
+    for (const serviceName of ['tools', 'timer', 'fs', 'sessions', 'sessionTitle']) ctx.provide(serviceName)
+    ctx.set('tools', { register: (t) => { tools.push(t); return () => {} } })
+    ctx.set('timer', { timeout: (ms) => new Promise((r) => setTimeout(r, ms)), interval: () => () => {} })
+    ctx.set('fs', makeFs(store, versions))
+    ctx.set('sessions', { get: () => ({ header: { cwd: CWD } }) })
+    ctx.set('sessionTitle', { get: () => ({ title: 'Push Worker' }) })
+    const storeApi = installStore(ctx)
+    installTools(ctx, storeApi, pushFactory(ctx, storeApi))
+    return tools.find((t) => t.name === 'collab_lock')
+  }
+  const release = (lock) => lock.execute({ op: 'release', claimId: 'c_x' }, { agent: { id: 'owner', session: { header: { cwd: CWD } } } })
+  const lockBoom = await boot(['agent:me'], () => ({ notifyReaders: async () => { throw new Error('notify exploded') } }))
+  const a = await release(lockBoom)
+  const an = a && a.data && a.data.notify
+  ok(a.ok === true, 'notifyReaders 抛错时 release 结果本身不变', JSON.stringify(a && { ok: a.ok }))
+  ok(an && an.skipped.length === 1 && an.skipped[0].reason === 'internal' && String(an.skipped[0].error).includes('notify exploded'),
+    'item 5：兜底形状是「带错误文本的 internal 记录」，而不是空的 { readers: 0, skipped: [] }', JSON.stringify(an))
+  // 对照：真的没有读者时，真实 notifyReaders 仍返回空汇总（不得因为"加了一条 internal"而误报）
+  const lockEmpty = await boot([], (c, s) => installPush(c, s))
+  const b = await release(lockEmpty)
+  const bn = b && b.data && b.data.notify
+  ok(bn && bn.readers === 0 && bn.pushed.length === 0 && bn.skipped.length === 0 && bn.pushedVia.length === 0,
+    'item 5 对照：真的没有读者时汇总仍为空（readers=0 / skipped=[]）', JSON.stringify(bn))
+  ok(an && bn && !(an.readers === bn.readers && an.pushed.length === bn.pushed.length && an.skipped.length === bn.skipped.length),
+    'item 5：内部错误与「没有读者」在返回值上可区分（不再逐字同形）', JSON.stringify({ internalError: an, noReaders: bn }))
+}
+
+console.log('# 存活判据三态：agents.get 抛异常 ≠ 读者没在线（item 6）')
+{
+  const foreign = mkClaim({ claimId: 'c_live', holderId: 'agent:owner', holderName: 'Owner', paths: ['src/a/'], readers: ['agent:me'], expiresAt: Date.now() + HOUR })
+  const hf = await makeHarness({ claims: [foreign], agentsGetThrows: true })
+  const res = await hf.callLock({ op: 'release', claimId: 'c_live' }, 'owner')
+  const n = res && res.data && res.data.notify
+  ok(n && n.readers === 1 && n.pushed.length === 0, '判据坏了也一条都不推（安全侧不变）', JSON.stringify(n && { readers: n.readers, pushed: n.pushed }))
+  ok(n && n.skipped.length === 1 && n.skipped[0].reason === 'liveness-check-failed',
+    'item 6：agents.get 抛异常时记 reason=liveness-check-failed', JSON.stringify(n && n.skipped))
+  ok(n && n.skipped.length === 1 && n.skipped[0].reason !== 'not-live',
+    'item 6：基础设施故障**不得**被折叠成 not-live（谎报"读者没在线"）', JSON.stringify(n && n.skipped))
+  ok(n && String(n.skipped[0].error || '').includes('agents registry exploded'),
+    'item 6：第三态带真实错误文本', JSON.stringify(n && n.skipped))
+  // 对照：读者真的没在线（agents.get 返回 undefined）仍是 not-live，且不带 error
+  const coldClaim = mkClaim({ claimId: 'c_cold', holderId: 'agent:owner', holderName: 'Owner', paths: ['src/a/'], readers: ['agent:me'], expiresAt: Date.now() + HOUR })
+  const hg = await makeHarness({ claims: [coldClaim], liveSessions: [] })
+  const cold = await hg.callLock({ op: 'release', claimId: 'c_cold' }, 'owner')
+  const cn = cold && cold.data && cold.data.notify
+  ok(cn && cn.skipped.length === 1 && cn.skipped[0].reason === 'not-live' && cn.skipped[0].error === undefined,
+    'item 6 对照：会话确实没在线时仍是 not-live（既有取值语义不变）', JSON.stringify(cn && cn.skipped))
+}
+
+console.log('# 源码级：agent/disposed 路径的注释与实现必须一致（item 8）')
+{
+  const src = readFileSync(path.join(ROOT, '../src/push.ts'), 'utf8')
+  const start = src.indexOf("ctx.on('agent/disposed'")
+  const region = start >= 0 ? src.slice(start) : ''
+  ok(region.length > 0, '定位到 agent/disposed 处理器区块（扫描本身有效）', 'start=' + start)
+  // 原缺陷：`.then(res => { try { … } catch (e) {} })`，注释却讲该路径会如实记账。
+  // 这里断言那层**死 catch** 已经不在（notifyReaders 是 async，调用点不会同步抛）。
+  const thenStart = region.indexOf('.then(res => {')
+  const thenEnd = region.indexOf('.catch(() => {})')
+  const thenBody = thenStart >= 0 && thenEnd > thenStart ? region.slice(thenStart, thenEnd) : ''
+  ok(thenBody.length > 0 && !/\btry\s*\{/.test(thenBody),
+    'item 8：agent/disposed 的 .then 回调里不再有空的 try/catch（死 catch 已删）',
+    JSON.stringify(thenBody.slice(0, 120)))
+  ok(!/不静默[\s\S]{0,600}?catch\s*\(\w+\)\s*\{\s*\}/.test(region),
+    'item 8：区块内不存在「注释宣称不静默 + 紧跟空 catch」的自相矛盾')
+  ok(/刻意保持静默/.test(region), 'item 8：该路径的静默被显式写成"刻意保持静默"（注释与实现对齐）')
+}
+
+console.log('# 源码级：releaseWithNotify 兜底里不再有「不可能抛」的嵌套 try/catch（item 7）')
+{
+  const src = readFileSync(path.join(ROOT, '../src/tools.ts'), 'utf8')
+  const start = src.indexOf('async function releaseWithNotify')
+  const end = src.indexOf('const boardHandler')
+  const region = start >= 0 && end > start ? src.slice(start, end) : ''
+  ok(region.length > 0, '定位到 releaseWithNotify 区块（扫描本身有效）', 'start=' + start)
+  const catchIdx = region.indexOf('} catch (e) {')
+  const stop = region.indexOf('return res', catchIdx)
+  const catchBody = catchIdx >= 0 && stop > catchIdx ? region.slice(catchIdx, stop) : ''
+  ok(catchBody.length > 0, '定位到兜底 catch 的函数体', JSON.stringify(catchBody.slice(0, 80)))
+  ok(catchBody.length > 0 && !/\btry\s*\{/.test(catchBody),
+    'item 7：兜底 catch 内不再嵌套 try/catch（给普通对象赋字段不可能抛，纯复制粘贴）',
+    JSON.stringify(catchBody.slice(0, 160)))
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// 3. 通知载体：显式来源的 notice 经 agent.inject 逐事件投递（AGENTS.md §1 的可执行版本）
+// ════════════════════════════════════════════════════════════════════════
+// 旧机制在这里与真实 @deepseek-ai/dsh-llm 的 createUserMessage 现场对拍。真身对拍已随
+// 副本（src/plugin-message.ts）一起删除 —— 现在没有"我们的消息实现"可以对拍了，
+// 于是这一节改为断言**新载体**的契约：来源显式非 user 的 notice + agent.inject 逐事件投递。
+console.log('# 通知载体：手抄的消息副本已删除，通知经 agent.inject 投递 form:notice 的显式来源消息')
+{
+  // (a) 副本本身**必须不存在**：留着它就会有人再用一次。
+  ok(!existsSync(path.join(ROOT, '../lib/plugin-message.js')), '构建产物 lib/plugin-message.js 不存在（副本不许复活）')
+  ok(!existsSync(path.join(ROOT, '../src/plugin-message.ts')), '源码 src/plugin-message.ts 不存在（副本不许复活）')
+
+  // (b) post-execute 的决策对象上没有 additionalContexts 键，且**原样返回 downstream 本身**。
+  const foreign = mkClaim({ claimId: 'c_carrier', holderId: 'agent:owner', holderName: 'Owner', paths: ['src/a/'], expiresAt: Date.now() + HOUR })
+  const h = await makeHarness({ claims: [foreign], liveSessions: ['me'] })
+  resetInject()
+  const { decision, downstream } = await h.post(readExec('src/a/1'))
+  ok(decision && !Object.prototype.hasOwnProperty.call(decision, 'additionalContexts'),
+    'post-execute 的决策对象上没有 additionalContexts 键', Object.keys(decision || {}).join(','))
+  ok(decision === downstream && decision.kind === 'accept',
+    'post-execute **原样返回 downstream 本身**（===，不改工具结果）', JSON.stringify(decision))
+
+  // (c) 通知真的经 agent.inject 投出，且来源显式（kind / plugin / form + 非空 summary）。
+  ok(injectLog.length === 1, '命中后 agent.inject 恰好调用一次', 'injects=' + injectLog.length)
+  const msg = injectLog[0] && injectLog[0].message
+  const source = msg && msg.source
+  ok(!!source && source.kind === 'plugin' && source.plugin === 'dsh-collab' && source.form === 'notice',
+    "inject 收到的消息 source 是 {kind:'plugin', plugin:'dsh-collab', form:'notice'}", JSON.stringify(source))
+  ok(!!source && typeof source.summary === 'string' && source.summary.length > 0,
+    'source.summary 是非空字符串（notice 缺它会退化成 opaque 行）', JSON.stringify(source && source.summary))
+  ok(!!msg && msg.role === 'user' && Object.isFrozen(msg),
+    '消息是冻结的 user 角色（role / id / 深冻结都由构造函数补）',
+    JSON.stringify({ role: msg && msg.role, frozen: !!(msg && Object.isFrozen(msg)) }))
+  ok(noticeText(injectLog[0]).includes('src/a/'), '正文点出被占路径', JSON.stringify(noticeText(injectLog[0])))
+
+  // (d) 载体**不是** systemPrompt 上下文段：假 systemPrompt 是活的（awareness 段被它接住），
+  //     所以"没有 access 段"是一条**非空**断言。
+  ok(h.contexts.has('dsh-collab/awareness'), '假 systemPrompt 确实接住了其它上下文段（否则下一条是空断言）',
+    JSON.stringify([...h.contexts.keys()]))
+  ok(!h.contexts.has('dsh-collab/access'), '**不再**注册 dsh-collab/access 上下文段（载体已换）',
+    JSON.stringify([...h.contexts.keys()]))
+}
+
+h.finish()

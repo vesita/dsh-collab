@@ -1,0 +1,134 @@
+// src/access.ts
+// **功能 A：访问路径相关通知 —— 逐事件投递一条显式标注来源的 notice 消息。**
+//
+// 载体（规范见 AGENTS.md §1「严禁冒充用户」）：
+//   source = { kind: 'plugin', plugin: 'dsh-collab', form: 'notice', summary }
+// 客户端的分流判据只有一条 —— `source.kind !== 'user'` ⇒ 渲染成 context 节点
+// （`dsh-client-ui-chat/lib/client.js:6058`），所以这条消息是 **notice 行，不是用户气泡**：
+// 它明确标注了来源，冒充不了用户。这是生态里逐事件通知的标准写法
+// （对照 `dsh-tool-jobs/lib/index.js:208-226`）。
+//
+// 投递用 `agent.inject`：契约是 `send(message, "next-step", wakeup=false)`
+// （`dsh-agent/lib/types/runtime-types.d.ts:209`、实现 `dsh-agent-loop/lib/index.js:795`）
+// —— 进入下一步但不唤醒 driver。
+//
+// **不手抄构造函数**：`createUserMessage` / `boundContextSummary` 都来自真实的
+// `@deepseek-ai/dsh-llm`（peer + dev 依赖），本仓库不再自制副本。
+//
+// 与功能 D 的接缝：被通知即被登记为读者（registerAccessReaders）。
+
+import { boundContextSummary, createUserMessage } from '@deepseek-ai/dsh-llm'
+import { relToProject, claimsForAccess, registerReader, renderAccessNotice } from './collab-core.js'
+import type { Claim } from './collab-core.js'
+import { collectPathCandidates, accessSignature } from './spec.js'
+import type { AgentLike, CollabContext } from './contract.js'
+import type { StateStore } from './store.js'
+
+export function installAccess(ctx: CollabContext, store: StateStore): void {
+  // 包形态的关闭开关，与 awareness(130) / delegation(131) **同一个总开关**：
+  // `DSH_COLLAB_NO_PROMPT_HINT=1` 的契约是"关掉**所有**运行时注入的内容"。
+  // 访问通知是由运行时状态派生、再注入进会话的，所以这个开关对它同样有效 ——
+  // 换载体（上下文段 → agent.inject）**不该顺手改掉用户的开关语义**：旧实现是靠
+  // "拿不到上下文注册面就没有载体"顺带实现这一条的，现在显式判定。
+  // 只关**投递**；读者反向登记（功能 D）照常发生，与换载体前一致。
+  const NOTICE_ENABLED = process.env.DSH_COLLAB_NO_PROMPT_HINT !== '1'
+
+  // 按 agent 去重：exec.agent 是稳定对象（先例 dsh-repeat-tool-reminder/lib/index.js:1462 用
+  // WeakMap 键在 agent 上），键不会拦住共享状态文件里的任何东西，也不会泄漏 agent。
+  const accessNotified = new WeakMap<object, string>()
+
+  /**
+   * 算出本次访问命中的"他人的活跃声明"。返回 null 表示"没有可用路径 / 没有命中"，
+   * duplicate=true 表示"与上一次投递给同一 agent 的内容逐字相同"（不再重复通知）。
+   * 纯读，不写状态；失败由调用方兜。
+   */
+  async function accessEntries(execCtx: any): Promise<{ id: string | null; agent?: AgentLike; entries: Claim[]; duplicate: boolean } | null> {
+    const candidates = collectPathCandidates(execCtx && execCtx.arguments)
+    if (!candidates.length) return null
+    const agent = execCtx && execCtx.agent
+    const id = agent && agent.id ? String(agent.id) : null
+    const cwd = await store.cwdOf(id, agent)
+    const mine = id ? 'agent:' + id : 'human:console'
+    const { state } = await store.load(id, agent)
+    const t = store.now()
+    const seen = new Set<string>()
+    const entries: Claim[] = []
+    for (const raw of candidates) {
+      const rel = relToProject(raw, cwd)
+      if (!rel) continue
+      for (const c of claimsForAccess(state.claims, rel, t)) {
+        if (c.holderId === mine || seen.has(c.claimId)) continue
+        seen.add(c.claimId)
+        entries.push(c)
+      }
+    }
+    if (!entries.length) return null
+    const signature = accessSignature(entries)
+    const key = agent && typeof agent === 'object' ? agent : null
+    if (key && accessNotified.get(key) === signature) return { id, agent, entries, duplicate: true }
+    if (key) accessNotified.set(key, signature)
+    return { id, agent, entries, duplicate: false }
+  }
+
+  /**
+   * 功能 D 的反向注册：把本次访问者登记为这些 claim 的读者。
+   * "被锁通知"这个动作本身就是登记 —— 投递与登记是同一件事。
+   * best-effort：写失败绝不阻断通知，也绝不抛进 waterfall。
+   */
+  async function registerAccessReaders(id: string | null, agent: AgentLike | undefined, entries: Claim[]): Promise<void> {
+    if (!id || !entries.length) return
+    const me = 'agent:' + id
+    try {
+      await store.mutate(s => {
+        let changed = false
+        for (const c of entries) if (registerReader(s, c.claimId, me).changed) changed = true
+        return changed ? { ok: true, changed: true, state: s, data: {} } : { ok: true, changed: false, data: {} }
+      }, id, agent)
+    } catch (e) {
+      // 反向注册失败只是少一条通知对象，不影响本次通知投递。
+    }
+  }
+
+  /**
+   * 访问通知消息：**显式标注来源的 notice**。
+   * `form: 'notice'` **必须带非空 `summary`**，否则客户端会把它退化成 opaque 行
+   * （`dsh-client-ui-chat/lib/client.js:795-800` 的 `case "notice"` 先算 `noticeSummary`）。
+   * 120 字符上限由 `boundContextSummary` 保证 —— 与生态里 5 个包同款用法。
+   */
+  function accessNoticeMessage(entries: Claim[]) {
+    const head = entries[0] && entries[0].paths.length ? entries[0].paths[0] : ''
+    return createUserMessage({
+      content: [{ type: 'text' as const, text: renderAccessNotice(entries) }],
+      source: {
+        kind: 'plugin' as const,
+        plugin: 'dsh-collab',
+        form: 'notice' as const,
+        summary: boundContextSummary('collab 占用 · ' + head + (entries.length > 1 ? ' 等 ' + entries.length + ' 条' : ''))
+      }
+    })
+  }
+
+  // ---- 命中即投递（绝不改工具结果本身）----
+  // 先 await next()：本次工具的结果永远原样返回，通知只是**旁路**地注入一条消息。
+  // 异常绝不进 waterfall（抛出的监听器会把工具结果变成 isError）：整体 try/catch，
+  // 任何失败都等价于"这次没有通知"。
+  // 注册走 ctx.on(...)，listener 作为 ctx 作用域的 effect 注册，随插件卸载自动回收。
+  ctx.on('tools/post-execute', async (execCtx: any, _result: any, next: () => Promise<any>) => {
+    const downstream = await next()
+    try {
+      const found = await accessEntries(execCtx)
+      // 全部是重复 → 不再通知（与旧载体的去重语义一致）。
+      if (found && !found.duplicate) {
+        // 功能 D：通知与反向注册是同一个动作，先登记读者再投递。
+        await registerAccessReaders(found.id, found.agent, found.entries)
+        const agent = execCtx && execCtx.agent
+        // 拿不到带 inject 的 Agent（例如受限宿主）时**不投递**，也绝不退回"自己造一条消息"。
+        // 总开关关掉时同样不投递（见上面的 NOTICE_ENABLED）。
+        if (NOTICE_ENABLED && agent && typeof agent.inject === 'function') agent.inject(accessNoticeMessage(found.entries))
+      }
+    } catch (e) {
+      // 计算或投递失败 = 本次没有通知。
+    }
+    return downstream
+  })
+}

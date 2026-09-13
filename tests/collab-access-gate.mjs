@@ -1,11 +1,18 @@
+import { createHarness } from './_harness.mjs'
+
 // collab-access-gate.mjs
-// 功能 A（访问时的路径相关通知，旁路投递）与功能 C（可读性 + 原生写保护）的回归测试。
+// 功能 A（访问时的路径相关通知）与功能 C（可读性 + 原生写保护）的回归测试。
 //
 // 覆盖面：
 //   1) 三个纯函数 accessScope / claimsForAccess / renderAccessNotice（含题面给的边界例）；
 //      以及功能 C 用的 claimsCovering、relToProject、isReadable。
-//   2) 真正注册出来的 ctx.on('tools/post-execute') 监听器：合并进 additionalContexts、
-//      block 分支、按 agent 去重、无路径原样放行、异常安全。
+//   2) 真正注册出来的 ctx.on('tools/post-execute') 监听器 + **真实的 agent.inject 投递面**：
+//      **原样返回 downstream**（不产生 content / value / additionalContexts 任何改动），命中即经
+//      `agent.inject` 投递一条**显式标注来源**的 notice 消息
+//      （`source.kind='plugin'` / `plugin='dsh-collab'` / `form='notice'` / 非空 `summary`），
+//      按 agent 的 accessSignature 去重、block 分支、无路径/无命中/自己的声明/过期一律不投递、
+//      正文与 renderAccessNotice(entries) 逐字一致、agent 没有 inject 时**不投递也不退回自造消息**、
+//      异常安全、卸载后监听器回收且不再 inject。
 //   3) 真正注册出来的 ctx.on('tools/pre-execute') 监听器：ask 判定、原样放行、
 //      readable:false 的读拦截、settings 门控关掉后不再拦。
 //   4) 功能 C 的 **mode 过滤**回归（0.8.1）：`shared` / `read` 声明既不拦写也不拦读
@@ -13,14 +20,24 @@
 //      `exclusive` 仍然拦（反向对照，防修过头）；并与 claim() 的冲突判据**逐例一致性对照**
 //      （同一组声明 + 同一目标路径，两套判据必须给出同一结论 —— 防将来再次漂移）。
 //
-// 为什么可以在 node 里测这两条：它们是 Host 面（cordis 事件 + 假 fs），不涉及浏览器 React。
+// 载体（规范见 AGENTS.md §1「严禁冒充用户」）：通知**不再**是 systemPrompt 上下文段
+// （`dsh-collab/access` order 132 已随旧载体删除，本文件显式断言它**不许复活**），
+// 而是逐事件经 `agent.inject` 投递 `form:'notice'` 的消息 —— 客户端按 `source.kind !== 'user'`
+// 把它渲染成 **notice 行、不是用户气泡**；`summary` 缺失才会退化成 opaque 行。
+// `id` / `role` / 深冻结全部由真实的 `@deepseek-ai/dsh-llm` 的 `createUserMessage` 补，
+// 本仓库不手抄副本。
+//
+// 为什么可以在 node 里测这两条：它们是 Host 面（cordis 事件 + 假 agent + 假 fs），不涉及浏览器 React。
 // 用真实 Cordis Context 注册，再用 ctx.waterfall 驱动 —— 与 dsh-tools 的调用形态同构
 // （dsh-tools/lib/index.js:3116 用 ctx.waterfall(carrier, 'tools/pre-execute', exec, next)）。
+// `inject` 是**假 agent** 上的记录器：真机上它进的是 next-step 收件箱，这里只钉插件侧契约
+// （调用几次 / 消息形状 / 来源标签），不断言"真机一定投得到"。
 //
 // 运行：node tests/collab-access-gate.mjs
 
 import path from 'node:path'
 import os from 'node:os'
+import { readFileSync } from 'node:fs'
 
 const cordis = await import('@deepseek-ai/cordis').catch(() => import('../node_modules/.pnpm/node_modules/@deepseek-ai/cordis/lib/index.js'))
 const { Context } = cordis
@@ -36,11 +53,8 @@ const collabPlugin = mod.default
 
 const { accessScope, claimsForAccess, renderAccessNotice, claimsCovering, relToProject, isReadable, clockUtc } = core
 
-let pass = 0, fail = 0
-const ok = (cond, label, extra) => {
-  if (cond) { pass++; console.log('  ok  ' + label) }
-  else { fail++; console.log('  FAIL ' + label + (extra ? '  <-- ' + extra : '')) }
-}
+const h = createHarness()
+const { ok } = h
 
 const T0 = Date.UTC(2026, 0, 2, 3, 4, 37)
 const HOUR = 3600 * 1000
@@ -107,6 +121,15 @@ console.log('# renderAccessNotice: 紧凑 + 时间稳定（无倒计时）')
   ok(text.includes('不可读') === false, '默认可读时不出现「不可读」', text)
   const noRead = renderAccessNotice([mkClaim({ claimId: 'c_nr', paths: ['src/nr/'], readable: false })])
   ok(noRead.includes('不可读'), 'readable:false 会渲染成「不可读」', noRead)
+  // 回归：readable 只对 exclusive 有门控意义（writeGate 对 shared/read 一律放行），
+  // 所以非 exclusive 声明**不得**渲染「不可读」——那会让只读声明显得像在读侧拦人。
+  const sharedNoRead = renderAccessNotice([mkClaim({ claimId: 'c_snr', paths: ['src/snr/'], mode: 'shared', readable: false })])
+  ok(sharedNoRead.includes('不可读') === false, 'shared + readable:false 不再谎报「不可读」', sharedNoRead)
+  const readNoRead = renderAccessNotice([mkClaim({ claimId: 'c_rnr', paths: ['src/rnr/'], mode: 'read', readable: false })])
+  ok(readNoRead.includes('不可读') === false, 'read + readable:false 不再谎报「不可读」（OPEN_HINT 推荐用法）', readNoRead)
+  ok(sharedNoRead.includes('（shared）') && readNoRead.includes('（read）'), '非 exclusive 仍点出 mode 本身', JSON.stringify([sharedNoRead, readNoRead]))
+  ok(renderAccessNotice([mkClaim({ claimId: 'c_ex', paths: ['src/ex/'], readable: false })]).includes('（exclusive，不可读）'),
+    'exclusive + readable:false 仍保留完整标注（门控真的生效）')
   const three = renderAccessNotice([A, B, C])
   ok(three.includes('；另有 1 条'), '超过 2 条折叠成计数', three)
   ok(!three.includes('Gamma'), '第 3 条不展开名字', three)
@@ -137,12 +160,17 @@ console.log('# claimsCovering / relToProject / isReadable（功能 C 的判据�
 // ════════════════════════════════════════════════════════════════════════
 const CWD = '/fake/project/gate'
 
-/** 极简假 fs（内存 + 版本号），语义与 e2e harness 的 fs 对齐（乐观并发那一步用得上）。 */
-function makeFs(store, versions, opts = {}) {
+/** 极简假 fs（内存 + 版本号），语义与 e2e harness 的 fs 对齐（乐观并发那一步用得上）。
+ *  calls 用来数读次数：去重断言要靠"重复命中不再走一次反向登记的 mutate"来证伪。 */
+function makeFs(store, versions, opts = {}, calls) {
   return {
     resolve: async (p) => ({ displayPath: p, path: p }),
-    stat: async (t) => (store.has(t.path) ? { version: versions.get(t.path) || 1 } : null),
+    stat: async (t) => {
+      if (calls) calls.stat++
+      return store.has(t.path) ? { version: versions.get(t.path) || 1 } : null
+    },
     readText: async (t) => {
+      if (calls) calls.readText++
       if (opts.readThrows && opts.readThrows(t.path)) throw new Error('boom: read failed')
       return store.get(t.path) || ''
     },
@@ -170,12 +198,20 @@ const settle = () => new Promise((r) => setTimeout(r, 20))
  * @param opts.readThrows 让 readText 抛错的判据（测异常安全）
  * @param opts.settings  用户设置（缺省 = 两个字段都 true）
  * @param opts.settingsWritable  false 时 installSection 交出一个只读读取器
+ * @param opts.initiator 当前会话的 agent（agents.currentInitiator 的返回值；缺省 ME）
+ *
+ * systemPrompt 服务**照常提供**，但只当**探测器**用：新载体（`agent.inject`）根本不碰它。
+ * awareness 段会被它接住，所以"没有注册 dsh-collab/access 段"是一条**非空**断言（见 A 段）。
  */
 async function makeHarness(opts = {}) {
   const store = new Map()
   const versions = new Map()
+  const calls = { stat: 0, readText: 0, writeText: 0 }
   const tools = []
   const prompts = []
+  // 按 name 索引已注册的运行时上下文段（与 tests/collab-awareness.mjs、collab-skill.mjs 的假服务同形）。
+  // **只是探测器**：功能 A 的通知已经不走上下文段了。
+  const contexts = new Map()
   const statePath = projectStateFile(CWD)
   if (opts.claims) {
     store.set(statePath, JSON.stringify({ schemaVersion: 1, seq: opts.claims.length, claims: opts.claims, messages: [], holders: [] }))
@@ -183,22 +219,31 @@ async function makeHarness(opts = {}) {
   }
 
   let hooks = null
+  let initiator = opts.initiator || ME
   let value = Object.assign({ exposeDelegationDiscipline: true, enforceWriteLock: true }, opts.settings || {})
   const ctx = new Context()
-  for (const n of ['tools', 'timer', 'fs', 'sessions', 'sessionTitle', 'agents']) ctx.provide(n)
-  const names = ['tools', 'timer', 'fs', 'sessions', 'sessionTitle', 'agents']
-  if (opts.settings !== undefined) { ctx.provide('settings'); names.push('settings') }
-  if (opts.withController) { ctx.provide('sessionController'); names.push('sessionController') }
+  const services = ['tools', 'timer', 'fs', 'sessions', 'sessionTitle', 'agents', 'systemPrompt']
+  if (opts.settings !== undefined) services.push('settings')
+  if (opts.withController) services.push('sessionController')
+  for (const n of services) ctx.provide(n)
 
   ctx.set('tools', { register: (t) => { tools.push(t); return () => {} } })
   ctx.set('timer', { timeout: (ms) => new Promise((r) => setTimeout(r, ms)), interval: () => () => {} })
-  ctx.set('fs', makeFs(store, versions, opts))
+  ctx.set('fs', makeFs(store, versions, opts, calls))
   ctx.set('sessions', { get: () => ({ header: { cwd: CWD } }) })
   ctx.set('sessionTitle', { get: () => ({ title: 'Gate Worker' }) })
   ctx.set('agents', {
-    currentInitiator: () => undefined,
+    currentInitiator: () => initiator,
     list: () => [],
     get: (id) => (opts.liveSessions && opts.liveSessions.includes(id) ? { id } : undefined)
+  })
+  // 假 systemPrompt：只记录注册进来的运行时上下文段。**它不是功能 A 的载体**（那是 agent.inject），
+  // 留在这里是为了让"没有注册 dsh-collab/access 段"有一个活着的对照物（awareness 段）。
+  ctx.set('systemPrompt', {
+    context: (c) => {
+      contexts.set(c.name, c)
+      return () => { if (contexts.get(c.name) === c) contexts.delete(c.name) }
+    }
   })
   if (opts.settings !== undefined) {
     ctx.set('settings', {
@@ -224,13 +269,20 @@ async function makeHarness(opts = {}) {
 
   return {
     ctx, tools, store, versions, statePath, prompts, readState, writeState, fiber,
+    contexts, calls,
     set(patch) { value = Object.assign({}, value, patch); if (hooks) hooks.onChange() },
     current: () => value,
-    /** 驱动 post-execute 瀑布：返回 { decision, downstream }。 */
+    /** 当前会话（agents.currentInitiator()）—— 只影响 awareness 段，与功能 A 的投递面无关。 */
+    setInitiator(a) { initiator = a },
+    /** 驱动 post-execute 瀑布：返回 { decision, downstream, nextCalls }。 */
     async post(exec, downstream = { kind: 'accept' }) {
       const produced = { ...downstream }
-      const decision = await ctx.waterfall('tools/post-execute', exec, produced, () => Promise.resolve(produced))
-      return { decision, downstream: produced }
+      let nextCalls = 0
+      const decision = await ctx.waterfall('tools/post-execute', exec, produced, () => {
+        nextCalls++
+        return Promise.resolve(produced)
+      })
+      return { decision, downstream: produced, nextCalls }
     },
     /** 驱动 pre-execute 瀑布：返回 { decision, nextCalls }。 */
     async pre(exec) {
@@ -244,97 +296,285 @@ async function makeHarness(opts = {}) {
   }
 }
 
-const ME = { id: 'agent-me', session: { header: { cwd: CWD } } }
+// ── agent.inject 捕获：新载体（逐事件 notice）的观测点 ──────────────────
+// 每个用例开头 resetInject()；ME 自带 inject，NO_INJECT_AGENT **故意没有**。
+let injectLog = []
+const resetInject = () => { injectLog = [] }
+/** 从 inject 记录里取正文（防御性：拿不到就返回空串，让断言失败而不是抛）。 */
+const noticeText = (entry) => (entry && entry.message && entry.message.content && entry.message.content[0] && entry.message.content[0].text) || ''
+/** 带记录器的假 agent：inject 把每次调用记进 injectLog。 */
+const withInject = (id) => ({ id, session: { header: { cwd: CWD } }, inject: (m) => injectLog.push({ agent: id, message: m }) })
+const ME = withInject('agent-me')
+/** 故意**没有** inject 的 agent：受限宿主上的 agent 形状（契约要求此时不投递、不抛）。 */
+const NO_INJECT_AGENT = { id: 'agent-no-inject', session: { header: { cwd: CWD } } }
 /** holderId 的形状是 'agent:' + agent.id（与 index.ts 的 holderOf 一致）。 */
 const ME_HOLDER = 'agent:' + ME.id
 const execOf = (name, args, agent = ME) => ({ name, arguments: args, agent })
 
-// ── 功能 A：post-execute 合并与去重 ─────────────────────────────────────
-console.log('# A: post-execute 把通知合并进 additionalContexts')
+// ── 功能 A：post-execute 原样返回 + agent.inject 交出通知 ────────────────
+console.log('# A: post-execute 原样返回 downstream，通知经 agent.inject 投递显式来源的 notice')
 {
+  resetInject()
   const foreign = mkClaim({ claimId: 'c_other', holderId: 'agent:other', holderName: 'Other Session', paths: ['src/a/2'], expiresAt: Date.now() + HOUR })
   const h = await makeHarness({ claims: [foreign] })
-  const { decision, downstream } = await h.post(execOf('read', { file_path: 'src/a/1' }))
-  ok(decision.additionalContexts && decision.additionalContexts.length === 1,
-    '恰好合并一条 additionalContexts', JSON.stringify(decision.additionalContexts && decision.additionalContexts.length))
-  const msg = decision.additionalContexts[0]
-  ok(msg && msg.role === 'user', '消息 role 是 user', msg && msg.role)
-  ok(msg && Array.isArray(msg.content) && msg.content[0].type === 'text' && msg.content[0].text.includes('Other Session'),
-    '文本点出其他会话', msg && JSON.stringify(msg.content))
-  ok(msg && msg.content[0].text.includes('src/a/2'), '文本点出被占用的路径', msg && msg.content[0].text)
-  ok(msg && msg.source && msg.source.kind === 'plugin' && msg.source.plugin === 'dsh-collab' && msg.source.form === 'notice' && typeof msg.source.summary === 'string',
-    'source 是 {kind:plugin, plugin:dsh-collab, form:notice, summary}', msg && JSON.stringify(msg.source))
-  ok(msg && typeof msg.id === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(msg.id),
-    'id 是 uuid v4', msg && msg.id)
-  ok(msg && Object.isFrozen(msg) && Object.isFrozen(msg.content) && Object.isFrozen(msg.content[0]) && Object.isFrozen(msg.source),
-    '消息与内容块深冻结', msg && Object.isFrozen(msg))
-  ok(decision !== downstream, '合并时返回的是新决策对象（不原地改结果）')
-  ok(!('content' in decision) && !('value' in decision), '只加 additionalContexts，不重建 content/value', Object.keys(decision).join(','))
-  ok(h.readState().claims[0].readers.includes(ME_HOLDER), '通知的同时把自己反向登记为 reader', JSON.stringify(h.readState().claims[0].readers))
 
-  // 去重：同一 agent 对同一组占用再访问一次 -> 原样放行
+  // ── 载体自查：**访问通知不再是 systemPrompt 上下文段** ──
+  // 假 systemPrompt 是活的（awareness 段被它接住），所以"没有 access 段"不是空断言。
+  ok(h.contexts.has('dsh-collab/awareness'), '假 systemPrompt 确实接住了其它上下文段（否则下一条是空断言）',
+    JSON.stringify([...h.contexts.keys()]))
+  ok(!h.contexts.has('dsh-collab/access'), '访问通知**不再**注册 dsh-collab/access 上下文段（载体已换）',
+    JSON.stringify([...h.contexts.keys()]))
+  const accessSrc = readFileSync(path.join(ROOT, '../src/access.ts'), 'utf8')
+  ok(!/systemPrompt/.test(accessSrc), 'src/access.ts 源码里不再出现 systemPrompt（载体不许改回去）')
+  ok(!/dsh-collab\/access/.test(accessSrc), "src/access.ts 源码里不再出现 'dsh-collab/access'")
+
+  // ── 未命中过的会话：一次 inject 都没有 ──
+  ok(injectLog.length === 0, '未命中前没有任何 inject 调用', 'injects=' + injectLog.length)
+
+  // ── 命中：工具结果原样，通知经 inject 投递一条 ──
+  const { decision, downstream, nextCalls } = await h.post(execOf('read', { file_path: 'src/a/1' }))
+  ok(decision === downstream, 'post-execute 返回的就是 downstream 本身（===，不再造新决策对象）')
+  ok(!('additionalContexts' in decision), '决策对象上没有 additionalContexts 字段（载体已换）', Object.keys(decision).join(','))
+  ok(decision.kind === 'accept' && JSON.stringify(decision) === JSON.stringify(downstream), '工具结果一字未改', JSON.stringify(decision))
+  ok(nextCalls === 1, '命中路径上 next() 恰好一次', 'nextCalls=' + nextCalls)
+
+  // ── 非重复命中 ⇒ inject 恰好一次 ──
+  ok(injectLog.length === 1, '非重复命中 -> agent.inject 恰好调用一次', 'injects=' + injectLog.length)
+  const delivered = injectLog[0]
+  ok(!!delivered && delivered.agent === ME.id, '投递到的是发起本次工具调用的那个 agent', String(delivered && delivered.agent))
+  const msg = delivered && delivered.message
+
+  // ── 消息是**显式标注来源**的 notice（不冒充真人）──
+  ok(!!msg && !!msg.source && msg.source.kind === 'plugin', "source.kind === 'plugin'（不是 user，不冒充真人）", JSON.stringify(msg && msg.source))
+  ok(!!msg && !!msg.source && msg.source.plugin === 'dsh-collab', "source.plugin === 'dsh-collab'", String(msg && msg.source && msg.source.plugin))
+  ok(!!msg && !!msg.source && msg.source.form === 'notice', "source.form === 'notice'（客户端据此渲染成 notice 行）", String(msg && msg.source && msg.source.form))
+  const summary = msg && msg.source && msg.source.summary
+  ok(typeof summary === 'string' && summary.length > 0, 'summary 是非空字符串（notice 缺 summary 会退化成 opaque）', JSON.stringify(summary))
+  ok(typeof summary === 'string' && summary.length <= 120, 'summary 不超过 120 字符（boundContextSummary 的上限）', 'len=' + (typeof summary === 'string' ? summary.length : 'n/a'))
+
+  // ── 构造函数补的字段：role / id / 深冻结 ──
+  ok(!!msg && msg.role === 'user', "role === 'user' 由 createUserMessage 自动补（不是我们手写）", String(msg && msg.role))
+  const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+  ok(!!msg && UUID_V4.test(String(msg.id)), 'id 是 uuid v4 形状（由构造函数生成）', String(msg && msg.id))
+  ok(!!msg && Object.isFrozen(msg), '消息对象深冻结（Object.isFrozen）')
+  ok(!!msg && Array.isArray(msg.content) && Object.isFrozen(msg.content), 'content 数组深冻结', typeof (msg && msg.content))
+  ok(!!msg && !!msg.content && !!msg.content[0] && Object.isFrozen(msg.content[0]), 'content[0] 内容块深冻结')
+
+  // ── 正文与 renderAccessNotice(entries) 逐字一致 ──
+  const entries = claimsForAccess(h.readState().claims, 'src/a/1', Date.now())
+  const text = renderAccessNotice(entries)
+  ok(!!msg && !!msg.content && !!msg.content[0] && msg.content[0].type === 'text', "content[0].type === 'text'", JSON.stringify(msg && msg.content && msg.content[0] && msg.content[0].type))
+  ok(noticeText(delivered) === text, '正文与 renderAccessNotice(entries) 逐字一致', JSON.stringify(noticeText(delivered)))
+  ok(noticeText(delivered).includes('Other Session'), '通知点出持有者名', noticeText(delivered))
+  ok(noticeText(delivered).includes('src/a/2'), '通知点出被占路径', noticeText(delivered))
+  ok((text.match(/\[dsh-collab\]/g) || []).length === 1, '正文里只有一条通知（没有叠加两次）', String((text.match(/\[dsh-collab\]/g) || []).length))
+
+  // ── summary 是一行折叠文案，不是正文全文；且含首条被占路径 ──
+  ok(summary !== text, 'summary 不等于正文全文（它是一行折叠文案）', JSON.stringify(summary))
+  ok(typeof summary === 'string' && summary.includes('src/a/2'), 'summary 包含首条被占路径', JSON.stringify(summary))
+  ok(typeof summary === 'string' && summary.length < text.length, 'summary 比正文短（折叠成一行）', 'summary=' + (typeof summary === 'string' ? summary.length : 'n/a') + ' text=' + text.length)
+
+  // ── 读者反向登记（功能 D 接缝未变）──
+  ok((h.readState().claims[0].readers || []).includes(ME_HOLDER), '通知的同时把自己反向登记为 reader（功能 D 接缝未变）', JSON.stringify(h.readState().claims[0].readers))
+
+  // ── 重复命中 ⇒ 不再 inject；且不再走一次反向登记的 mutate ──
+  // 两个可观测量：inject 次数不涨；且**不再走一次反向登记的 mutate**
+  // （重复分支只做 accessEntries 的那一次 load，首次还要多一次 registerAccessReaders 的 load）。
+  const firstReads = h.calls.readText
   const again = await h.post(execOf('read', { file_path: 'src/a/1' }))
-  ok(again.decision === again.downstream, '重复访问返回 downstream 本身（原样放行）')
-  ok(!again.decision.additionalContexts, '重复访问不追加 additionalContexts', JSON.stringify(again.decision))
+  ok(again.decision === again.downstream && !('additionalContexts' in again.decision), '重复访问仍然原样放行')
+  ok(injectLog.length === 1, '重复命中 -> 不再 inject（仍是一条）', 'injects=' + injectLog.length)
+  ok(h.calls.readText - firstReads === 1,
+    '重复命中不再做一次反向登记（状态只读 1 次；首次是 2 次：accessEntries + registerReaders）',
+    'delta=' + (h.calls.readText - firstReads))
 
-  // 另一个 agent 不受去重影响
-  const otherAgent = { id: 'agent-other-me', session: { header: { cwd: CWD } } }
-  const third = await h.post(execOf('read', { file_path: 'src/a/1' }, otherAgent))
-  ok(third.decision.additionalContexts && third.decision.additionalContexts.length === 1, '去重按 agent 隔离')
-  ok(h.readState().claims[0].readers.includes('agent:' + otherAgent.id), '第二个 agent 也被登记', JSON.stringify(h.readState().claims[0].readers))
+  // ── 另一个 agent 各调一次（去重键是 agent 对象）──
+  const otherAgent = withInject('agent-other-me')
+  h.setInitiator(otherAgent)
+  await h.post(execOf('read', { file_path: 'src/a/1' }, otherAgent))
+  ok(injectLog.length === 2, '另一个 agent 命中同一组占用 -> 自己那条 inject', 'injects=' + injectLog.length)
+  ok(injectLog.length > 1 && injectLog[1].agent === otherAgent.id, '第二条投递给第二个 agent', String(injectLog[1] && injectLog[1].agent))
+  ok(injectLog.length > 1 && noticeText(injectLog[1]) === text, '第二个 agent 拿到的正文与第一个逐字相同')
+  ok((h.readState().claims[0].readers || []).includes('agent:' + otherAgent.id), '第二个 agent 也被登记', JSON.stringify(h.readState().claims[0].readers))
+  // 第三个 agent 从未命中过：新载体里根本没有"共享槽位"，所以它不会凭空拿到别人的通知。
+  const thirdAgent = withInject('agent-third-me')
+  h.setInitiator(thirdAgent)
+  ok(injectLog.length === 2, '从未命中过的第三个 agent 不会凭空收到别人的通知（没有共享槽位）', 'injects=' + injectLog.length)
+  await h.post(execOf('read', { file_path: 'src/a/1' }, thirdAgent))
+  ok(injectLog.length === 3 && injectLog[2].agent === thirdAgent.id, '第三个 agent 自己命中 -> 投递自己的一条', 'injects=' + injectLog.length)
+  h.setInitiator(ME)
+  const back = await h.post(execOf('read', { file_path: 'src/a/1' }))
+  ok(back.decision === back.downstream && injectLog.length === 3, '切回原 agent 重复命中仍然不投递（各自的去重键互不影响）', 'injects=' + injectLog.length)
 }
 
-console.log('# A: block 分支 / 无命中 / 无候选 / 绝对路径 / 自己的声明 / 过期')
+console.log('# A: block 分支 / 无命中 / 无候选 / 绝对路径 / 自己的声明 / 过期 —— 一律不投递，读者不被改动')
 {
   const foreign = mkClaim({ claimId: 'c_other', holderId: 'agent:other', holderName: 'Other Session', paths: ['src/a/2'], expiresAt: Date.now() + HOUR })
+  resetInject()
   const h = await makeHarness({ claims: [foreign] })
 
   const feedback = [{ type: 'text', text: 'blocked' }]
   const blocked = await h.post(execOf('read', { file_path: 'src/a/1' }), { kind: 'block', feedback })
   ok(blocked.decision.kind === 'block', 'block 决策保持 kind=block', JSON.stringify(blocked.decision.kind))
   ok(blocked.decision.feedback === feedback, 'feedback 原样保留（同一引用）')
-  ok(blocked.decision.additionalContexts && blocked.decision.additionalContexts.length === 1, 'block 也带上 additionalContexts')
+  ok(blocked.decision === blocked.downstream, 'block 分支同样原样返回 downstream 本身')
+  ok(!('additionalContexts' in blocked.decision), 'block 决策上没有 additionalContexts 字段')
+  ok(injectLog.length === 1 && noticeText(injectLog[0]).includes('src/a/2'),
+    'block 分支命中后仍然投递通知（通知与工具结果两条路）', 'injects=' + injectLog.length)
 
+  resetInject()
   const h2 = await makeHarness({ claims: [foreign] })
   const miss = await h2.post(execOf('read', { file_path: 'src/zzz/1' }))
-  ok(miss.decision === miss.downstream && !miss.decision.additionalContexts, '无相关占用 -> 原样放行')
+  ok(miss.decision === miss.downstream && !('additionalContexts' in miss.decision), '无相关占用 -> 原样放行')
+  ok(injectLog.length === 0, '无命中 -> 不投递', 'injects=' + injectLog.length)
+  ok((h2.readState().claims[0].readers || []).length === 0, '无命中 -> 读者不被改动', JSON.stringify(h2.readState().claims[0].readers))
   const noPaths = await h2.post(execOf('read', {}))
   ok(noPaths.decision === noPaths.downstream, '提不出候选路径 -> 原样放行')
+  ok(injectLog.length === 0, '无候选路径 -> 不投递', 'injects=' + injectLog.length)
   const abs = await h2.post(execOf('read', { file_path: CWD + '/src/a/1' }))
-  ok(abs.decision.additionalContexts && abs.decision.additionalContexts.length === 1, '绝对路径按 cwd 归一到项目相对后仍命中')
+  ok(abs.decision === abs.downstream && !('additionalContexts' in abs.decision),
+    '绝对路径按 cwd 归一到项目相对后仍命中（且不改工具结果）')
+  ok(injectLog.length === 1 && noticeText(injectLog[0]).includes('src/a/2'),
+    '绝对路径归一后命中 -> 投递一条并点出被占路径', 'injects=' + injectLog.length + ' ' + JSON.stringify(noticeText(injectLog[0]).slice(0, 40)))
 
+  resetInject()
   const mine = mkClaim({ claimId: 'c_mine', holderId: ME_HOLDER, holderName: 'Me', paths: ['src/a/2'], expiresAt: Date.now() + HOUR })
   const h3 = await makeHarness({ claims: [mine] })
   const own = await h3.post(execOf('read', { file_path: 'src/a/1' }))
   ok(own.decision === own.downstream, '自己的声明不通知自己')
+  ok(injectLog.length === 0, '自己的声明 -> 不投递', 'injects=' + injectLog.length)
 
+  resetInject()
   const expired = mkClaim({ claimId: 'c_old', holderId: 'agent:other', paths: ['src/a/2'], expiresAt: Date.now() - 1000 })
   const h4 = await makeHarness({ claims: [expired] })
   const gone = await h4.post(execOf('read', { file_path: 'src/a/1' }))
   ok(gone.decision === gone.downstream, '过期声明不通知')
+  ok(injectLog.length === 0, '声明已过期 -> 不投递', 'injects=' + injectLog.length)
 
   // 字符串数组里的候选路径（题面要求"含字符串数组"）。用干净实例，避开上面的去重状态。
+  resetInject()
   const h5 = await makeHarness({ claims: [foreign] })
   const arr = await h5.post(execOf('collab_board', { op: 'post', body: 'hi', mentions: ['src/a/2'] }))
-  ok(arr.decision.additionalContexts && arr.decision.additionalContexts.length === 1,
-    'mentions 这类字符串数组里的路径也参与候选提取',
-    JSON.stringify(arr.decision.additionalContexts && arr.decision.additionalContexts.length))
-  ok(arr.decision.additionalContexts[0].content[0].text.includes('src/a/2'), '数组里的路径命中后文本正确')
+  ok(arr.decision === arr.downstream && !('additionalContexts' in arr.decision), '字符串数组命中同样不改工具结果')
+  ok(injectLog.length === 1 && noticeText(injectLog[0]).includes('src/a/2'),
+    'mentions 这类字符串数组里的路径也参与候选提取，命中后通知点出该路径',
+    'injects=' + injectLog.length + ' ' + JSON.stringify(noticeText(injectLog[0])))
   // body 里的自由文本同样会被当作候选字符串，但它不是路径（'hi' 没有父目录），不会命中。
+  resetInject()
   const h6 = await makeHarness({ claims: [foreign] })
   const bodyOnly = await h6.post(execOf('collab_board', { op: 'post', body: 'hi' }))
   ok(bodyOnly.decision === bodyOnly.downstream, '非路径的自由文本不产生通知（无命中即放行）')
+  ok(injectLog.length === 0, '非路径自由文本 -> 不投递', 'injects=' + injectLog.length)
+}
+
+console.log('# A: 去重键是 per-agent 的 accessSignature —— 占用集合一变就再投一条（新载体没有 TTL）')
+{
+  const a1 = mkClaim({ claimId: 'c_one', holderId: 'agent:other', holderName: 'Other Session', paths: ['src/a/2'], expiresAt: Date.now() + HOUR })
+  resetInject()
+  const h = await makeHarness({ claims: [a1] })
+
+  await h.post(execOf('read', { file_path: 'src/a/1' }))
+  ok(injectLog.length === 1, '第一次命中投递一条', 'injects=' + injectLog.length)
+  const firstText = noticeText(injectLog[0])
+
+  await h.post(execOf('read', { file_path: 'src/a/1' }))
+  ok(injectLog.length === 1, '同一组占用重复命中不再投递', 'injects=' + injectLog.length)
+
+  // 占用集合变化（多了一条他人的声明）-> 新的 accessSignature -> 再投一条。
+  const a2 = mkClaim({ claimId: 'c_two', holderId: 'agent:other2', holderName: 'Second Session', paths: ['src/a/3'], expiresAt: Date.now() + HOUR })
+  h.writeState(Object.assign(h.readState(), { claims: h.readState().claims.concat([a2]) }))
+  await h.post(execOf('read', { file_path: 'src/a/1' }))
+  ok(injectLog.length === 2, '占用集合变化 -> 重新投递一条', 'injects=' + injectLog.length)
+  const secondText = noticeText(injectLog[1])
+  ok(secondText !== firstText && secondText.includes('Second Session'),
+    '第二条正文写的是新增后的占用集合（不是重发旧文本）', JSON.stringify(secondText))
+  ok(secondText.includes('src/a/3'), '第二条正文点出新占用的路径', JSON.stringify(secondText))
+
+  await h.post(execOf('read', { file_path: 'src/a/1' }))
+  ok(injectLog.length === 2, '新签名之后的重复命中同样不再投递', 'injects=' + injectLog.length)
+
+  // 另一个 agent 有自己的去重键：第一次命中就投一条，重复不再投。
+  const other = withInject('agent-sig-other')
+  await h.post(execOf('read', { file_path: 'src/a/1' }, other))
+  ok(injectLog.length === 3, '另一个 agent 有独立的去重键 -> 自己投一条', 'injects=' + injectLog.length)
+  await h.post(execOf('read', { file_path: 'src/a/1' }, other))
+  ok(injectLog.length === 3, '该 agent 重复命中不再投递', 'injects=' + injectLog.length)
+}
+
+console.log('# A: agent 没有 inject（或没有 agent）-> 不投递、不抛，读者反向登记仍发生')
+{
+  const foreign = mkClaim({ claimId: 'c_noinj', holderId: 'agent:other', holderName: 'Other Session', paths: ['src/a/2'], expiresAt: Date.now() + HOUR })
+  resetInject()
+  const h = await makeHarness({ claims: [foreign], initiator: NO_INJECT_AGENT })
+  ok(typeof NO_INJECT_AGENT.inject === 'undefined', '这个 agent 确实没有 inject 函数')
+  let threw = null
+  let posted = null
+  try { posted = await h.post(execOf('read', { file_path: 'src/a/1' }, NO_INJECT_AGENT)) } catch (e) { threw = e }
+  ok(threw === null, '没有 inject 时不抛', threw && String(threw.message))
+  ok(posted && posted.decision === posted.downstream && posted.decision.kind === 'accept',
+    '工具结果原样返回（绝不退回"自己造一条消息"）', JSON.stringify(posted && posted.decision))
+  ok(posted && !('additionalContexts' in posted.decision), '这条路径上同样没有 additionalContexts 字段')
+  ok(posted && posted.nextCalls === 1, 'next() 恰好一次', 'nextCalls=' + (posted && posted.nextCalls))
+  ok(injectLog.length === 0, '没有 inject -> 一次都不调用', 'injects=' + injectLog.length)
+  // 通知的计算本身没有被跳过（只是没有出口）—— 反向登记仍发生，功能 D 不受影响。
+  ok((h.readState().claims[0].readers || []).includes('agent:' + NO_INJECT_AGENT.id),
+    '读者反向登记仍发生（代价只落在投递上）', JSON.stringify(h.readState().claims[0].readers))
+
+  // 没有 agent（受限宿主 / 非 agent 调用面）：同样不投递、不抛、next() 恰好一次。
+  resetInject()
+  const h2 = await makeHarness({ claims: [foreign] })
+  let threw2 = null
+  let posted2 = null
+  try { posted2 = await h2.post({ name: 'read', arguments: { file_path: 'src/a/1' }, agent: null }) } catch (e) { threw2 = e }
+  ok(threw2 === null, '没有 agent 时不抛', threw2 && String(threw2.message))
+  ok(posted2 && posted2.decision === posted2.downstream && posted2.nextCalls === 1,
+    '没有 agent -> 工具结果原样返回，next() 恰好一次', JSON.stringify(posted2 && posted2.decision))
+  ok(injectLog.length === 0, '没有 agent -> 不投递', 'injects=' + injectLog.length)
 }
 
 console.log('# A: 异常绝不进 waterfall')
 {
   const foreign = mkClaim({ claimId: 'c_other', holderId: 'agent:other', paths: ['src/a/2'], expiresAt: Date.now() + HOUR })
+  resetInject()
   const h = await makeHarness({ claims: [foreign], readThrows: (p) => p.endsWith('.json') })
   let threw = null
-  let decision = null
-  try { decision = (await h.post(execOf('read', { file_path: 'src/a/1' }))).decision } catch (e) { threw = e }
+  let posted = null
+  try { posted = await h.post(execOf('read', { file_path: 'src/a/1' })) } catch (e) { threw = e }
   ok(threw === null, '读盘失败不抛进 waterfall', threw && String(threw.message))
-  ok(decision && decision.kind === 'accept' && !decision.additionalContexts, '读盘失败等价于"没有通知"', JSON.stringify(decision))
+  ok(posted && posted.decision === posted.downstream && posted.decision.kind === 'accept',
+    '读盘失败等价于"没有通知"：返回 downstream 本身', JSON.stringify(posted && posted.decision))
+  ok(posted && !('additionalContexts' in posted.decision), '异常路径上同样没有 additionalContexts 字段')
+  ok(posted && posted.nextCalls === 1, '异常路径上 next() 恰好一次', 'nextCalls=' + (posted && posted.nextCalls))
+  ok(injectLog.length === 0, '读盘失败 -> 不投递（失败不会被当成一条通知）', 'injects=' + injectLog.length)
+  ok((h.readState().claims[0].readers || []).length === 0, '读盘失败 -> 读者不被改动', JSON.stringify(h.readState().claims[0].readers))
+}
+
+console.log('# A: 总开关 DSH_COLLAB_NO_PROMPT_HINT=1 仍然管住访问通知（换载体不许改开关语义）')
+{
+  const foreign = mkClaim({ claimId: 'c_optout', holderId: 'agent:other', holderName: 'Other Session', paths: ['src/a/2'], expiresAt: Date.now() + HOUR })
+  // 开关是 config 期读的（installAccess 里），所以在 makeHarness 之前设。
+  process.env.DSH_COLLAB_NO_PROMPT_HINT = '1'
+  let h
+  try {
+    resetInject()
+    h = await makeHarness({ claims: [foreign] })
+    const posted = await h.post(execOf('read', { file_path: 'src/a/1' }))
+    ok(posted.decision === posted.downstream, 'opt-out 下工具结果照样原样返回', JSON.stringify(posted.decision))
+    ok(posted.nextCalls === 1, 'opt-out 下 next() 恰好一次', 'nextCalls=' + posted.nextCalls)
+    ok(injectLog.length === 0, 'opt-out 下**不投递**访问通知（总开关的契约是关掉所有运行时注入）',
+      'injects=' + injectLog.length)
+    // 只关投递：读者反向登记（功能 D）照常 —— 这正是换载体前的行为。
+    const rd = (h.readState().claims[0].readers || [])
+    ok(rd.includes('agent:' + ME.id), 'opt-out 只关投递：读者反向登记照常发生', JSON.stringify(rd))
+  } finally {
+    delete process.env.DSH_COLLAB_NO_PROMPT_HINT
+  }
+  // 反向对照：同一个 harness 形状，开关放开后**必须**投递（否则上一条是空断言）。
+  resetInject()
+  const h2 = await makeHarness({ claims: [foreign] })
+  await h2.post(execOf('read', { file_path: 'src/a/1' }))
+  ok(injectLog.length === 1, '（对照）开关放开后同一场景投递恰好一条 —— 证明上一条不是恒真',
+    'injects=' + injectLog.length)
 }
 
 // ── 功能 C：pre-execute 的 ask 判定 ────────────────────────────────────
@@ -473,18 +713,28 @@ console.log('# C: readable 的 claim 入参与兼容映射')
   ok(st3.claims[0].readable === true, '合并时显式给 readable:true -> 生效')
 }
 
-console.log('# 监听器随 ctx 作用域回收（卸载插件后不再拦截/通知）')
+console.log('# 监听器随 ctx 作用域回收（卸载插件后不再拦截/通知/inject）')
 {
   const foreign = mkClaim({ claimId: 'c_dir', holderId: 'agent:other', paths: ['src/a/'], expiresAt: Date.now() + HOUR })
+  resetInject()
   const h = await makeHarness({ claims: [foreign] })
   const before = await h.pre(execOf('write', { file_path: 'src/a/1', content: 'x' }))
   ok(before.decision.kind === 'ask', '卸载前拦截')
+  await h.post(execOf('read', { file_path: 'src/a/1' }))
+  ok(injectLog.length === 1 && noticeText(injectLog[0]).includes('src/a/'), '卸载前访问命中 -> 投递通知',
+    'injects=' + injectLog.length + ' ' + JSON.stringify(noticeText(injectLog[0]).slice(0, 30)))
+  ok(!h.contexts.has('dsh-collab/access'), '整个生命周期里都不存在 dsh-collab/access 上下文段（载体已换）',
+    JSON.stringify([...h.contexts.keys()]))
   await h.fiber.dispose()
   await settle()
   const after = await h.pre(execOf('write', { file_path: 'src/a/1', content: 'x' }))
   ok(after.decision.kind === 'allow' && after.nextCalls === 1, '卸载后 pre-execute 监听器被回收（放行）', JSON.stringify(after))
   const posted = await h.post(execOf('read', { file_path: 'src/a/1' }))
-  ok(posted.decision === posted.downstream && !posted.decision.additionalContexts, '卸载后 post-execute 监听器被回收（不追加通知）')
+  ok(posted.decision === posted.downstream && !('additionalContexts' in posted.decision),
+    '卸载后 post-execute 监听器被回收（不再投递、也不改工具结果）')
+  ok(injectLog.length === 1, '卸载后不再 inject（通知数没有增加）', 'injects=' + injectLog.length)
+  ok(!h.contexts.has('dsh-collab/awareness'), '卸载后 awareness 上下文段也被 dispose（ctx.effect 生效）',
+    JSON.stringify([...h.contexts.keys()]))
 }
 
 // ── 功能 C：mode 过滤回归（0.8.1）──────────────────────────────────────
@@ -639,5 +889,4 @@ console.log('# C: 一致性 —— writeGate 阻塞集合 ≡ claim() 冲突集�
     '门控报出的第一位阻塞者与 claim() 的 cs[0] 同一条', String(gate.decision.reason))
 }
 
-console.log(`\n${fail === 0 ? 'ALL PASS' : 'FAILURES'}: ${pass} passed, ${fail} failed`)
-process.exit(fail === 0 ? 0 : 1)
+h.finish()

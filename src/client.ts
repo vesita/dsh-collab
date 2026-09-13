@@ -252,12 +252,11 @@
           const load = async () => {
             try {
               const response = await fetch(SKILL_ROUTE, { headers: { accept: 'application/json' } })
-              let payload: any = {}
-              try {
-                payload = await response.json()
-              } catch (e) {
-                payload = {}
-              }
+              // 解析失败**不吞**：让 response.json() 的异常直接冒到下面的 catch。
+              // 曾经的写法是内层再包一个 try、失败就 payload={} —— 于是"远端返回了非 JSON"
+              // 会被降级成 items=[]、status='ready'、skill=null，UI 显示"技能路径不可用"，
+              // 把一次真实的响应格式故障说成了"这个技能没随包发布"。**能读懂的错误 > 好看的错误。**
+              const payload: any = await response.json()
               if (!response.ok) throw new Error((payload && payload.error) || 'HTTP ' + response.status)
               if (!live) return
               const items = payload && Array.isArray(payload.items) ? payload.items : []

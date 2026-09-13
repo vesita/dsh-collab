@@ -1,3 +1,5 @@
+import { createHarness } from './_harness.mjs'
+
 // collab-pure-logic.mjs
 // 纯逻辑回归测试。import 自 lib/collab-core.js（唯一事实源），而非复制。
 // 运行：node tests/collab-pure-logic.mjs
@@ -9,8 +11,8 @@ import {
   post, overview, related, filterMessages, blockers, holderView, holderFresh, MODES,
 } from '../lib/collab-core.js'
 
-let pass = 0, fail = 0
-const ok = (cond, label) => { if (cond) { pass++; console.log('  ok  ' + label) } else { fail++; console.log('  FAIL ' + label) } }
+const h = createHarness()
+const { ok } = h
 const t0 = 1000000
 const T = () => t0
 
@@ -327,5 +329,4 @@ console.log('# hostCode inline vs core (drift guard)')
   ok(JSON.stringify(coreState) === JSON.stringify(hostState), 'hostCode sweep mutates state identically to core')
 }
 
-console.log(`\n${fail === 0 ? 'ALL PASS' : 'FAILURES'}: ${pass} passed, ${fail} failed`)
-process.exit(fail === 0 ? 0 : 1)
+h.finish()
