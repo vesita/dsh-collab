@@ -10,8 +10,8 @@
     },
     "Mode": {
       "type": "string",
-      "enum": ["exclusive", "shared"],
-      "description": "exclusive 独占（默认，阻塞他人重叠声明）；shared 只声明不排他。"
+      "enum": ["exclusive", "shared", "read"],
+      "description": "exclusive 独占（默认，阻塞他人重叠声明）；shared 只声明不排他但会被他人独占挡住；read 只读观测，不排他也不被挡。"
     },
     "Claim": {
       "type": "object",

@@ -2,7 +2,7 @@
  * Type definitions derived from src/schema/collab.schema.json (Single Source of Truth)
  */
 
-export type Mode = 'exclusive' | 'shared';
+export type Mode = 'exclusive' | 'shared' | 'read';
 
 export interface Claim {
   claimId: string;

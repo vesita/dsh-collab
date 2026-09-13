@@ -13,7 +13,10 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Any, Optional
 
-TEST_STATE_FILE = os.path.expanduser("~/.dsh/collab/projects/test-simulation.json")
+# 与 TS 侧 src/paths.ts 保持同一事实源：状态目录 = ${DSH_HOME:-$HOME/.dsh}/collab/projects。
+# 注意：fs.resolve 不做 `~` 展开，但 Python 的 expanduser 会 —— 历史 bug 只存在于 TS 侧。
+DSH_HOME = os.environ.get("DSH_HOME") or os.path.expanduser("~/.dsh")
+TEST_STATE_FILE = os.path.join(DSH_HOME, "collab", "projects", "test-simulation.json")
 
 def norm_path(p: str) -> Optional[str]:
     if not p or not p.strip():

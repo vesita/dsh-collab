@@ -5,6 +5,12 @@
 - 状态：设计规划阶段，未开始实现
 - 关联：调研参考见第 2 节；所有接口均基于本环境 `cordis_inspect_*` 实测结果（见第 5 节）
 
+> **实现现状（v0.4.1，以此为准）**：本文档记录的是设计阶段的方案，实现已按实测演进。
+> 状态落点是 `${DSH_HOME:-$HOME/.dsh}/collab/projects/<项目名>-<哈希>.json` 的**绝对路径**（见 `src/paths.ts`），
+> 锁模式为 `exclusive` / `shared` / `read` 三态，并新增了「多会话实时态势注入」。
+> 面向使用者的现行规范见 [`collab-usage.md`](collab-usage.md)，工程说明见仓库 [`README.md`](../README.md)。
+> 下文出现的 `.dsh-collab/state.json`、`storageDomain` 等描述属于当时的候选方案。
+
 ---
 
 ## 1. 需求与场景

@@ -58,6 +58,7 @@ export interface ReadInput {
 export interface SweepOptions {
   maxMessages?: number
   holderTtlMs?: number
+  staleWarnMs?: number
 }
 
 /** sweep 的清理诊断信息。 */
@@ -65,6 +66,18 @@ export interface SweepResult {
   expiredClaims: number
   droppedMessages: number
   prunedHolders: number
+}
+
+/** list 中按 holder 聚合的存活视图，用于区分"活跃""近期出现过""僵尸"。 */
+export interface HolderView {
+  holderId: string
+  name?: string
+  kind?: string
+  sessionId?: string
+  lastSeenAt: number
+  ageSec: number        // 距 t 的秒数
+  active: boolean       // 该 holder 当前是否有未过期声明
+  stale: boolean        // 无活跃声明且 ageSec*1000 >= holderTtlMs
 }
 
 /** 对外发布的 claim 视图（剥离内部字段）。 */
@@ -161,7 +174,12 @@ export function projectStorageFileName(projectRoot: string): string {
 export const seg = (p: string): string[] => p.split('/').filter(Boolean)
 
 // 前缀重叠（分段）：src/backend/ 与 src/backend/models/ 重叠，src/foo 与 src/foobar 不重叠。
-export function ov(a: string, b: string): boolean { const sa = seg(a), sb = seg(b), n = Math.min(sa.length, sb.length); for (let i = 0; i < n; i++) if (sa[i] !== sb[i]) return false; return true }
+export function ov(a: string, b: string): boolean {
+  if (typeof a !== 'string' || typeof b !== 'string' || a.length === 0 || b.length === 0) return false
+  const sa = seg(a), sb = seg(b), n = Math.min(sa.length, sb.length)
+  for (let i = 0; i < n; i++) if (sa[i] !== sb[i]) return false
+  return true
+}
 
 // 显示名清洗：压缩空白并截断 24 字。
 export function cleanName(s: string): string {
@@ -177,6 +195,20 @@ export function init(): StateDocument { return { schemaVersion: 1, seq: 0, claim
 // 两者都由 sweep() 在每次读/写前惰性执行，保证状态文件不会无限增长。
 export const MAX_MESSAGES: number = 2000
 export const HOLDER_TTL_MS: number = 24 * 60 * 60 * 1000
+// 时钟偏移容忍：lastSeenAt 落在未来超过该窗口的 holder 视为不可信并回收。
+// 只回收 holder 记录；声明仍按各自的 expiresAt 判定，锁语义不受影响。
+export const HOLDER_FUTURE_SKEW_MS: number = 5 * 60 * 1000
+// stale 预警阈值：holder 无活跃声明且静默超过该时长即报 stale=true。
+// 它**小于**回收阈值（24h），所以 stale 是"看起来已废弃"的先行信号，而不是"马上会被删"的同义词；
+// 若与回收同阈值，在"先 sweep 再取视图"的产品路径上该字段恒为 false（死信号）。
+export const HOLDER_STALE_WARN_MS: number = 60 * 60 * 1000
+
+// holder 是否仍算"新鲜"：age 落在 [-HOLDER_FUTURE_SKEW_MS, holderTtlMs) 内。
+// sweep 的回收判据与 holderView 的 stale 判据共用这一个函数，二者不会再出现"口径不一致"。
+export function holderFresh(lastSeenAt: number | undefined, t: number, holderTtlMs: number = HOLDER_TTL_MS): boolean {
+  const age = t - (lastSeenAt || 0)
+  return age < holderTtlMs && age > -HOLDER_FUTURE_SKEW_MS
+}
 
 // 惰性清理：过期声明 + 超额留言 + 陈旧 holder。
 // 返回各类清理数量，供上层附带诊断信息。
@@ -196,7 +228,7 @@ export function sweep(s: StateDocument, t: number, opts: SweepOptions = {}): Swe
 
   const active = new Set(s.claims.map(c => c.holderId))
   const beforeHolders = s.holders.length
-  s.holders = s.holders.filter(h => active.has(h.holderId) || t - (h.lastSeenAt || 0) < holderTtlMs)
+  s.holders = s.holders.filter(h => active.has(h.holderId) || holderFresh(h.lastSeenAt, t, holderTtlMs))
   const prunedHolders = beforeHolders - s.holders.length
 
   return { expiredClaims, droppedMessages, prunedHolders }
@@ -204,6 +236,30 @@ export function sweep(s: StateDocument, t: number, opts: SweepOptions = {}): Swe
 
 // 惰性清理过期声明，返回清理数量（兼容旧调用方）。
 export function expire(s: StateDocument, t: number): number { return sweep(s, t).expiredClaims }
+
+// holder 存活视图：把 holders 数组翻译成"谁还活着"的可读判断。
+// active = 该 holder 有未过期声明；stale = 无活跃声明且距 t 已超过 holderTtlMs（sweep 下次就会回收它）。
+// 按 lastSeenAt 降序，调用方一眼看出最近活跃者；staleHolders 是 stale 的计数。
+export function holderView(state: StateDocument, t: number, opts: SweepOptions = {}): { holders: HolderView[]; staleHolders: number } {
+  const holderTtlMs = Number.isInteger(opts.holderTtlMs) && opts.holderTtlMs >= 0 ? opts.holderTtlMs : HOLDER_TTL_MS
+  // 预警阈值取 min(1h, holderTtlMs)：测试里把 ttl 调小时，stale 判据跟着一起缩，语义保持一致。
+  const warnMs = Number.isInteger(opts.staleWarnMs) && opts.staleWarnMs >= 0
+    ? opts.staleWarnMs
+    : Math.min(HOLDER_STALE_WARN_MS, holderTtlMs)
+  const activeIds = new Set(state.claims.filter(c => c.expiresAt > t).map(c => c.holderId))
+  const holders: HolderView[] = state.holders
+    .map(h => {
+      const lastSeenAt = h.lastSeenAt || 0
+      const ageMs = t - lastSeenAt
+      const ageSec = Math.max(0, Math.floor(ageMs / 1000))
+      const active = activeIds.has(h.holderId)
+      // stale = 无活跃声明，且（静默超过预警阈值 或 时间戳落在未来过远因而不新鲜）。
+      const stale = !active && (ageMs >= warnMs || !holderFresh(lastSeenAt, t, holderTtlMs))
+      return { holderId: h.holderId, name: h.name, kind: h.kind, sessionId: h.sessionId, lastSeenAt, ageSec, active, stale }
+    })
+    .sort((a, b) => b.lastSeenAt - a.lastSeenAt)
+  return { holders, staleHolders: holders.filter(x => x.stale).length }
+}
 
 // 对外发出一条 claim 的公开视图（剥离内部字段）。
 export function publish(c: Claim): PublishedClaim {
@@ -226,40 +282,59 @@ export function holder(state: StateDocument, h: HolderInput, name: string, tNow:
   return r
 }
 
+/** 合法锁模式集合；claim 只接受这三个值。 */
+export const MODES: readonly Mode[] = ['exclusive', 'shared', 'read']
+
 // 声明占用。返回 {ok,changed,state,data}，或抛 conflictError。
 // tNow 是 () => 当前毫秒；h = {holderId, sessionId?, name?}；a = {paths, mode?, ttlSec?, note?}。
 export function claim(state: StateDocument, h: HolderInput, a: ClaimInput, tNow: Clock): OpResult {
   const paths = (Array.isArray(a.paths) ? a.paths : []).map(norm).filter(Boolean)
   if (!paths.length) return { ok: false, changed: false, tNow, data: { error: 'bad-request', message: 'paths required（目录以 / 结尾）' } }
-  const mode: Mode = a.mode === 'shared' ? 'shared' : 'exclusive'
+  // mode 显式校验：未知值返回 bad-request，而不是替调用方猜一个
+  // （猜成 exclusive 会把一次笔误静默升级为最强锁，属于 fail-unsafe）。
+  const rawMode = (a as { mode?: unknown }).mode
+  const requested = rawMode === undefined || rawMode === null || rawMode === '' ? 'exclusive' : String(rawMode)
+  if (requested !== 'exclusive' && requested !== 'shared' && requested !== 'read') {
+    return { ok: false, changed: false, tNow, data: { error: 'bad-request', message: 'mode must be one of exclusive | shared | read (got ' + String(rawMode) + ')' } }
+  }
+  const mode = requested as Mode
   const ttl = Math.max(5, Math.min(86400, Number(a.ttlSec) || 1800))
   const note = typeof a.note === 'string' ? a.note.slice(0, 500) : ''
   const t = tNow(), cs: ConflictInfo[] = []
-  for (const c of state.claims) {
-    if (c.holderId === h.holderId || c.expiresAt <= t || c.mode === 'shared') continue
-    for (const p of paths) for (const cp of c.paths) if (ov(p, cp)) {
-      const remainingSec = Math.max(0, Math.ceil((c.expiresAt - t) / 1000))
-      const suggestedAction: ConflictInfo['suggestedAction'] = remainingSec <= 30 ? 'wait' : 'negotiate'
-      cs.push({
-        claimId: c.claimId,
-        holderId: c.holderId,
-        holderName: c.holderName || c.holderId,
-        path: p,
-        overlapsWith: cp,
-        mode: c.mode,
-        expiresAt: c.expiresAt,
-        remainingSec,
-        suggestedAction,
-      })
-      break
+  // read 是纯观测：不阻塞他人，也不被他人阻塞，直接跳过整个冲突扫描。
+  if (mode !== 'read') {
+    for (const c of state.claims) {
+      if (c.holderId === h.holderId || c.expiresAt <= t || c.mode === 'shared' || c.mode === 'read') continue
+      for (const p of paths) for (const cp of c.paths) if (ov(p, cp)) {
+        const remainingSec = Math.max(0, Math.ceil((c.expiresAt - t) / 1000))
+        const suggestedAction: ConflictInfo['suggestedAction'] = remainingSec <= 30 ? 'wait' : 'negotiate'
+        cs.push({
+          claimId: c.claimId,
+          holderId: c.holderId,
+          holderName: c.holderName || c.holderId,
+          path: p,
+          overlapsWith: cp,
+          mode: c.mode,
+          expiresAt: c.expiresAt,
+          remainingSec,
+          suggestedAction,
+        })
+        break
+      }
     }
   }
   if (cs.length) throw conflictError(cs)
   holder(state, h, h.name, tNow)
   const expiresAt = t + ttl * 1000
-  const own = state.claims.find(c => c.holderId === h.holderId && c.paths.some(cp => paths.some(p => ov(p, cp))))
+  // 合并限定在**同一 mode** 的声明上；不同 mode 各成一条。
+  // 若跨 mode 合并，"对 src/ 声明 read + 对 src/sub/ 声明 exclusive"会合成一条
+  // 覆盖 src/ 的 exclusive 声明，把从未被独占的兄弟路径 src/other/ 一并锁上。
+  const own = state.claims.find(c => c.holderId === h.holderId && c.mode === mode && c.paths.some(cp => paths.some(p => ov(p, cp))))
   let cl: Claim, merged = !!own
-  if (own) { for (const p of paths) if (!own.paths.includes(p)) own.paths.push(p); own.mode = mode; own.ttlSec = ttl; own.note = note || own.note; own.expiresAt = expiresAt; cl = own }
+  if (own) {
+    for (const p of paths) if (!own.paths.includes(p)) own.paths.push(p)
+    own.ttlSec = ttl; own.note = note || own.note; own.expiresAt = expiresAt; cl = own
+  }
   else { cl = { claimId: 'c_' + (++state.seq), holderId: h.holderId, holderName: h.name, paths, mode, ttlSec: ttl, expiresAt, note, createdAt: t }; state.claims.push(cl) }
   let warn: string | null = null
   if (ttl < 60) warn = 'short-lease: ttl=' + ttl + 's（<60s）; 请按时 heartbeat 续租，避免过期' + (merged ? '；已并入你现有声明' : '')

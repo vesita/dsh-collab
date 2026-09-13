@@ -140,6 +140,19 @@ pub fn hash_project_key(s: &str) -> String {
     format!("{:012x}", val)
 }
 
+/// 展开开头的 `~` / `~/`，与 TS 侧 `src/paths.ts` 的 expandHome 语义一致。
+fn expand_home(p: &str, home: Option<&str>) -> String {
+    if let Some(h) = home {
+        if p == "~" {
+            return h.to_string();
+        }
+        if let Some(rest) = p.strip_prefix("~/").or_else(|| p.strip_prefix("~\\")) {
+            return PathBuf::from(h).join(rest).to_string_lossy().into_owned();
+        }
+    }
+    p.to_string()
+}
+
 pub fn resolve_default_state_file() -> PathBuf {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let norm_cwd = cwd.to_string_lossy().replace('\\', "/");
@@ -148,10 +161,18 @@ pub fn resolve_default_state_file() -> PathBuf {
     let hash = hash_project_key(&norm_cwd);
     let file_name = format!("{}-{}.json", base, hash);
 
-    let home = std::env::var("DSH_HOME")
+    let home_env = std::env::var("HOME").ok().filter(|h| !h.trim().is_empty());
+    // DSH_HOME 优先；纯空白视为未设置；开头的 `~` 按 HOME 展开。
+    // 与 TS 侧 paths.ts 的 dshHomeDir 保持同一语义；仅当 HOME 也缺失时退到进程 cwd 下的 .dsh。
+    let explicit = std::env::var("DSH_HOME")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .map(|v| expand_home(&v, home_env.as_deref()));
+    let home = explicit
         .map(PathBuf::from)
-        .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".dsh")))
-        .unwrap_or_else(|_| PathBuf::from(".dsh"));
+        .or_else(|| home_env.map(|h| PathBuf::from(h).join(".dsh")))
+        .unwrap_or_else(|| cwd.join(".dsh"));
 
     let target_dir = home.join("collab").join("projects");
     let _ = fs::create_dir_all(&target_dir);
@@ -481,6 +502,17 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_expand_home_matches_ts_semantics() {
+        // 与 src/paths.ts 的 expandHome 对齐：~ 与 ~/ 展开，其余原样
+        assert_eq!(expand_home("~/.dsh", Some("/home/u")), "/home/u/.dsh");
+        assert_eq!(expand_home("~", Some("/home/u")), "/home/u");
+        assert_eq!(expand_home("/abs/.dsh", Some("/home/u")), "/abs/.dsh");
+        assert_eq!(expand_home("rel/.dsh", Some("/home/u")), "rel/.dsh");
+        // 没有 HOME 时保持字面量，由调用方决定后果
+        assert_eq!(expand_home("~/.dsh", None), "~/.dsh");
+    }
 
     #[test]
     fn test_norm_path() {

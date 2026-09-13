@@ -1,6 +1,6 @@
 {
   "name": "dsh-collab",
-  "version": "0.3.3",
+  "version": "0.4.2",
   "description": "Multi-agent real-time collaboration & concurrency lock plugin for DSH",
   "type": "module",
   "main": "lib/index.js",
@@ -27,7 +27,7 @@
     "build": "tsc -p tsconfig.json && cp -R src/types lib/",
     "build:types": "tsc --declaration --emitDeclarationOnly",
     "prepack": "npm run build",
-    "test": "npm run build && node tests/collab-pure-logic.mjs && node tests/collab-integration.mjs",
+    "test": "npm run build && node tests/collab-pure-logic.mjs && node tests/collab-integration.mjs && node tests/collab-hostcode-parity.mjs && node tests/collab-awareness.mjs && node tests/collab-e2e.mjs",
     "test:types": "tsc --noEmit",
     "lint": "tsc --noEmit"
   },

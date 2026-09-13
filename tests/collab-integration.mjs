@@ -2,6 +2,13 @@
 const cordis = await import('@deepseek-ai/cordis').catch(() => import('../node_modules/.pnpm/node_modules/@deepseek-ai/cordis/lib/index.js'))
 const { Context } = cordis
 import collabPlugin from '../lib/index.js'
+import os from 'node:os'
+import path from 'node:path'
+import { projectStateFile, collabDir } from '../lib/paths.js'
+
+// 隔离：把状态目录指到临时 DSH_HOME，避免测试污染真实 ~/.dsh。
+// paths.ts 在**调用时**读取 process.env，所以在 import 之后设置依然生效。
+process.env.DSH_HOME = path.join(os.tmpdir(), 'dsh-collab-it-' + process.pid)
 
 const ctx = new Context()
 ctx.provide('tools')
@@ -36,6 +43,16 @@ const boardTool = tools.find(t => t.name === 'collab_board')
 
 if (!lockTool || !boardTool) {
   throw new Error('collab_lock or collab_board not registered')
+}
+
+// 跨形态断言：包形态的 tool schema 必须与 collab-core 的 MODES（单一事实源）一致。
+// 历史缺陷：动态形态漏了 read，插件自己注入的提示要求 mode=read 而 schema 拒绝它。
+{
+  const { MODES } = await import('../lib/collab-core.js')
+  const modeEnum = lockTool.parameters.properties.mode.enum
+  if (!Array.isArray(modeEnum) || !MODES.every(m => modeEnum.includes(m))) {
+    throw new Error('packaged form mode enum must advertise every valid mode, got ' + JSON.stringify(modeEnum))
+  }
 }
 
 const exec1 = { agent: { id: 'agent-1' } }
@@ -74,10 +91,34 @@ if (badRelease.ok || badRelease.error !== 'bad-request') throw new Error('releas
 const badHeartbeat = await lockTool.execute({ op: 'heartbeat', claimId: 'c_nope' }, exec2)
 if (badHeartbeat.ok || badHeartbeat.error !== 'not-found') throw new Error('heartbeat of a missing claim must fail with not-found at top level')
 
-// 8. corrupt state self-heals instead of bricking the tool
-const { projectStorageFileName } = await import('../lib/collab-core.js')
-const statePath = '.dsh/collab/projects/' + projectStorageFileName('/test/workspace')
-stateStore.set(statePath, 'not-json{{{')
+// 8. 状态目录必须是**绝对路径**、不含字面量 `~`、且与进程 cwd 无关
+//    （历史 bug：hostCode 用 '~/.dsh/...' ⇒ 写进 <HOME>/~/.dsh/...；index.ts 用相对路径 ⇒ 随进程 cwd 漂移）
+const listed = await lockTool.execute({ op: 'list' }, exec2)
+const statePath = listed.data.statePath
+const stateDir = listed.data.stateDir
+if (!path.isAbsolute(statePath)) throw new Error('statePath must be absolute, got ' + statePath)
+if (statePath.includes('/~') || statePath.includes('~/.dsh')) throw new Error('statePath must not contain a literal ~ segment, got ' + statePath)
+if (statePath.startsWith(process.cwd() + path.sep)) throw new Error('statePath must not be anchored to the process cwd, got ' + statePath)
+if (stateDir !== collabDir()) throw new Error('stateDir must equal collabDir(), got ' + stateDir + ' vs ' + collabDir())
+if (!stateDir.startsWith(process.env.DSH_HOME)) throw new Error('stateDir must honour DSH_HOME, got ' + stateDir)
+
+// 8b. DSH_HOME 边界：开头的 ~ 要展开（否则又造出字面量 ~ 目录）、纯空白视为未设置
+{
+  const { dshHomeDir, expandHome } = await import('../lib/paths.js')
+  const realHome = os.homedir()
+  if (dshHomeDir({ DSH_HOME: '~/.dsh' }) !== path.join(realHome, '.dsh')) {
+    throw new Error("DSH_HOME='~/.dsh' must expand the tilde, got " + dshHomeDir({ DSH_HOME: '~/.dsh' }))
+  }
+  if (dshHomeDir({ DSH_HOME: '   ' }) !== path.join(realHome, '.dsh')) {
+    throw new Error('a blank DSH_HOME must be treated as unset, got ' + dshHomeDir({ DSH_HOME: '   ' }))
+  }
+  if (dshHomeDir({ DSH_HOME: '/tmp/abs-dsh' }) !== '/tmp/abs-dsh') throw new Error('absolute DSH_HOME must pass through')
+  if (expandHome('~/x', '/home/u') !== '/home/u/x' || expandHome('a/b', '/home/u') !== 'a/b') throw new Error('expandHome semantics drifted')
+}
+
+// 9. corrupt state self-heals instead of bricking the tool
+const corruptKey = projectStateFile('/test/workspace')
+stateStore.set(corruptKey, 'not-json{{{')
 const healed = await lockTool.execute({ op: 'list' }, exec2)
 if (!healed.ok) throw new Error('corrupt state must self-heal, got ' + JSON.stringify(healed))
 if (!String(healed.data.warning || '').includes('corrupted')) throw new Error('self-heal must surface a warning')
