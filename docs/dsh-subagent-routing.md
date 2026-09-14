@@ -125,13 +125,23 @@ shipped `standard` 里这一行的原始位置是 `presets/standard/agent.cordis
 
 | 用户 preset 目录 | 显示名 | 与 shipped 的差别 |
 |---|---|---|
-| `~/.dsh/.agent-presets/no-inherit-subagent/` | 标准模式（子代理不继承） | = shipped `standard` **+10 行**（注释 + `agentOptions`） |
-| `~/.dsh/.agent-presets/cordis-no-inherit/` | 创造模式（子代理不继承） | = shipped `cordis` **+11 行** |
+| `~/.dsh/.agent-presets/no-inherit-subagent/` | 标准模式（子代理不继承） | = shipped `standard` + `agentOptions`（含注释） |
+| `~/.dsh/.agent-presets/cordis-no-inherit/` | 创造模式（子代理不继承） | = shipped `cordis` + `agentOptions`（含注释），**且 `tool-cordis` 行置 `disabled: true`**（见下） |
 
 - 两者都把裸派子代理钉到 `google-antigravity/gemini-3.8-flash` / `reasoningEffort: high`；
   调用方显式点名 `provider`/`model` 仍可覆盖（`modelSelectionSettings: true` 保留）。
-- **实测**：`~/.dsh/settings.yaml` 的 `agent-presets.default` 现为 `no-inherit-subagent`。
-  （提醒：按 1.1，它只决定**新**会话；已在跑的会话不受影响。）
+- **`cordis` 副本必须让出 cordis 工具集**：`tool-cordis` 把检视 provider 注册进**进程全局**的
+  `cordisInspect` 服务（该服务由 `dsh-web-app` 这一 **host 组合**装载 —— `dsh-web-app/cordis.patch.yml:122-123`；
+  服务自身注释原文 "Register the process-global Host registry"，实现见
+  `dsh-cordis-host-runner/lib/types/inspect-registry.js:11-14`），同一进程里**只能存在一份实例**。
+  shipped `cordis` 已经占住它；第二个含 `tool-cordis` 的 preset 会在挂载期抛
+  `failed to apply loader entry tool-cordis … Host Cordis inspect provider "Service" is already registered`
+  （**实测**，见 4.3）。**preset 侧无法用 `isolate` realm 修**：`cordisInspect` 是 host 提供的服务，
+  不是 preset 自有的，两个实例仍会注册进同一个全局注册表。
+  因此副本把 `tool-cordis` 置 `disabled: true`：**要创作 preset 就用 shipped 创造模式**，
+  本副本只负责"创造模式的能力面 + 钉死的子代理路由"，从而**任何进程状态下都能挂载**。
+- 要让**新**会话默认用其中一份，把 `~/.dsh/settings.yaml` 的 `agent-presets.default` 设为对应 id
+  （本仓库不替你改；能改的只有 `~/.dsh/settings.yaml`，按 1.1 它只影响**新**会话）。
 - 差别可用 `diff` 一眼核对（**实测**，本机）：
 
   ```bash
@@ -158,6 +168,9 @@ cp "$SHIP/standard/agent.cordis.yml" ~/.dsh/.agent-presets/$ID/agent.cordis.yml
 cp "$SHIP/standard/preset.yml"       ~/.dsh/.agent-presets/$ID/preset.yml
 # 然后编辑 preset.yml 的 name/description，并在 agent.cordis.yml 的 tool-subagent 行 config 里加第 2 节那段
 ```
+
+> **从 `cordis` 复制时另加一步**：把 `tool-cordis` 行置 `disabled: true`（或整行删掉）—— 理由见 2.1，
+> 否则副本在已有 cordis 系 preset 的进程里**挂载失败**。`no-inherit-subagent`（源自 `standard`）无此步。
 
 `preset.yml` 最小形状（**实测**，`dsh-agent-presets/lib/index.js:67-72,85-91`：解析 `name` /
 `description` / `order`，缺哪个省哪个）：
@@ -264,14 +277,15 @@ for line in sys.stdin:
 跑带 `agentOptions` 的 preset 时应打印 `google-antigravity / gemini-3.8-flash @ high`。
 `subagent/descriptor` 记录里的 `agentProvider`/`agentModel` 是同一路由的副本，可交叉核对。
 
-### 4.2 排障：三类失败与一眼判据
+### 4.2 排障：四类失败与一眼判据
 
-判据都是**报错里的路径前缀**，一眼可分：
+判据是**报错里的路径前缀或服务名**，一眼可分：
 
 | 失败 | 路径前缀 | 含义与处置 |
 |---|---|---|
 | **悬空默认 preset** | 报错指向 `agent-presets.default` 里那个 id | 默认指向了一个已不存在的目录 ⇒ 新会话创建/恢复失败。改回存在的 id（**实测**语义：default 只影响新会话，见 1.1） |
 | **自建副本挂载失败** | `~/.dsh/.agent-presets/<id>/` | 是**你自己的副本**：`agentOptions` 字段写错、provider 不支持该能力（1.3 的 `does not support child agentOptions`）、YAML 缩进坏等 |
+| **同进程第二个 `tool-cordis`** | 报错含 `Host Cordis inspect provider "…" is already registered` | 该副本含 `tool-cordis`，而进程里已有另一个含它的 preset（通常是 shipped `cordis`）。`cordisInspect` 是 **host 组合装载的进程全局**服务，preset 侧不能 isolate（见 2.1、4.3）。把副本的 `tool-cordis` 置 `disabled: true` |
 | **部署 shipped preset 冲突** | `/usr/lib/node_modules/.../dsh-agent-presets/presets/<id>/` | 部署/版本层问题，不是你写的。**实测一次**（原文：`preset "cordis" failed to mount: prompt section "deployment:persona-prefix" is already registered`；本次核查未在日志里找到留存副本，标注为**单次实测**）：发生在全局包刚换版本、旧进程/profile 仍在跑的半升级状态；**重装成一套一致版本后消失** |
 
 **何时需要重启**（见 2.3）：新建/编辑**用户 preset 目录不需要重启**（roster 每次读取都重扫目录）；
@@ -294,6 +308,8 @@ for line in sys.stdin:
 | provider 能力声明 | `dsh-subagent-spawn-in-process/lib/index.js:24` → `agentOptions: true` |
 | 挂载期断言 | `dsh-tool-subagent/lib/index.js:376-380`（报错在 `:378`） |
 | roster 每次读取重扫 | `dsh-agent-presets/lib/index.js:382`、`:242` |
+| **cordis 工具集进程单例** | 本机 cordis 会话存活时 `standingKeyFor('cordis-no-inherit')` 返回 `failed to apply loader entry tool-cordis … Host Cordis inspect provider "Service" is already registered`；同一副本把 `tool-cordis` 置 `disabled: true` 后，同一次调用返回 `OK`（副本：`~/.dsh/.agent-presets/cordis-no-inherit/agent.cordis.yml`） |
+| **全局注册表的宿主归属** | `dsh-web-app/cordis.patch.yml:122-123` 装载 `@deepseek-ai/dsh-cordis-host-runner`；`dsh-cordis-host-runner/lib/types/inspect-registry.js:11-14` 以 `super(ctx, 'cordisInspect')` 注册，注释 "Register the process-global Host registry"；`register()` 在重名时抛错（`:22-23`） |
 
 ## 5. 本文不做什么
 
