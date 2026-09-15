@@ -96,6 +96,8 @@
   diff "$SHIP/cordis/agent.cordis.yml"   ~/.dsh/.agent-presets/cordis-no-inherit/agent.cordis.yml
   ```
 
+- **升级 DSH 后必重跑上面的 diff**：副本冻结的是**复制那一刻**的 shipped 行名，部署改名后整份挂载失败（0.1.6 **实测**：`dsh-workflow-worker-thread` → `dsh-workflow-ptc`，报 `Cannot find package '@deepseek-ai/dsh-workflow-worker-thread'`，两个副本一起失效）。修法 = 把漂移行改回 shipped 现名，直到 diff 只剩上表的预期差别；`cordis-no-inherit/skills/` 里随行的 skill 副本同样冻结旧行名，一并重同步。
+
 ### 2.2 自己造一份
 
 ```bash
@@ -121,7 +123,7 @@ description: >-                # 建议给
 ### 2.3 生效条件与边界
 
 - `agent-presets.default`：只影响**新**会话（见 1.1）；回滚即"下一个新会话别再用它"，一行。
-- **改用户 preset 目录**：**不需重启** —— roster 每次读取都重扫目录（**实测** `dsh-agent-presets/lib/index.js:382` "Every directory whose name is a usable preset id is a roster row"、`:242` "runs on every roster read"）。
+- **改用户 preset 目录**：**不需重启** —— roster 每次读取都重扫目录（**实测** `dsh-agent-presets/lib/index.js:364` "Every directory whose name is a usable preset id is a roster row"；service 契约亦声明 discovery 不 memo，`list()`/`resolve()` 每次调用重读 roots）。
 - **改 npm 依赖（插件包）**：**需重启** —— 组合里 `name:` 是 Node 模块，进程不热加载（**推断**）。
 - 用带固定路由的会话：**新开一个**该 preset 的会话；已开会话切换 preset 后，**新派**的子代理才按新 preset 解析（见 1.1 实测）。
 
@@ -188,6 +190,7 @@ for line in sys.stdin:
 |---|---|---|
 | 悬空默认 preset | 报错指向 `agent-presets.default` 里那个 id | 默认指向不存在的目录 ⇒ 新会话创建/恢复失败。改回存在的 id（default 只影响新会话，见 1.1） |
 | 自建副本挂载失败 | `~/.dsh/.agent-presets/<id>/` | 自己的副本：`agentOptions` 字段写错、provider 不支持该能力（见 1.3）、YAML 缩进坏 |
+| 升版后副本挂载失败 | 报错含 `Cannot find package '@deepseek-ai/…'`（roster 该行带 `broken`） | 副本里的 `name:` 被新版本改过。按 2.1 重跑 diff，把漂移行改回 shipped 现名 |
 | 同进程第二个 `tool-cordis` | 报错含 `Host Cordis inspect provider "…" is already registered` | 进程里已有另一个含 `tool-cordis` 的 preset（通常是 shipped `cordis`）。`cordisInspect` 是 host 装载的进程全局服务，preset 侧不能 isolate。把副本 `tool-cordis` 置 `disabled: true`（见 2.1） |
 | 部署 shipped preset 冲突 | `/usr/lib/node_modules/.../dsh-agent-presets/presets/<id>/` | 部署/版本层问题，非你所写。**单次实测**：`preset "cordis" failed to mount: prompt section "deployment:persona-prefix" is already registered`，发生在包刚换版本、旧进程仍在跑的半升级态；**重装成一致版本后消失** |
 
@@ -209,7 +212,8 @@ for line in sys.stdin:
 | schema 字段声明 | `dsh-tool-subagent/lib/index.js:258-263`（验证器不拒绝缺字段，见 1.3） |
 | provider 能力声明 | `dsh-subagent-spawn-in-process/lib/index.js:24` → `agentOptions: true` |
 | 挂载期断言 | `dsh-tool-subagent/lib/index.js:376-380`（报错 `:378`） |
-| roster 每次读取重扫 | `dsh-agent-presets/lib/index.js:382`、`:242` |
+| roster 每次读取重扫 | `dsh-agent-presets/lib/index.js:364` |
+| 升版导致行名漂移 | 0.1.6：两副本报 `Cannot find package '@deepseek-ai/dsh-workflow-worker-thread'`；改回 `dsh-workflow-ptc` 后 `standingKeyFor` 双双 `OK`、roster `broken` 清空 |
 | cordis 工具集进程单例 | cordis 会话存活时 `standingKeyFor('cordis-no-inherit')` = `failed to apply loader entry tool-cordis … already registered`；置 `disabled: true` 后同调用返回 `OK` |
 | 全局注册表宿主归属 | `dsh-web-app/cordis.patch.yml:122-123` 装载 `dsh-cordis-host-runner`；`…/inspect-registry.js:11-14` `super(ctx, 'cordisInspect')` + "process-global Host registry"；`register()` 重名抛错 `:22-23` |
 
