@@ -246,7 +246,7 @@ if (!hostCode || typeof hostCode !== 'string') {
 const EXPECTED_PARITY = [
   'claim', 'cleanName', 'clockUtc', 'dropHolder', 'expire', 'hashProjectKey', 'heartbeat',
   'holder', 'holderFresh', 'holderView', 'init', 'modeLabel', 'norm', 'ov', 'post', 'reap',
-  'release', 'renderDigest', 'seg', 'sweep'
+  'release', 'releaseOnLoopEnd', 'renderDigest', 'seg', 'sweep'
 ].sort()
 // 同名但**不同形**：宿主的 overview(agentId) 是 async 的 I/O op（load→expire→聚合），
 // core 的 overview(state) 是纯状态变换。两者不是同一形状的函数，不能逐参对拍；
@@ -294,6 +294,11 @@ tryExtract('release', { now: fixedNow, norm: host.norm, ov: host.ov, pub: host.p
 // 与 core 的 REAP_DEFAULT_OLDER_THAN_SEC 是否一致由下面的语料守护（含一个不传 olderThanSec 的用例）。
 tryExtract('reap', { norm: host.norm, ov: host.ov, pub: host.pub })
 tryExtract('dropHolder', { pub: host.pub, hostReaders: host.hostReaders })
+// releaseOnLoopEnd（0.9.10）：纯函数 releaseOnLoopEnd(s, holderId, holderName, t, graceSec)。
+// 宿主内联的 author 写字面量 'system:dsh-collab'，core 侧用导出的 AUTO_RELEASE_AUTHOR —— 两者是否
+// 一致由下面的语料**逐输出**守护（消息对象里带 author 字段，对拍即校验）。宽限期同理：宿主是
+// 接线层传进来的常量 15，core 不自己判断，所以语料里显式传不同 graceSec 值。
+tryExtract('releaseOnLoopEnd', { pub: host.pub })
 tryExtract('heartbeat', { now: fixedNow })
 tryExtract('post', { now: fixedNow, holder: host.holder })
 let overviewLoad = async () => ({ state: null, target: { path: '/fake/collab/state.json' }, stateDir: '/tmp', warn: null })
@@ -878,6 +883,73 @@ group('dropHolder', '会话退出：只回收已过期声明 + 从所有剩余 c
     }
   }
 }
+// ---------------------------------------------------------------- releaseOnLoopEnd
+// 循环终止自动释放（0.9.10）：会话循环停下（agent/status → idle）并过了宽限期之后，把该 holder
+// 的**未过期**声明全部释放，并在留言板留一条审计留言（channel=agent:<holderId>）。
+// 两形态必须逐输出等价 —— 包括留言对象本身（author / channel / seq / 正文）。
+group('releaseOnLoopEnd', '循环终止自动释放：只释放未过期声明 + 留言留痕（幂等）')
+{
+  const R = (label, opts) => pairCase('releaseOnLoopEnd', label, () => {
+    const state = mkState(opts.state ? opts.state() : {})
+    const holderId = opts.holderId || 'agent:A'
+    const name = opts.name === undefined ? NAME_A : opts.name
+    const t = opts.t === undefined ? T0 : opts.t
+    const graceSec = opts.graceSec === undefined ? 15 : opts.graceSec
+    return { hostArgs: [state, holderId, name, t, graceSec], coreArgs: [state, holderId, name, t, graceSec], state }
+  })
+  R('单条未过期声明被释放', { state: () => ({ claims: [mkClaimRec({ claimId: 'c_1' })] }) })
+  R('已过期声明**不**动（那是 sweep 的活）', { state: () => ({ claims: [mkClaimRec({ claimId: 'c_e', expiresAt: T0 - 1 })] }) })
+  R('混合：未过期释放、已过期原样留下', { state: () => ({ claims: [mkClaimRec({ claimId: 'c_live' }), mkClaimRec({ claimId: 'c_exp', expiresAt: T0 - 1 })] }) })
+  R('其他 holder 的声明不受影响', { state: () => ({ claims: [mkClaimRec({ claimId: 'c_a' }), mkClaimRec({ claimId: 'c_b', holderId: 'agent:B', holderName: 'Worker B', paths: ['src/b/'] })] }) })
+  R('一条声明都没有 → changed:false（不留痕）', { state: () => ({ claims: [] }) })
+  R('holder 不在状态里 → changed:false', { state: () => ({ claims: [mkClaimRec({ claimId: 'c_b', holderId: 'agent:B' })] }) })
+  R('多条声明 + 路径去重折叠（> 3 条只计数）', {
+    state: () => ({
+      seq: 11,
+      claims: [
+        mkClaimRec({ claimId: 'c_1', paths: ['src/a/', 'src/b/', 'src/c/'] }),
+        mkClaimRec({ claimId: 'c_2', paths: ['src/d/', 'src/b/'], mode: 'shared' })
+      ]
+    })
+  })
+  R('holderName 为空时留言用 holderId', { state: () => ({ claims: [mkClaimRec({ claimId: 'c_1' })] }), name: '' })
+  R('graceSec 取非默认值时留言文案跟着变', { state: () => ({ claims: [mkClaimRec({ claimId: 'c_1' })] }), graceSec: 90 })
+  R('边界：expiresAt === t **不算**未过期（与 sweep 的 > t 同一判据）', { state: () => ({ claims: [mkClaimRec({ claimId: 'c_bd', expiresAt: T0 })] }) })
+  R('留言 seq 接在既有 seq 之后（claim 与 message 共用一个 seq）', { state: () => ({ seq: 41, claims: [mkClaimRec({ claimId: 'c_1' })] }) })
+  R('已有留言时追加在末尾', { state: () => ({ seq: 9, messages: mkMessages(2, 8), claims: [mkClaimRec({ claimId: 'c_1' })] }) })
+
+  // 幂等：第二次必须 changed === false（两形态一致），且**不**再留痕。
+  {
+    const mk = () => mkState({ claims: [mkClaimRec({ claimId: 'c_1', readers: ['agent:R'] })] })
+    const hs = mk(), cs = mk()
+    const h1 = host.releaseOnLoopEnd(hs, 'agent:A', NAME_A, T0, 15), c1 = coreFns.releaseOnLoopEnd(cs, 'agent:A', NAME_A, T0, 15)
+    const h2 = host.releaseOnLoopEnd(hs, 'agent:A', NAME_A, T0, 15), c2 = coreFns.releaseOnLoopEnd(cs, 'agent:A', NAME_A, T0, 15)
+    cmp('releaseOnLoopEnd · 第一次输出', outcome({ threw: false, value: h1 }), outcome({ threw: false, value: c1 }))
+    cmp('releaseOnLoopEnd · 第二次输出（幂等）', outcome({ threw: false, value: h2 }), outcome({ threw: false, value: c2 }))
+    cmp('releaseOnLoopEnd · 两次调用后的 state', hs, cs)
+    ok(h1.changed === true && h2.changed === false, '幂等：第一次 changed / 第二次 not changed', String(h1.changed) + '/' + String(h2.changed))
+    ok(hs.messages.length === 1, '幂等：只留一条审计留言（第二次不再追加）', String(hs.messages.length))
+  }
+
+  // 显式钉住取值（不只看两形态相等）：释放了什么、留下了什么、留痕长什么样。
+  {
+    const st = mkState({
+      seq: 7,
+      claims: [
+        mkClaimRec({ claimId: 'c_1', paths: ['src/a/', 'src/a/b/'], readers: ['agent:R'] }),
+        mkClaimRec({ claimId: 'c_2', holderId: 'agent:B', paths: ['src/b/'] })
+      ]
+    })
+    const r = coreFns.releaseOnLoopEnd(st, 'agent:A', NAME_A, T0, 15)
+    ok(r.data.released.length === 1 && r.data.released[0].claimId === 'c_1', 'data.released 只含真正被删的那条', JSON.stringify(r.data.released.map((x) => x.claimId)))
+    ok(st.claims.length === 1 && st.claims[0].claimId === 'c_2', 'state 里只剩别人的声明', JSON.stringify(st.claims.map((x) => x.claimId)))
+    const m = r.data.notice
+    ok(m && m.channel === 'agent:A' && m.author === 'system:dsh-collab', '留痕寻址到持有者（channel 就是 holderId，不再重复拼 agent:）、作者是 system:dsh-collab', JSON.stringify(m && [m.channel, m.author]))
+    ok(m && Array.isArray(m.mentions) && m.mentions[0] === 'agent:A' && String(m.body).includes('自动释放'), '留痕 mention 持有者且正文说明是自动释放', JSON.stringify(m && m.body))
+    ok(m && m.seq === 8 && m.msgId === 'm_8', '留痕序号接在既有 seq 之后', JSON.stringify(m && [m.seq, m.msgId]))
+    ok(core.AUTO_RELEASE_AUTHOR === 'system:dsh-collab', 'AUTO_RELEASE_AUTHOR 常量与留痕作者一致（宿主内联字面量由上面的逐输出对拍守护）', String(core.AUTO_RELEASE_AUTHOR))
+  }
+}
 // ---------------------------------------------------------------- heartbeat
 group('heartbeat', '续租：expiresAt = now + ttlSec / forbidden / not-found')
 {
@@ -963,7 +1035,7 @@ group('corpus', '每个同名函数的语料条数下限（防止语料被悄悄
     const n = g ? g.pass + g.fail : 0
     ok(n >= 4, 'corpus · ' + name + ' 至少 4 条断言', 'actual=' + n)
   }
-  ok(EXPECTED_PARITY.length === 20, '逐输出对拍的同名函数恰好 20 个', String(EXPECTED_PARITY.length))
+  ok(EXPECTED_PARITY.length === 21, '逐输出对拍的同名函数恰好 21 个', String(EXPECTED_PARITY.length))
 }
 
 // ---------------------------------------------------------------- 汇总

@@ -14,15 +14,34 @@ export const CLIENT_SKILL_ROUTE = '/dsh-collab/skill-index'
 /** 偏好设置命名空间。 */
 export const DELEGATION_SETTINGS_NAMESPACE = 'dsh-collab'
 
+/**
+ * 循环终止自动释放的宽限期（秒）：循环停下（agent/status → idle）后等这么久，
+ * 期间会话恢复 running 就**取消**释放。默认 15 秒 ——
+ * 它要短到能解开"父会话结束循环、子代理干等锁"的死锁，又要长到不把两个回合之间的
+ * 正常停顿（模型思考/工具往返之间的空隙）算成"会话结束了"。
+ */
+export const LOOP_END_GRACE_SEC_DEFAULT: number = 15
+export const LOOP_END_GRACE_SEC_MIN: number = 1
+export const LOOP_END_GRACE_SEC_MAX: number = 3600
+
 /** 设置契约：默认**开启**——目标是让这套工作方式真的发生，开关是用来关掉它的。 */
 export const DELEGATION_SETTINGS_SCHEMA = z.object({
   exposeDelegationDiscipline: z.boolean().default(true),
   // 功能 C：写保护默认开。默认值就是"必须拦"，所以它只能被显式关掉。
-  enforceWriteLock: z.boolean().default(true)
+  enforceWriteLock: z.boolean().default(true),
+  // 循环终止自动释放（0.9.10）：默认开。关掉它对应用户明确要求"锁必须活到我手动释放"。
+  releaseOnLoopEnd: z.boolean().default(true),
+  // 宽限期（秒）。夹在 [1, 3600]：0 会把"每个回合之间的停顿"也算成循环终止。
+  loopEndGraceSec: z.number().min(LOOP_END_GRACE_SEC_MIN).max(LOOP_END_GRACE_SEC_MAX).default(LOOP_END_GRACE_SEC_DEFAULT)
 })
 
 /** 组合默认值：settings 服务缺失（或 installSection 不可用）时，它就是生效值。 */
-export const DELEGATION_SETTINGS_ENTRY: DelegationSettings = { exposeDelegationDiscipline: true, enforceWriteLock: true }
+export const DELEGATION_SETTINGS_ENTRY: DelegationSettings = {
+  exposeDelegationDiscipline: true,
+  enforceWriteLock: true,
+  releaseOnLoopEnd: true,
+  loopEndGraceSec: LOOP_END_GRACE_SEC_DEFAULT
+}
 
 /**
  * 常驻委托纪律文本：**纯常量**，无时间戳、无计数、无任何会漂移的字符。
@@ -35,7 +54,8 @@ export const DELEGATION_DISCIPLINE_TEXT = [
   '判据：能用一段话写清规格、且能用一次检查判定对错就委托，否则先想清规格；探索阶段默认先派：为答一个问题连读多文件、或先跑一遍才知道结果时，把整个问题包给子代理，只收「文件:行 + 结论」再验收，别在主会话自己翻。',
   '独立单元同一条消息并行发，一个子代理只回答一个完整问题；验收永远留主 AI：不外包结论，要原始输出作证据，别只看摘要。',
   '只等子代理不算一轮：说清在等谁并结束，别用重复验证或轮询凑数。',
-  '子代理禁止 client 检视（无浏览器页面必永久挂起），界面信息由主 AI 预查后写进背景；别凭收尾消息结案（可能静默空收尾），开文件验产物；同一仓库只许一个跑构建，其余只做类型检查。'
+  '子代理禁止 client 检视（无浏览器页面必永久挂起），界面信息由主 AI 预查后写进背景；别凭收尾消息结案（可能静默空收尾），开文件验产物；同一仓库只许一个跑构建，其余只做类型检查。',
+  '循环一停就自动放锁：你结束循环（空闲十几秒）后，持有的声明会被自动释放 —— 恢复工作时先用 collab_lock op=claim 重新声明，再写这些路径。'
 ].join('\n')
 
 // ---- 功能 C：写/读调用的路径事实源 ----

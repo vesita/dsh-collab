@@ -25,8 +25,13 @@ export interface Claim {
    * 可选字段同样为了兼容老状态文件 —— 缺省即 `[]`（见 collab-core 的 readersOf）。
    * 移除时机只有两处：持有者 `op=release`（整条声明消失）、`agent/disposed`（dropHolder 摘登记，
    * 它在**会话被 dispose 之后往往还会恢复**，所以措辞不用"真正的会话结束"）。
-   * **声明本身不因 dispose 而被回收**（W7）：claim 的生命周期只由租约 `expiresAt` 决定，
-   * dispose 只是摘掉 reader 登记、并回收该 holder 已过期的声明。
+   * **声明本身不因 dispose 而被回收**（W7）：dispose 只是摘掉 reader 登记、并回收该 holder
+   * 已过期的声明。声明有**三条**回收路径，别把其中任何一条读成"会话结束了"：
+   *   1) 租约到期 `expiresAt`（sweep，唯一无条件的回收路径）；
+   *   2) 持有者显式 `op=release`；
+   *   3) **循环终止自动释放**（0.9.10，`releaseOnLoopEnd`）：`agent/status` → `idle` 且空闲超过
+   *      宽限期（默认 15 秒，可在 settings 关掉）—— 触发者不是 dispose，而是"循环停了、
+   *      但 agent 还加载着"这一刻，见 src/auto-release.ts。恢复工作前必须重新 claim。
    * 0.8.3 起 sweep() 不再按 liveness 清理 —— `agents.get()` 对休眠但可唤回的会话
    * 返回 undefined，按它清理会把只是空闲的读者删掉，静默丢掉释放通知。
    */

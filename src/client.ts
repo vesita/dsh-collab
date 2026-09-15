@@ -31,6 +31,14 @@
     const FIELD = 'exposeDelegationDiscipline'
     /** 功能 C 的写保护开关（布尔，默认 **true**；字段名必须与 Host 半边 schema 逐字一致）。 */
     const WRITE_LOCK_FIELD = 'enforceWriteLock'
+    /** 循环终止自动释放的开关（布尔，默认 **true**；字段名与 Host 半边 schema 逐字一致）。 */
+    const AUTO_RELEASE_FIELD = 'releaseOnLoopEnd'
+    /** 上面那条的宽限期秒数（数字，默认 15；Host 半边把它夹在 [1, 3600]）。 */
+    const AUTO_RELEASE_GRACE_FIELD = 'loopEndGraceSec'
+    /** Host 半边 spec.ts 的三个常量，逐字对齐（这里只做前端夹取与回退，权威仍在 Host）。 */
+    const GRACE_MIN = 1
+    const GRACE_MAX = 3600
+    const GRACE_DEFAULT = 15
     /** Host 半边注册的只读技能索引路由。 */
     const SKILL_ROUTE = '/dsh-collab/skill-index'
     /** 下拉的两档文案。 */
@@ -39,6 +47,9 @@
     /** 写保护开关的两档文案。 */
     const LOCK_ON_LABEL = '拦截'
     const LOCK_OFF_LABEL = '不拦截'
+    /** 循环终止自动释放的两档文案。 */
+    const AUTO_ON_LABEL = '自动释放'
+    const AUTO_OFF_LABEL = '不自动释放'
     /**
      * `dsh-resource://file/session/<sessionId>/<path>` 前缀。
      * 只读**会话作用域**：`absolute` 作用域在本部署读不了 —— 文档预览类型的
@@ -64,7 +75,12 @@
     /** 设置 scope 快照中本卡片真正用到的字段。 */
     interface ScopeSnapshot {
       status: 'loading' | 'ready' | 'unavailable'
-      value: { exposeDelegationDiscipline?: boolean; enforceWriteLock?: boolean } | undefined
+      value: {
+        exposeDelegationDiscipline?: boolean
+        enforceWriteLock?: boolean
+        releaseOnLoopEnd?: boolean
+        loopEndGraceSec?: number
+      } | undefined
       writable: boolean
       revision: number | undefined
     }
@@ -170,6 +186,20 @@
         color: 'var(--dsw-alias-label-secondary)',
         background: '0 0'
       },
+      /** 秒数输入框：与 select 同一套边框/底色 token，宽度收窄到够放四位数。 */
+      number: {
+        font: 'inherit',
+        height: '34px',
+        width: '84px',
+        border: '0.5px solid var(--dsw-alias-border-l4)',
+        background: 'var(--dsw-alias-bg-layer-3)',
+        color: 'var(--dsw-alias-label-primary)',
+        borderRadius: '8px',
+        padding: '0 10px',
+        fontSize: '13px'
+      },
+      /** 数字后面的单位（"秒"）：只做说明，不可点。 */
+      unit: { color: 'var(--dsw-alias-label-tertiary)', fontSize: '12px' },
       hint: {
         color: 'var(--dsw-alias-label-tertiary)',
         margin: 0,
@@ -240,6 +270,13 @@
         const [open, setOpen] = React.useState(false)
         const [skill, setSkill] = React.useState({ status: 'loading', skill: null, error: null } as SkillState)
         const [notice, setNotice] = React.useState(null as string | null)
+        /**
+         * 宽限期输入框的**本地草稿**（null = 跟随 Host 快照）。
+         * 为什么要草稿：受控 input 直接写 Host 会在每次按键上触发一次保存，
+         * 而保存期间的 `disabled` 会让 input 立刻失焦 —— 用户输入两位数会被打断。
+         * 所以输入只改草稿，**失焦或回车**才写回（写回时夹到 [1, 3600]）。
+         */
+        const [graceDraft, setGraceDraft] = React.useState(null as string | null)
 
         React.useEffect(() => {
           setSnapshot(scope.getSnapshot())
@@ -288,7 +325,7 @@
           return () => clearTimeout(timer)
         }, [notice])
 
-        const write = (field: string, next: boolean) => {
+        const write = (field: string, next: boolean | number) => {
           setSaving(true)
           setFailed(false)
           Promise.resolve(scope.set(field, next)).then(
@@ -344,8 +381,28 @@
         // schema 默认开启：只有显式关掉才是关。
         const enabled = snapshot.value?.exposeDelegationDiscipline !== false
         const writeLock = snapshot.value?.enforceWriteLock !== false
+        const autoRelease = snapshot.value?.releaseOnLoopEnd !== false
+        // 宽限期：Host 是权威（夹在 [1, 3600]），这里只做同口径的前端回退，避免显示 NaN。
+        const rawGrace = Number(snapshot.value?.loopEndGraceSec)
+        const graceSec = Number.isFinite(rawGrace)
+          ? Math.min(GRACE_MAX, Math.max(GRACE_MIN, Math.round(rawGrace)))
+          : GRACE_DEFAULT
         const disabled = snapshot.writable !== true || saving
         const stateLabel = enabled ? ON_LABEL : OFF_LABEL
+
+        /**
+         * 把宽限期草稿写回 Host；非法值直接丢弃（回到 Host 的值）。
+         * 与 Host 同口径夹到 [1, 3600]，值没变就不发请求。
+         */
+        const commitGrace = (draft: string | null) => {
+          setGraceDraft(null)
+          if (draft === null) return
+          const next = Number(draft)
+          if (!Number.isFinite(next)) return
+          const clamped = Math.min(GRACE_MAX, Math.max(GRACE_MIN, Math.round(next)))
+          if (clamped === graceSec) return
+          write(AUTO_RELEASE_GRACE_FIELD, clamped)
+        }
 
         const header = h(
           'button',
@@ -362,7 +419,8 @@
             'span',
             { style: styles.headText },
             h('span', { style: styles.name }, 'collab 配置'),
-            h('span', { style: styles.summary }, '委托与验收纪律 · ' + stateLabel + ' · 写保护 ' + (writeLock ? LOCK_ON_LABEL : LOCK_OFF_LABEL))
+            h('span', { style: styles.summary }, '委托与验收纪律 · ' + stateLabel + ' · 写保护 ' + (writeLock ? LOCK_ON_LABEL : LOCK_OFF_LABEL) +
+              ' · ' + (autoRelease ? AUTO_ON_LABEL + ' ' + graceSec + ' 秒' : AUTO_OFF_LABEL))
           )
         )
 
@@ -464,6 +522,64 @@
                     'p',
                     { style: styles.hint },
                     '拦截：写入/修改他人已声明占用的路径前先走原生审批（本部署没有审批提示时，ask 会变成硬拒绝）；关闭则完全不拦。'
+                  )
+                ),
+                h(
+                  'div',
+                  { style: styles.item },
+                  h(
+                    'div',
+                    { style: styles.itemHead },
+                    h('span', { style: styles.itemLabel }, '循环终止自动释放'),
+                    h('span', { style: styles.itemType }, '锁生命周期')
+                  ),
+                  h(
+                    'div',
+                    { style: styles.controls },
+                    h(
+                      'select',
+                      {
+                        key: 'auto',
+                        style: styles.select,
+                        value: autoRelease ? 'on' : 'off',
+                        disabled,
+                        'aria-label': '循环终止自动释放',
+                        onChange: (event: any) => {
+                          write(AUTO_RELEASE_FIELD, event.target.value === 'on')
+                        }
+                      },
+                      h('option', { key: 'on', value: 'on' }, AUTO_ON_LABEL),
+                      h('option', { key: 'off', value: 'off' }, AUTO_OFF_LABEL)
+                    ),
+                    h('input', {
+                      key: 'grace',
+                      type: 'number',
+                      style: styles.number,
+                      min: GRACE_MIN,
+                      max: GRACE_MAX,
+                      step: 1,
+                      // 草稿优先；跟随 Host 时用归一后的值。
+                      value: graceDraft !== null ? graceDraft : String(graceSec),
+                      // **不**因 saving 而 disable：输入框一 disabled 就会失焦，多位数会输不完。
+                      disabled: snapshot.writable !== true || !autoRelease,
+                      'aria-label': '空闲宽限期（秒）',
+                      onChange: (event: any) => {
+                        setGraceDraft(String(event.target.value))
+                      },
+                      onBlur: () => {
+                        commitGrace(graceDraft)
+                      },
+                      onKeyDown: (event: any) => {
+                        if (event && event.key === 'Enter') commitGrace(graceDraft)
+                      }
+                    }),
+                    h('span', { style: styles.unit }, '秒')
+                  ),
+                  h(
+                    'p',
+                    { style: styles.hint },
+                    '会话循环停下（空闲超过上面的秒数）后，它持有的声明会被自动释放，让等在后面的会话能接着干；' +
+                    '宽限期内被唤醒则取消释放。释放后会通知等待者，并给该会话留一条「你的锁已被自动释放」的告知。'
                   )
                 ),
                 h(

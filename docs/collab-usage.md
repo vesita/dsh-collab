@@ -123,7 +123,27 @@ collab_lock op=wait paths=["src/backend/models/"] timeoutMs=15000
 
 等待给定路径被他人**独占**声明释放。`blockers` 是当前阻塞者（空数组表示可以进入）；`timeoutMs` 到点仍被占则返回 timeout + blockers + waitedMs。`read` / `shared` 声明会直接放行。
 
-### 2.5 维护
+### 2.5 循环终止自动释放（0.9.10）
+
+会话的循环停下（`agent/status` 从 `running` 翻到 `idle`）并空闲超过**宽限期**（默认 **15 秒**）
+后，它持有的声明**自动释放** —— 这是"父会话派完子代理就停下、锁还占着"那个死锁的出口
+（停下的循环收不到任何通知：`agent.inject` 不唤醒 driver，留言板协商它读不到）。
+
+- 宽限期内被唤醒 ⇒ **取消**释放；到点还必须解析到该会话且它仍是 `idle`（判据不可用、或它已
+  退场，一律不放）。
+- 只释放该会话**未过期**的声明；别人的、已过期的都不动。
+- 释放后：等待者收到「锁已自动释放」，被释放的会话收到「你的声明已被自动释放，恢复工作前重新
+  `claim`」；状态文件里另留一条审计留言（`channel` = `agent:<sessionId>`），`collab_board op=read` 可回读。
+
+| 设置（命名空间 `dsh-collab`，活读） | 默认 | 说明 |
+| --- | --- | --- |
+| `releaseOnLoopEnd` | `true` | 关掉则回到旧行为：只由 `release` / 租约到期回收 |
+| `loopEndGraceSec` | `15` | 宽限秒数，夹在 `[1, 3600]` |
+
+> 宽限期排不掉"等真人回复"这种停顿：超过宽限期同样会放锁。希望锁握到手动 `release` 就关掉
+> `releaseOnLoopEnd`（或调大 `loopEndGraceSec`）。
+
+### 2.6 维护
 
 | op | 用途 |
 | --- | --- |
@@ -132,8 +152,9 @@ collab_lock op=wait paths=["src/backend/models/"] timeoutMs=15000
 | `heartbeat claimId=...` | 续租（延长至 `now + ttlSec`） |
 | `reap` | **僵尸声明显式回收**（默认 dry-run，只列候选、不改状态） |
 | `reap confirm=true` | 真正回收命中判据的僵尸声明（回收后通知其读者） |
+| —（无 op） | **循环终止自动释放**：循环停下且空闲超过宽限期后自动执行，不是手动 op，见 §2.5 |
 
-### 2.6 僵尸声明显式回收（`reap`）
+### 2.7 僵尸声明显式回收（`reap`）
 
 被**强杀**的会话（dsh 重启等）不会 `release`，它未到期的声明会一直占用到租约到期；租约最长
 `86400` 秒 ⇒ 最长 24 小时内他人对这些路径的**写入都会被门控硬拒绝**，而声明只有持有者本人能
@@ -156,7 +177,7 @@ collab_lock op=reap paths=["src/"] olderThanSec=60    # 可限定路径 / 放宽
 > 没有定时器、不在 `sweep()`/读路径里、`agent/disposed` 也不会调用它。误杀的代价是持有者恢复后
 > 仍以为自己有锁，而另一边看到路径空闲（W7 的锁安全缺陷）。
 
-### 2.7 本地工具链辅助
+### 2.8 本地工具链辅助
 
 开工或提交前，可用 Rust CLI 做协作自检：
 

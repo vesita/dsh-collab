@@ -390,6 +390,33 @@ return {
       if (!changed) return { ok: true, changed: false, data: {} }
       return { ok: true, changed: true, state: s, data: { released: rel.map(pub) } }
     }
+    // 循环终止自动释放（0.9.10）：见 src/collab-core.ts 的同名函数与 README「循环终止自动释放」。
+    // 与包形态**同语义**：只释放**未过期**声明（过期的归 sweep），并在留言板留一条审计留言
+    // （channel=agent:<holderId>，author=system:dsh-collab）。释放之后由谁告知读者与本人，
+    // 见下面的 agent/status 接线注释 —— 本形态**不投递**任何通知。
+    // 与包形态的一致性由 tests/collab-inline-parity.mjs 逐输出对拍本函数守护。
+    const releaseOnLoopEnd = (s, holderId, holderName, t, graceSec) => {
+      const mine = s.claims.filter(c => c.holderId === holderId && c.expiresAt > t)
+      if (!mine.length) return { ok: true, changed: false, data: { released: [] } }
+      s.claims = s.claims.filter(c => !mine.includes(c))
+      const released = mine.map(pub)
+      const uniq = []
+      for (const c of released) for (const p of c.paths) if (!uniq.includes(p)) uniq.push(p)
+      const shown = uniq.slice(0, 3).join(' ') + (uniq.length > 3 ? ' 等 ' + uniq.length + ' 条' : '')
+      const who = holderName || holderId
+      const m = {
+        msgId: 'm_' + (++s.seq),
+        seq: s.seq,
+        channel: holderId,
+        author: 'system:dsh-collab',
+        ts: t,
+        body: '[自动释放] ' + who + ' 的会话循环已结束（空闲超过 ' + graceSec + ' 秒），其对 ' + shown +
+          ' 的声明已被自动释放。恢复工作前如需写入这些路径，请重新 collab_lock op=claim。',
+        mentions: [holderId]
+      }
+      s.messages.push(m)
+      return { ok: true, changed: true, state: s, data: { released: released, notice: m } }
+    }
     function heartbeat(state, h, a) {
       const c = state.claims.find(x => x.claimId === a.claimId)
       if (!c) return { ok: false, changed: false, data: { error: 'not-found', message: 'no claim ' + a.claimId } }
@@ -491,7 +518,7 @@ return {
     const render = (args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }]
     const lockTool = harness.defineTool({
       name: 'collab_lock',
-      description: '多智能体协作中央注册锁：开工前声明占用项目文件夹（目录以 / 结尾，如 src/backend/），查询他人占用，减少共同开发冲突。规范：动手改代码前先 claim；开工前和定期 list/overview；冲突时先 wait 等待或用 board 留言协商；完成即 release；长任务 heartbeat 续租；被强杀的会话会留下僵尸声明，默认 dry-run 的 op=reap 可显式回收（先看候选，再 confirm:true）。',
+      description: '多智能体协作中央注册锁：开工前声明占用项目文件夹（目录以 / 结尾，如 src/backend/），查询他人占用，减少共同开发冲突。规范：动手改代码前先 claim；开工前和定期 list/overview；冲突时先 wait 等待或用 board 留言协商；完成即 release；长任务 heartbeat 续租；被强杀的会话会留下僵尸声明，默认 dry-run 的 op=reap 可显式回收（先看候选，再 confirm:true）。会话循环结束（空闲超过宽限期，默认 15 秒）后，你的声明会被自动释放：恢复工作前请重新 claim。',
       parameters: {
         type: 'object',
         additionalProperties: true,
@@ -627,6 +654,68 @@ return {
         mutate(s => dropHolder(s, h, now()), String(agent.id), agent).catch(() => {})
       } catch (e) {}
     }, { global: true })
+
+    // ---- 循环终止自动释放（0.9.10）：agent/status → idle 后等宽限期，期间恢复 running 就取消 ----
+    // 三道闸门与包形态（src/auto-release.ts）一致：宽限期 + 代次（任何状态变化都让本次武装作废）
+    // + 到点复核 status。**唯一的差别**：这里不投递任何通知 —— 受限动态宿主没有
+    // @deepseek-ai/dsh-llm，构造不出「显式来源的 notice」，而 AGENTS.md §1 禁止退回任何会冒充
+    // 用户的通道，所以本形态只做状态变更（释放 + 留言板留痕）。包形态才发读者/本人两条告知。
+    // 宽限期**常量 15 秒**：动态形态读不到 settings 服务（包形态的 loopEndGraceSec 默认值也是它）。
+    // tests/collab-hostcode-parity.mjs 会真实触发这条接线，断言"未过期声明在宽限期到点后被释放"。
+    const LOOP_END_GRACE_SEC = 15
+    const armedIdle = new Map()
+    let idleGen = 0
+    let idleClosed = false
+    ctx.effect(() => () => { idleClosed = true; armedIdle.clear() })
+    const agentStatusOf = (a) => (a && typeof a.status === 'string' ? a.status : '')
+    function fireIdleRelease(id, gen) {
+      try {
+        if (idleClosed || armedIdle.get(id) !== gen) return
+        armedIdle.delete(id)
+        // 服务面**现场取**（与包形态同）：apply 时捕获会让"复核 status"这条闸门静默失效。
+        let svc
+        try { svc = ctx.get('agents') } catch (e) { svc = undefined }
+        if (!svc || typeof svc.get !== 'function') return
+        let cur
+        try { cur = svc.get(id) } catch (e) { return }
+        // 合取闸门：解析不到（已 dispose）或当前不是 idle，一律**不放**。
+        // W7 就在这一句里：退场的会话常常恢复并继续干活，而它此刻收不到任何告知。
+        if (!cur || agentStatusOf(cur) !== 'idle') return
+        const holderId = 'agent:' + id
+        const name = hname({ holderId: holderId, sessionId: id, agent: cur })
+        mutate(s => releaseOnLoopEnd(s, holderId, name, now(), LOOP_END_GRACE_SEC), id, cur).catch(() => {})
+      } catch (e) {}
+    }
+    function armIdleRelease(id) {
+      if (idleClosed) return
+      const gen = ++idleGen
+      armedIdle.set(id, gen)
+      ctx.timer.timeout(LOOP_END_GRACE_SEC * 1000).then(() => { fireIdleRelease(id, gen) }).catch(() => {})
+    }
+    ctx.on('agent/status', (payload) => {
+      try {
+        const agent = payload && payload.agent
+        const id = agent && agent.id ? String(agent.id) : ''
+        if (!id) return
+        const status = payload && typeof payload.status === 'string' ? payload.status : agentStatusOf(agent)
+        if (status === 'idle') armIdleRelease(id)
+        else if (status === 'running') armedIdle.delete(id)
+      } catch (e) {}
+    }, { global: true })
+    // 退场 ⇒ 取消武装（到点也不会释放：fireIdleRelease 的第 3 条闸门）。**只取消，不释放**。
+    ctx.on('agent/disposed', (payload) => {
+      try {
+        const agent = payload && payload.agent
+        if (agent && agent.id) armedIdle.delete(String(agent.id))
+      } catch (e) {}
+    }, { global: true })
+    // 装机时已经 idle 的会话补一次武装（插件晚于 agent 装载 / 热重载时，那一轮 idle 事件收不到）。
+    try {
+      const boot = ctx.get('agents')
+      if (boot && typeof boot.list === 'function') {
+        for (const a of boot.list()) if (a && a.id && agentStatusOf(a) === 'idle') armIdleRelease(String(a.id))
+      }
+    } catch (e) {}
   }
 }
 `

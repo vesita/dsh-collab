@@ -29,6 +29,13 @@ export interface AgentLike {
   id?: string
   session?: SessionLike
   /**
+   * 循环终止自动释放用：DSH 的 agent 状态（`AgentStatus = 'idle' | 'running'`，
+   * `dsh-agent/lib/types/runtime-types.d.ts:90,147`）。
+   * `'idle'` = 没有 driver 还排着或跑着（循环停了）；`'running'` = 有驱动在执行。
+   * 可选：受限宿主可能给不出这个字段 —— 拿不到就**不武装**自动释放（见 auto-release.ts）。
+   */
+  status?: 'idle' | 'running'
+  /**
    * 功能 A 用：逐事件注入一条**显式标注来源**的消息。
    * 契约原文 `inject(message: UserMessage): void`（`dsh-agent/lib/types/runtime-types.d.ts:209`），
    * 语义是 `send(message, "next-step", wakeup=false)` —— 进入下一步但**不唤醒** driver
@@ -193,6 +200,25 @@ export interface DelegationSettings {
    * 关掉后 pre-execute 不再拦截任何写/读调用；已存在的 claim 语义不受影响。
    */
   enforceWriteLock: boolean
+  /**
+   * 循环终止自动释放总开关（0.9.10），默认 **true**。
+   * 关掉后 agent/status → idle 不再触发任何释放，声明只由 op=release / 租约到期回收。
+   */
+  releaseOnLoopEnd: boolean
+  /** 上面那条的宽限期（秒），默认 15，夹在 [LOOP_END_GRACE_SEC_MIN, LOOP_END_GRACE_SEC_MAX]。 */
+  loopEndGraceSec: number
+}
+
+/**
+ * 一次"循环终止自动释放"的告知结果。
+ * 两个受影响的群体分开报账，因为它们**不是同一件事**：
+ *   - `readers`：此前登记为读者、正等着这些路径的会话（沿用 release 的 NotifyOutcome 口径）；
+ *   - `holder`：被释放的会话**本人** —— 它多半正 idle，`agent.inject` 的消息会挂在收件箱里，
+ *     等它下一次被唤醒时送达（这正是"别让它恢复后以为自己还持锁"的那条告知）。
+ */
+export interface LoopEndReleaseOutcome {
+  readers: NotifyOutcome
+  holder: PushOutcome
 }
 
 /** ctx.settings.installSection 的 hooks：setSource 交出**实时**读取器，onChange 在值变化时回调。 */

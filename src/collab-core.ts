@@ -459,6 +459,66 @@ export function dropHolder(state: StateDocument, holderId: string, t: number): O
   return { ok: true, changed: true, state, data: { released: rel.map(publish) } }
 }
 
+// ---- 循环终止自动释放（0.9.10，op=release 之外的第三条回收路径）----
+//
+// 为什么需要它（一手场景）：父会话 claim 了一个目录，把写入交给子代理后**结束了自己的循环**
+// （agent/status → idle，agent 仍加载着、不是 dispose）。子代理需要写同一批路径，被
+// 功能 C 的门控硬拒绝，于是到留言板 @ 父会话要求释放 —— 但父会话的循环已经停了，
+// `agent.inject` 的契约是 `send(message, "next-step", wakeup=false)`：**不唤醒 driver**
+// （`dsh-agent/lib/types/runtime-types.d.ts:202-209`），留言永远读不到、锁也永远不放开，
+// 只能干等租约到期（默认 1800 秒）。这条路径补上那个缺口：循环一停，宽限期一过就自动释放。
+//
+// 与 dropHolder（W7：**dispose 不释放**未过期声明）的分工，别把两者混为一谈：
+//   - dropHolder 的触发是 **agent/disposed**（进程里这个 agent 没了），它只能断言"会话已退场"
+//     —— 而退场的会话**常常恢复并继续干活**，所以那里不缩短租约；
+//   - 本函数的触发是 **agent/status → idle**（循环停了，agent 还在），且调用方**先等过宽限期、
+//     并确认它没有恢复成 running** 才调用。宽限期把"两个回合之间的正常停顿"排除掉。
+// 语义后果（如实写在这里，不藏）：自动释放之后，那个会话**如果恢复**，它的对话历史里仍然
+// "记得"自己持有这些路径。所以调用方有义务（见 src/auto-release.ts 与 push.ts 的
+// notifyLoopEndRelease）给被释放的会话投一条显式来源的告知，让它重新 claim 再写。
+//
+// `t` 与 `graceSec` 都由调用方显式传入（纯逻辑模块不隐式读时钟）；`graceSec` 只用于生成
+// 留痕文本 —— 函数**不**自己判断宽限期，那是接线层的事。
+
+/** 自动释放留痕消息的作者。不是任何真实 holder：形如 `human:console` 的第三种前缀。 */
+export const AUTO_RELEASE_AUTHOR: string = 'system:dsh-collab'
+
+/**
+ * 循环终止自动释放：删除 holderId 的**全部未过期声明**，并在留言板留下一条可审计的留言。
+ *
+ * - 只处理**未过期**的声明：已过期的归 sweep()，这里不抢它的活（与 reap 同一条口径）。
+ * - 一条都没有时 `changed: false`，调用方据此**不写盘、不发通知、不留痕**（没有发生释放事件）。
+ * - 留痕消息进 `messages`（契约里已有的结构，不改状态文档 schema）：channel 就是 `holderId`
+ *   —— agent holder 的 holderId 本身已经是 `agent:<sessionId>`，正是工具文档里"频道
+ *   agent:…"那种寻址写法（**不要**再拼一次 `agent:`，那会得到 `agent:agent:<id>`），
+ *   mentions 指向持有者本人，于是"这条锁是谁、因为什么、什么时候被拿掉的"从
+ *   `collab_board op=read` 就能复述。
+ * - 返回 `data.released` 是**真正被删掉**的那些声明的公开视图（供通知使用）。
+ */
+export function releaseOnLoopEnd(state: StateDocument, holderId: string, holderName: string, t: number, graceSec: number): OpResult {
+  const mine = state.claims.filter(c => c.holderId === holderId && c.expiresAt > t)
+  if (!mine.length) return { ok: true, changed: false, data: { released: [] } }
+  state.claims = state.claims.filter(c => !mine.includes(c))
+  const released = mine.map(publish)
+  // 路径去重保序后折叠：与通知文案同一口径（最多列 3 条，其余计数）。
+  const uniq: string[] = []
+  for (const c of released) for (const p of c.paths) if (!uniq.includes(p)) uniq.push(p)
+  const shown = uniq.slice(0, 3).join(' ') + (uniq.length > 3 ? ' 等 ' + uniq.length + ' 条' : '')
+  const who = holderName || holderId
+  const m: Message = {
+    msgId: 'm_' + (++state.seq),
+    seq: state.seq,
+    channel: holderId,
+    author: AUTO_RELEASE_AUTHOR,
+    ts: t,
+    body: '[自动释放] ' + who + ' 的会话循环已结束（空闲超过 ' + graceSec + ' 秒），其对 ' + shown +
+      ' 的声明已被自动释放。恢复工作前如需写入这些路径，请重新 collab_lock op=claim。',
+    mentions: [holderId]
+  }
+  state.messages.push(m)
+  return { ok: true, changed: true, state, data: { released, notice: m } }
+}
+
 /** readers 归一：缺字段按 []，且**去重保序**（功能 D 要求不重复）。 */
 export function readersOf(c: Claim): string[] {
   const raw = c && Array.isArray((c as { readers?: unknown }).readers) ? (c as { readers: unknown[] }).readers : []

@@ -108,7 +108,7 @@ export function installTools(ctx: CollabContext, store: StateStore, push: PushAp
 
   const lockTool: ToolDefinition = {
     name: 'collab_lock',
-    description: '多智能体协作中央注册锁：开工前声明占用项目文件夹（目录以 / 结尾，如 src/backend/），查询他人占用，减少共同开发冲突。规范：动手改代码前先 claim；开工前和定期 list/overview；冲突时先 wait 等待或用 board 留言协商；完成即 release；长任务 heartbeat 续租；被强杀的会话会留下僵尸声明，默认 dry-run 的 op=reap 可显式回收（先看候选，再 confirm:true）。',
+    description: '多智能体协作中央注册锁：开工前声明占用项目文件夹（目录以 / 结尾，如 src/backend/），查询他人占用，减少共同开发冲突。规范：动手改代码前先 claim；开工前和定期 list/overview；冲突时先 wait 等待或用 board 留言协商；完成即 release；长任务 heartbeat 续租；被强杀的会话会留下僵尸声明，默认 dry-run 的 op=reap 可显式回收（先看候选，再 confirm:true）。会话循环结束（空闲超过宽限期，默认 15 秒）后，你的声明会被自动释放：恢复工作前请重新 claim。',
     parameters: {
       type: 'object',
       properties: {

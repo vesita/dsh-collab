@@ -1,6 +1,6 @@
 {
   "name": "dsh-collab",
-  "version": "0.9.9",
+  "version": "0.9.10",
   "description": "Multi-agent real-time collaboration & concurrency lock plugin for DSH",
   "type": "module",
   "main": "lib/index.js",
@@ -35,7 +35,7 @@
     "build": "rm -rf lib && tsc -p tsconfig.json && tsc -p tsconfig.client.json && cp -R src/types lib/",
     "build:types": "tsc --declaration --emitDeclarationOnly",
     "prepack": "npm run build",
-    "test": "npm run build && node tests/collab-pure-logic.mjs && node tests/collab-integration.mjs && node tests/collab-hostcode-parity.mjs && node tests/collab-inline-parity.mjs && node tests/collab-contract-derivation.mjs && node tests/collab-message-provenance.mjs && node tests/collab-digest-stability.mjs && node tests/collab-awareness.mjs && node tests/collab-awareness-cross-session.mjs && node tests/collab-access-gate.mjs && node tests/collab-readers-push.mjs && node tests/collab-reap.mjs && node tests/collab-e2e.mjs && node tests/collab-skill.mjs && node tests/collab-client-route.mjs",
+    "test": "npm run build && node tests/collab-pure-logic.mjs && node tests/collab-integration.mjs && node tests/collab-hostcode-parity.mjs && node tests/collab-inline-parity.mjs && node tests/collab-contract-derivation.mjs && node tests/collab-message-provenance.mjs && node tests/collab-digest-stability.mjs && node tests/collab-awareness.mjs && node tests/collab-awareness-cross-session.mjs && node tests/collab-access-gate.mjs && node tests/collab-readers-push.mjs && node tests/collab-reap.mjs && node tests/collab-auto-release.mjs && node tests/collab-e2e.mjs && node tests/collab-skill.mjs && node tests/collab-client-route.mjs",
     "test:real": "npm run build && node tests/collab-skill-real.mjs",
     "test:types": "tsc --noEmit",
     "lint": "tsc --noEmit"

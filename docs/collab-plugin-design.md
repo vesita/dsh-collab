@@ -251,11 +251,22 @@ Holder = {
 
 ### 7.3 生命周期与租约
 
-- **租约扫描**：每实例 `ctx.timer.interval`（如 30s）惰性检查；claim 读取时也做惰性过期（双重机制）；
-- **下线联动**：`ctx.on('agent/disposed')` → 找到该 agent 的所有 claims → 释放 → 广播 `collab/claim-released` + 留言"xx 已下线，占用已释放"；
-- **启动恢复**：插件 apply 时从持久化加载全量状态（含未过期的 claims），跨重启不丢。
+> 本节 0.9.10 按**实现现状**重写：原设计写的「`agent/disposed` → 释放声明 → 广播」从未落地，
+> 且被 W7 证伪（退场的会话常常恢复并继续干活，提前释放会让两边同时以为可以写）。
+
+- **租约扫描**：状态文件每次读/写前惰性 `sweep()`（`expiresAt > now` 才算占用），没有后台定时器；
+  租约上限 24h，是**最后的兜底**；
+- **三条回收路径**（见 README 0.9.10）：租约到期、持有者 `op=release`、**循环终止自动释放**
+  （`agent/status` → `idle` 且空闲超过宽限期，默认 15 秒；期内恢复 `running` 即取消，到点须仍解析到
+  该 agent 且状态为 `idle` —— 已 dispose 的一律不放）；
+- **`agent/disposed` 不释放未过期声明**（W7）：只摘掉该 holder 的 `readers` 登记 + 回收它已过期的声明；
+- **`op=reap`**（0.9.8）：`agents.list()` 分不清"休眠可唤回"与"真死"，故默认 dry-run、只由显式 `confirm` 触发；
+- **启动恢复**：apply 时从持久化加载全量状态；对**已经 idle** 的会话补一次自动释放武装（热重载 / 晚装载）。
 
 ### 7.4 广播事件（`ctx.emit('collab/<event>', payload)`）
+
+> **未落地**：实现里没有 `collab/*` 事件 —— 通知走 `agent.inject` 的显式来源 notice
+> （见 AGENTS.md §1）。此表只记录当初的取舍，不要按它接线。
 
 | 事件 | payload（仅 JSON 标量） | 触发 |
 | --- | --- | --- |

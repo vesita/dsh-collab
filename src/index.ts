@@ -9,6 +9,7 @@
 //   awareness.ts   态势上下文（order 130）；暴露 systemPrompt 面与总开关
 //   delegation.ts  委托纪律：settings 偏好 + 随包 skill + 常驻纪律块（order 131）
 //   gate.ts        功能 C：写/读的原生审批门控（消费 delegation 的偏好读取面）
+//   auto-release.ts 循环终止自动释放（消费 store + push + delegation 的偏好读取面）
 //   tools.ts       collab_lock / collab_board 注册（消费 push 的 notifyReaders）
 //   client-route.ts 浏览器半边只读 loopback 路由
 
@@ -18,6 +19,7 @@ import { installAccess } from './access.js'
 import { installAwareness } from './awareness.js'
 import { installDelegation } from './delegation.js'
 import { installGate } from './gate.js'
+import { installAutoRelease } from './auto-release.js'
 import { installTools } from './tools.js'
 import { installClientRoute } from './client-route.js'
 import type { CollabContext } from './contract.js'
@@ -47,6 +49,7 @@ export function apply(ctx: CollabContext): void {
   //   access 只依赖 store（逐事件 agent.inject，不再用上下文面）；
   //   awareness 交出运行时上下文注册面，delegation 需要它；
   //   delegation 交出写保护开关，gate 需要它；
+  //   auto-release 需要 store + push + delegation 的偏好读取面；
   //   tools 需要 store + push 的 notifyReaders；clientRoute 独立。
   const store = installStore(ctx)
   const push = installPush(ctx, store)
@@ -54,6 +57,7 @@ export function apply(ctx: CollabContext): void {
   const surface = installAwareness(ctx, store)
   const prefs = installDelegation(ctx, surface)
   installGate(ctx, store, prefs)
+  installAutoRelease(ctx, store, push, prefs)
   installTools(ctx, store, push)
   installClientRoute(ctx)
 }

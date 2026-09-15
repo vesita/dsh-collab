@@ -32,9 +32,9 @@
 import { boundContextSummary, createUserMessage } from '@deepseek-ai/dsh-llm'
 import { readersOf, dropHolder, modeLabel } from './collab-core.js'
 import type { PublishedClaim } from './collab-core.js'
-import { sessionIdOf } from './spec.js'
+import { sessionIdOf, LOOP_END_GRACE_SEC_DEFAULT } from './spec.js'
 import type {
-  AgentLike, AgentsLookupService, CollabContext, NotifyOutcome, PushChannel, PushOutcome
+  AgentLike, AgentsLookupService, CollabContext, LoopEndReleaseOutcome, NotifyOutcome, PushChannel, PushOutcome
 } from './contract.js'
 import type { StateStore } from './store.js'
 
@@ -46,8 +46,21 @@ export interface PushApi {
     releaserHolderId: string,
     releaserName: string,
     releaserAgent?: AgentLike,
-    action?: 'release' | 'reap'
+    action?: 'release' | 'reap' | 'auto',
+    graceSec?: number
   ): Promise<NotifyOutcome>
+  /**
+   * 循环终止自动释放（0.9.10）的告知：**两个群体分别投递**（见 contract 的 LoopEndReleaseOutcome）：
+   *   1. 读者（正等这些路径的会话）—— 与 release 同一条投递面，只是文案说"自动释放"；
+   *   2. 被释放的会话本人 —— 一条"你的锁已被自动释放，重新开工前请重新 claim"的告知。
+   * 第二条约等于本功能的**安全阀**：会话恢复后不会以为自己还持锁。
+   */
+  notifyLoopEndRelease(
+    released: PublishedClaim[],
+    holderId: string,
+    holderName: string,
+    graceSec: number
+  ): Promise<LoopEndReleaseOutcome>
 }
 
 export function installPush(ctx: CollabContext, store: StateStore): PushApi {
@@ -99,7 +112,7 @@ export function installPush(ctx: CollabContext, store: StateStore): PushApi {
    * 回收者并不是被回收声明的持有者，照抄"X 已释放"会让读者以为 X 才是锁的主人（来源诚实
    * 不止 `source.kind`，正文也不能替数据撒谎）。两条文案共用同一个 `shown/mode` 组装。
    */
-  function releaseNoticeParts(c: PublishedClaim, releaserName: string, action: 'release' | 'reap' = 'release'): { text: string; summary: string } {
+  function releaseNoticeParts(c: PublishedClaim, releaserName: string, action: 'release' | 'reap' | 'auto' = 'release', graceSec: number = LOOP_END_GRACE_SEC_DEFAULT): { text: string; summary: string } {
     const paths = Array.isArray(c.paths) ? c.paths : []
     const shown = paths.slice(0, 3).join(' ') + (paths.length > 3 ? ' 等 ' + paths.length + ' 条' : '')
     if (action === 'reap') {
@@ -109,10 +122,37 @@ export function installPush(ctx: CollabContext, store: StateStore): PushApi {
       const summary = boundContextSummary('collab 锁已回收 · ' + shown)
       return { text, summary }
     }
+    // 0.9.10：自动释放。**不许**照抄"X 已释放" —— 释放者不是调用这个 op 的会话，
+    // 而是插件在 X 的循环停下之后替它放的；正文必须说清触发条件与宽限期，
+    // 否则读者会把这条通知误读成"X 主动放弃了"。
+    if (action === 'auto') {
+      const text = '[dsh-collab] ' + releaserName + ' 的会话循环已结束（空闲超过 ' + graceSec + ' 秒），其对 ' + shown +
+        '（' + modeLabel(c.mode) + '）的声明已被自动释放。你此前被登记为它的读者，这些路径不再由该会话占用。'
+      const summary = boundContextSummary('collab 锁自动释放 · ' + shown)
+      return { text, summary }
+    }
     const text = '[dsh-collab] ' + releaserName + ' 已释放 ' + shown + '（' + modeLabel(c.mode) + '）。' +
       '你此前被登记为它的读者，这些路径不再由该会话占用。'
     // boundContextSummary 截到 120 字符（CONTEXT_SUMMARY_MAX_CHARS，dsh-llm/lib/index.js:15-22）。
     const summary = boundContextSummary('collab 锁已释放 · ' + releaserName + ' · ' + shown)
+    return { text, summary }
+  }
+
+  /**
+   * 给**被自动释放的会话本人**的那条告知文案（0.9.10）。
+   * 与 releaseNoticeParts 分开写，因为收件人不同、要求也不同：读者只需知道"路径空出来了"，
+   * 而本人需要知道**自己已经不再持锁**，以及"继续写之前先重新 claim"这个动作。
+   * 时间稳定性不适用（这是一次性通知），但措辞不得暗示"你（曾）做错了什么"。
+   */
+  function loopEndHolderNoticeParts(holderName: string, released: PublishedClaim[], graceSec: number): { text: string; summary: string } {
+    const uniq: string[] = []
+    for (const c of released) for (const p of (Array.isArray(c.paths) ? c.paths : [])) if (!uniq.includes(p)) uniq.push(p)
+    const shown = uniq.slice(0, 3).join(' ') + (uniq.length > 3 ? ' 等 ' + uniq.length + ' 条' : '')
+    const who = holderName || '你的会话'
+    const text = '[dsh-collab] ' + who + ' 的会话循环已结束（空闲超过 ' + graceSec + ' 秒），因此你此前持有的声明 ' + shown +
+      ' 已被自动释放。恢复工作前如需写入这些路径，请重新执行 collab_lock op=claim；' +
+      '在此期间其他会话可能已经占用它们。'
+    const summary = boundContextSummary('collab 你的锁已被自动释放 · ' + shown)
     return { text, summary }
   }
 
@@ -204,7 +244,8 @@ export function installPush(ctx: CollabContext, store: StateStore): PushApi {
     releaserHolderId: string,
     releaserName: string,
     releaserAgent?: AgentLike,
-    action: 'release' | 'reap' = 'release'
+    action: 'release' | 'reap' | 'auto' = 'release',
+    graceSec: number = LOOP_END_GRACE_SEC_DEFAULT
   ): Promise<NotifyOutcome> {
     const out: NotifyOutcome = { readers: 0, pushed: [], skipped: [], pushedVia: [] }
     // 候选读者 = released 各 claim 上、能解析出 sessionId 且不是释放者的 (claim, reader)。
@@ -255,7 +296,7 @@ export function installPush(ctx: CollabContext, store: StateStore): PushApi {
           out.skipped.push({ sessionId: job.sessionId, reason: 'already-pushed' })
           continue
         }
-        const parts = releaseNoticeParts(job.claim, releaserName, action)
+        const parts = releaseNoticeParts(job.claim, releaserName, action, graceSec)
         const r = pushOne(agents as AgentsLookupService, job.sessionId, parts)
         if (r.ok) {
           out.pushed.push(job.sessionId)
@@ -292,6 +333,41 @@ export function installPush(ctx: CollabContext, store: StateStore): PushApi {
     return out
   }
 
+  /**
+   * 循环终止自动释放的**两条**告知（0.9.10）：
+   *   1. 读者（`notifyReaders(..., 'auto', graceSec)`）—— 谁在等这些路径，谁就该知道它空出来了；
+   *   2. 被释放的会话**本人** —— 它此刻正是 idle，`agent.inject` 不唤醒 driver
+   *      （`inject = send(msg, 'next-step', wakeup=false)`），消息挂在收件箱里，
+   *      下一次被唤醒（真人回话 / 子代理交付）时随下一步进入模型上下文。
+   *      这正是本功能的安全阀：**没有这条，会话恢复后会以为自己还持锁**。
+   *
+   * 绝不抛（自动释放是旁路，任何失败都不许打断宿主）；两个群体分别报账，
+   * 使"没人需要通知"与"投递面坏了"从返回值上可分辨（与 notifyReaders 同一口径）。
+   *
+   * 解析不到本人（已卸载 / 受限宿主）时如实记 `agent-not-resolvable`，
+   * **不**回退到任何别的通道（AGENTS.md §1：没有诚实通道就不投）。
+   * 那种情况下留痕消息仍在（releaseOnLoopEnd 写在状态文件里），可以从留言板查到。
+   */
+  async function notifyLoopEndRelease(
+    released: PublishedClaim[],
+    holderId: string,
+    holderName: string,
+    graceSec: number
+  ): Promise<LoopEndReleaseOutcome> {
+    const readers = await notifyReaders(released, holderId, holderName, undefined, 'auto', graceSec)
+    let holder: PushOutcome = { ok: false, error: 'not-an-agent-holder' }
+    try {
+      const sessionId = sessionIdOf(holderId)
+      if (!sessionId) return { readers, holder }
+      const agents = ctx.get('agents') as AgentsLookupService | undefined
+      if (!agents || typeof agents.get !== 'function') return { readers, holder: { ok: false, error: 'no-agents-service' } }
+      holder = pushOne(agents, sessionId, loopEndHolderNoticeParts(holderName, released, graceSec))
+    } catch (e) {
+      holder = { ok: false, error: describeError(e) }
+    }
+    return { readers, holder }
+  }
+
   ctx.on('agent/disposed', (payload: { agent?: { id?: string } }) => {
     try {
       const agent = payload && payload.agent
@@ -325,5 +401,5 @@ export function installPush(ctx: CollabContext, store: StateStore): PushApi {
     } catch (e) {}
   }, { global: true })
 
-  return { notifyReaders }
+  return { notifyReaders, notifyLoopEndRelease }
 }

@@ -47,6 +47,7 @@
 │   ├── tools.ts                  # collab_lock / collab_board 注册（消费 store + push）
 │   ├── access.ts                 # 功能 A：访问通知（逐事件经 agent.inject 投递 form:'notice' 的显式来源消息）+ 读者反向注册（tools/post-execute）
 │   ├── gate.ts                   # 功能 C：写/读的原生审批门控（tools/pre-execute）
+│   ├── auto-release.ts           # 循环终止自动释放（agent/status → idle，宽限 15 秒；tools.ts 之外的第二条回收路径）
 │   ├── push.ts                   # 功能 D：释放推送（唯一通道 agent.inject + 显式来源 form:'notice'）+ agent/disposed 生命周期
 │   ├── awareness.ts              # 协作态势注入（运行时上下文 order 130）
 │   ├── delegation.ts             # 委托纪律：settings 偏好 + 随包 skill + 常驻纪律块（order 131）
@@ -154,6 +155,14 @@ agents.currentInitiator()            → 正在装配的那个会话
 | 设置命名空间 | `dsh-collab` |
 | 字段 | `exposeDelegationDiscipline` |
 | 类型 / 默认 | `boolean` / `true` |
+| 字段 | `enforceWriteLock` |
+| 类型 / 默认 | `boolean` / `true` |
+| 字段 | `releaseOnLoopEnd` |
+| 类型 / 默认 | `boolean` / `true` |
+| 字段 | `loopEndGraceSec` |
+| 类型 / 默认 | `number` / `15`（夹在 `[1, 3600]`） |
+
+四个字段同属一个命名空间：前两项控制委托纪律与写保护（见上），后两项控制**循环终止自动释放**（见下文 0.9.10 一节）。
 
 该命名空间经 `ctx.settings.installSection(...)` 注册（schema 由 `@deepseek-ai/schemastery` 描述），因此它出现在设置文档 `${DSH_HOME:-$HOME/.dsh}/settings.yaml` 与设置界面里。值是**活读**的：改完立即生效，无需重启 dsh。命名空间是可选服务，部署里没有 settings 服务时插件按 `true` 行事。
 
@@ -170,7 +179,7 @@ agents.currentInitiator()            → 正在装配的那个会话
 
 偏好能出现在 UI 里，靠的是插件带的浏览器半边 `lib/client.js`（`package.json` 声明 `dsh.client` 与 `exports["./client"]`）。原因很直接：设置页只**枚举**命名空间、从不解释它，一张卡片是由拥有该命名空间的插件按 `settings.plugin.item` 槽位、以命名空间为 key 注册进来的——**谁拥有设置，谁自带卡片**。
 
-打开 **设置 → 插件**（Settings → Plugins）即可看到 `dsh-collab` 的卡片：默认折叠的一行摘要（标题 + 当前两项状态），点开是两行设置项 —— 「委托与验收纪律」（下拉：关闭 / 集群协作，带一个打开随包技能正文的预览按钮）与「原生写保护」（下拉：拦截 / 不拦截）。控件直接写 Host，改完即保存；三种状态都如实呈现——命名空间尚未就绪时给一行加载占位，本部署没有 Host 半边时整张卡片不渲染，只读部署把控件置灰并说明原因。
+打开 **设置 → 插件**（Settings → Plugins）即可看到 `dsh-collab` 的卡片：默认折叠的一行摘要（标题 + 当前三项状态），点开是三行设置项 —— 「委托与验收纪律」（下拉：关闭 / 集群协作，带一个打开随包技能正文的预览按钮）、「原生写保护」（下拉：拦截 / 不拦截）与「循环终止自动释放」（下拉：自动释放 / 不自动释放 + 宽限期秒数输入框）。控件直接写 Host，改完即保存；三种状态都如实呈现——命名空间尚未就绪时给一行加载占位，本部署没有 Host 半边时整张卡片不渲染，只读部署把控件置灰并说明原因。
 
 **预览按钮的行为（0.8.2 起）**：点一下**直接**在右侧栏的文档面板打开随包技能正文，没有二次确认，**也不会关闭设置页**——设置页照常开着，右侧栏多出一份技能文档。按钮就只是「在右侧栏打开技能文档」，文案与行为一致。
 
@@ -185,6 +194,49 @@ agents.currentInitiator()            → 正在装配的那个会话
 包形态的 `DSH_COLLAB_NO_PROMPT_HINT=1` 关掉**所有**运行时注入 —— 态势上下文、委托纪律文本、以及功能 A 的访问通知（后者也是运行时派生再注入进会话的内容）。它不影响技能注册。
 
 ---
+
+## 0.9.10：循环终止自动释放（告别「循环停了、锁还在」）
+
+**问题**：父会话 `claim` 后把写入交给子代理，**自己循环停了**。子代理被门控硬拒绝，到留言板
+`@` 它也没用 —— `agent.inject` 是 `send(msg, 'next-step', wakeup=false)`，**不唤醒 driver**
+（`dsh-agent/lib/types/runtime-types.d.ts:202-209`），停下的循环读不到留言。结果只能干等租约
+（默认 1800 秒）或让别人 `op=reap`。根子是**锁的生命周期比会话的循环长**。
+
+**判据**：`agent/status` 从 `running` 翻到 `idle`（循环停了）。**不是** `agent/disposed` ——
+idle 的 agent 仍在 `agents.list()` 里、仍可唤醒，所以 W7「dispose 不释放」没有被推翻。
+
+**三道闸门**（方向都是"少放"）：宽限期 `loopEndGraceSec`（默认 **15 秒**）排除回合之间的
+正常停顿；宽限期内任何状态变化都让本次武装作废（代次）；到点**必须**解析到那个 agent 且它
+此刻仍是 `idle` —— 服务缺失 / `get()` 抛错 / 已 dispose / 非 idle，**一律不放**。放的时候
+只释放该 holder **未过期**的声明。
+
+**释放后两条告知**（都经 `agent.inject` 的显式来源 notice）：等待者收到「锁已自动释放」（不是
+"X 已释放"，释放者不是持有者）；被释放的会话本人收到「你的声明已被自动释放，恢复工作前重新
+`claim`」—— 后者是安全阀，否则它恢复后仍以为自己持锁。同时在状态文件里留一条审计留言
+（`channel` = `agent:<sessionId>`，作者 `system:dsh-collab`），`collab_board op=read` 可回读。
+
+| 回收路径 | 触发 | 说明 |
+| --- | --- | --- |
+| 租约到期 | 时间 | `sweep()` 回收，仍是最后兜底 |
+| `op=release` | 持有者显式 | — |
+| **循环终止自动释放** | `idle` + 宽限到点 | 本版新增；**仅限仍加载着的会话** |
+| `agent/disposed` | agent 离开注册表 | **不释放**未过期声明（W7） |
+| `op=reap` | 显式 `confirm:true` | 只收确认的僵尸，默认 dry-run |
+
+**边界**：只覆盖"循环停了、agent 还加载着"的持有者。**已 dispose** 的持有者不在此列 ——
+它收不到告知（注入面对未加载会话不可达），恢复后必然会以为自己还持锁，所以交给租约到期与
+`op=reap`。
+
+**设置**：`releaseOnLoopEnd`（默认 `true`）、`loopEndGraceSec`（默认 `15`，夹在 `[1, 3600]`），
+**活读**——武装后到点前关掉也照样拦住。**取舍**：宽限期排不掉"等真人回复"这种停顿，超过宽限期
+同样会放锁；想让锁活得比循环长就关掉 `releaseOnLoopEnd` 或调大 `loopEndGraceSec`。
+
+**两形态**：包形态 `src/auto-release.ts`（释放 + 两条通知）；动态形态 `hostCode` 内联等价释放
+逻辑但**不投递通知**（受限环境没有 `@deepseek-ai/dsh-llm`，造不出显式来源消息，不许退回会冒充
+用户的通道）。一致性由 `tests/collab-inline-parity.mjs`（纯函数逐输出）与
+`tests/collab-hostcode-parity.mjs`（真实触发 `agent/status`）守护；完整生命周期见
+`tests/collab-auto-release.mjs`。`collab_lock` 描述与常驻纪律文本各加一句"循环一停就自动放锁：
+恢复工作前先重新 claim"（常驻文本仍是纯常量、无阿拉伯数字）。
 
 ## 0.9.9：skill 正文与常驻纪律文本凝练
 
@@ -652,14 +704,16 @@ pnpm install --dir ~/.dsh/profiles/<profile>
 # 重启 dsh
 ```
 
-**坑（实测）**：**版本号不变**、只是重新打包时，`pnpm install --force` 会报
-"Already up to date / added 0"，`node_modules` 里**仍然是旧内容** —— lockfile 的 integrity
-已经更新成新包，但目录没有被重新链接。先删掉再装才可靠：
+**坑（实测，pnpm 12.4.1）**：**版本号不变**、只是用同一个文件名重新打包时，`pnpm install`
+（含 `--force`）会**从 store 拿回缓存里的旧包**：lockfile 里那条 `file:` 依赖的 integrity 没变，
+pnpm 就认为已解析、直接复用 —— 连 `rm -rf node_modules/dsh-collab` 再装也一样（"reused 7,
+downloaded 0"，装回去的还是旧内容）。**唯一可靠的做法是让它重新解析**：
 
 ```bash
-rm -rf ~/.dsh/profiles/<profile>/node_modules/dsh-collab
-pnpm install --dir ~/.dsh/profiles/<profile>
+pnpm update dsh-collab --dir ~/.dsh/profiles/<profile>   # 重新哈希那个 tgz（会 "downloaded 1"）
 ```
+
+改 `package.json` 里的版本号（新文件名）时，普通 `pnpm install` 就够了。
 
 装完用 `diff -r lib ~/.dsh/profiles/<profile>/node_modules/dsh-collab/lib` 确认逐字节一致 ——
 「装了」和「装对了」是两件事。

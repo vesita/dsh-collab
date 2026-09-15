@@ -6,15 +6,22 @@
 // 对外暴露偏好读取面：gate 用它做写保护总开关（活读，不是快照）。
 
 import { dirname } from 'node:path'
-import { DELEGATION_SETTINGS_NAMESPACE, DELEGATION_SETTINGS_SCHEMA, DELEGATION_SETTINGS_ENTRY, DELEGATION_DISCIPLINE_TEXT } from './spec.js'
+import {
+  DELEGATION_SETTINGS_NAMESPACE, DELEGATION_SETTINGS_SCHEMA, DELEGATION_SETTINGS_ENTRY, DELEGATION_DISCIPLINE_TEXT,
+  LOOP_END_GRACE_SEC_DEFAULT, LOOP_END_GRACE_SEC_MIN, LOOP_END_GRACE_SEC_MAX
+} from './spec.js'
 import { loadBundledSkill } from './skill.js'
 import type { CollabContext, DelegationSettings, SettingsService, SkillsService } from './contract.js'
 import type { AwarenessSurface } from './awareness.js'
 
-/** 偏好读取面：installDelegation() 对外暴露的东西（gate 消费）。 */
+/** 偏好读取面：installDelegation() 对外暴露的东西（gate 与 auto-release 消费）。 */
 export interface DelegationPrefs {
   /** 功能 C 的写保护总开关，**活读**；默认 true。 */
   enforceWriteLockEnabled(): boolean
+  /** 循环终止自动释放总开关，**活读**；默认 true（见 src/auto-release.ts）。 */
+  releaseOnLoopEndEnabled(): boolean
+  /** 循环终止自动释放的宽限毫秒数，**活读**；默认 15 秒，夹在 spec 的上下界内。 */
+  loopEndGraceMs(): number
 }
 
 export function installDelegation(ctx: CollabContext, surface: AwarenessSurface): DelegationPrefs {
@@ -51,6 +58,36 @@ export function installDelegation(ctx: CollabContext, surface: AwarenessSurface)
     } catch (e) {
       return true
     }
+  }
+
+  /**
+   * 循环终止自动释放的开关，**活读**（同一份读取器）。默认 true：
+   * 读设置失败、服务缺失、字段缺省都按"**开**"处理 —— 这条功能的默认值就是用户的诉求
+   * （删掉那个"会话循环停了、锁还在"的死锁），只有显式 false 才关。
+   */
+  const releaseOnLoopEndEnabled = (): boolean => {
+    try {
+      const value = readSettings ? readSettings() : DELEGATION_SETTINGS_ENTRY
+      return !value || value.releaseOnLoopEnd !== false
+    } catch (e) {
+      return true
+    }
+  }
+
+  /**
+   * 宽限毫秒数，**活读**。非有限数 / 越界一律回落到默认 15 秒：
+   * 这条值决定"多久之后自动放锁"，绝不接受 NaN（会让计时器立即触发）或 0 之类的坏输入。
+   */
+  const loopEndGraceMs = (): number => {
+    let sec = LOOP_END_GRACE_SEC_DEFAULT
+    try {
+      const value = readSettings ? readSettings() : DELEGATION_SETTINGS_ENTRY
+      const raw = Number(value && value.loopEndGraceSec)
+      if (Number.isFinite(raw)) sec = Math.min(LOOP_END_GRACE_SEC_MAX, Math.max(LOOP_END_GRACE_SEC_MIN, raw))
+    } catch (e) {
+      sec = LOOP_END_GRACE_SEC_DEFAULT
+    }
+    return Math.round(sec * 1000)
   }
 
   // 按当前偏好结算两项交付物；开则注册，关则撤回。注册与撤回都走 effect disposer，可逆。
@@ -132,5 +169,5 @@ export function installDelegation(ctx: CollabContext, surface: AwarenessSurface)
   })
   if (!settingsUsable) reconcileDelegation()
 
-  return { enforceWriteLockEnabled }
+  return { enforceWriteLockEnabled, releaseOnLoopEndEnabled, loopEndGraceMs }
 }

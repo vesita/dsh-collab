@@ -493,7 +493,12 @@ console.log('# agent/disposed wiring: an unexpired claim survives dispose (W7)')
 {
   const map = new Map()
   const toolsLocal = []
+  // 事件 -> 处理器**数组**：Cordis 允许同一事件挂多个监听器，假 ctx 也必须如此。
+  // 曾经这里是 `handlers.set(ev, fn)`（单槽）—— 第二个监听器会静默顶掉第一个，
+  // 于是"dispose 摘 reader"的行为看起来坏掉，实际是测试脚手架吞了处理器。
   const handlers = new Map()
+  const onEvent = (ev, fn) => { const list = handlers.get(ev) || []; list.push(fn); handlers.set(ev, list); return () => {} }
+  const firstHandler = (ev) => (handlers.get(ev) || [])[0]
   const fsLocal = {
     resolve: (p, o) => makeTarget(path.isAbsolute(p) ? p : path.resolve(o && o.cwd ? o.cwd : process.cwd(), p)),
     stat: async (t) => (map.has(t.path) ? { version: 1 } : undefined),
@@ -506,7 +511,7 @@ console.log('# agent/disposed wiring: an unexpired claim survives dispose (W7)')
     fs: fsLocal,
     timer: { timeout: (ms) => new Promise((r) => setTimeout(r, ms)), interval: () => () => {} },
     effect: (fn) => { const d = fn(); return typeof d === 'function' ? d : () => {} },
-    on: (ev, fn) => { handlers.set(ev, fn); return () => {} },
+    on: onEvent,
     get: (name) => {
       if (name === 'settings') return { prepareDocument: async () => SETTINGS_DOC }
       if (name === 'sessions') return { get: () => ({ header: { cwd: '/fake/host/dispose' } }) }
@@ -518,8 +523,13 @@ console.log('# agent/disposed wiring: an unexpired claim survives dispose (W7)')
     { defineTool: (d) => d, registerTool: (_c, t) => { toolsLocal.push(t); return () => {} }, handle: () => () => {} }, ctxLocal)
   await pluginLocal.apply(ctxLocal)
   const lockLocal = toolsLocal.find((t) => t.name === 'collab_lock')
-  const disposed = handlers.get('agent/disposed')
+  const disposed = firstHandler('agent/disposed')
   ok(typeof disposed === 'function', 'hostCode registers an agent/disposed handler', typeof disposed)
+  // 同一事件上的**多个**监听器必须都活着（dropHolder 一个 + 自动释放的 disarm 一个）：
+  // 这条同时守护测试脚手架本身，防止它退回单槽把真实处理器吞掉。
+  ok((handlers.get('agent/disposed') || []).length >= 2,
+    'agent/disposed 上的多个监听器都保留下来（单槽假 ctx 会静默顶掉）',
+    JSON.stringify((handlers.get('agent/disposed') || []).length))
 
   const DEAD = { agent: { id: 'agent-dead-host' } }
   const r = await lockLocal.execute({ op: 'claim', paths: ['src/host-dispose/'], ttlSec: 600 }, DEAD)
@@ -613,6 +623,84 @@ console.log('# op=reap (host inline form): dry-run default / confirm removes onl
   const ids = (JSON.parse(map.get(sp)).claims || []).map((c) => c.holderId).sort()
   ok(JSON.stringify(ids) === JSON.stringify(['agent:agent-lived', 'agent:agent-reaper']),
     '宿主 confirm:true 后活着的与自己的一条都没动', JSON.stringify(ids))
+}
+
+// ---------- N+1. 循环终止自动释放（0.9.10，宿主内联形态的行为对拍）----------
+// 为什么必须在这里测：hostCode 的 agent/status 接线是**另一份实现**（动态插件不接受 import），
+// inline-parity 只逐输出对拍了纯函数 releaseOnLoopEnd，证明不了钩子真把「当前 now()」与
+// 「holder 自己的 sessionId」传了进去，也证明不了宽限期常量真的是 15 秒。
+// 这里把真实注册的 agent/status 处理器抓出来触发，并用**立即 resolve 的假计时器**记录请求的
+// 毫秒数（真等 15 秒不现实），断言：未过期声明被释放 + 留言板留痕 + running 会取消。
+console.log('# agent/status wiring (host inline form): idle releases after the 15s grace')
+{
+  const map = new Map()
+  const toolsLocal = []
+  const handlers = new Map()
+  const onEvent = (ev, fn) => { const list = handlers.get(ev) || []; list.push(fn); handlers.set(ev, list); return () => {} }
+  const firstHandler = (ev) => (handlers.get(ev) || [])[0]
+  const timerRequests = []
+  const LIVE = ['agent-idle-host', 'agent-busy-host']
+  const status = { 'agent-idle-host': 'running', 'agent-busy-host': 'running' }
+  const ctxLocal = {
+    fs: {
+      resolve: (p, o) => makeTarget(path.isAbsolute(p) ? p : path.resolve(o && o.cwd ? o.cwd : process.cwd(), p)),
+      stat: async (t) => (map.has(t.path) ? { version: 1 } : undefined),
+      readText: async (t) => map.get(t.path) || '',
+      writeText: async (t, c) => { map.set(t.path, c); return { operation: 'create', version: 1 } },
+      processPath: (t) => t.path,
+      listDir: async () => []
+    },
+    // 假计时器：立即 resolve（不能真等 15 秒），但把请求的毫秒数记下来。
+    timer: { timeout: (ms) => { timerRequests.push(ms); return Promise.resolve() }, interval: () => () => {} },
+    effect: (fn) => { const d = fn(); return typeof d === 'function' ? d : () => {} },
+    on: onEvent,
+    get: (name) => {
+      if (name === 'settings') return { prepareDocument: async () => SETTINGS_DOC }
+      if (name === 'sessions') return { get: () => ({ header: { cwd: '/fake/host/loop-end' } }) }
+      if (name === 'sessionTitle') return { get: (s) => ({ title: 'Host ' + (s && s.id ? s.id : '?') }) }
+      if (name === 'agents') return {
+        currentInitiator: () => undefined,
+        list: () => LIVE.map((id) => ({ id, status: status[id] })),
+        get: (id) => (LIVE.includes(id) ? { id, status: status[id] } : undefined)
+      }
+      return undefined
+    }
+  }
+  const pluginLocal = new Function('harness', 'ctx', hostCode)(
+    { defineTool: (d) => d, registerTool: (_c, t) => { toolsLocal.push(t); return () => {} }, handle: () => () => {} }, ctxLocal)
+  await pluginLocal.apply(ctxLocal)
+  const lockLocal = toolsLocal.find((t) => t.name === 'collab_lock')
+  const IDLE = { agent: { id: 'agent-idle-host' } }
+  const BUSY = { agent: { id: 'agent-busy-host' } }
+  const onStatus = firstHandler('agent/status')
+  ok(typeof onStatus === 'function', 'hostCode registers an agent/status handler', typeof onStatus)
+
+  await lockLocal.execute({ op: 'claim', paths: ['src/host-loop-end/'], ttlSec: 600 }, IDLE)
+  await lockLocal.execute({ op: 'claim', paths: ['src/host-busy/'], ttlSec: 600 }, BUSY)
+  const sp = (await lockLocal.execute({ op: 'list' }, IDLE)).data.statePath
+  timerRequests.length = 0
+
+  // 1) running → idle：武装计时器，宽限期常量必须是 15 秒。
+  status['agent-idle-host'] = 'idle'
+  onStatus({ agent: { id: 'agent-idle-host' }, status: 'idle' })
+  ok(timerRequests.length === 1 && timerRequests[0] === 15000,
+    '宿主内联形态的宽限期常量是 15 秒', JSON.stringify(timerRequests))
+  await new Promise((r) => setTimeout(r, 60))
+  let doc = JSON.parse(map.get(sp))
+  ok(!(doc.claims || []).some((c) => c.holderId === 'agent:agent-idle-host'),
+    'idle 的会话在宽限到点后被释放（但别人不动）', JSON.stringify((doc.claims || []).map((c) => c.holderId)))
+  ok((doc.claims || []).some((c) => c.holderId === 'agent:agent-busy-host'), 'running 的会话声明原样保留', JSON.stringify((doc.claims || []).map((c) => c.holderId)))
+  ok((doc.messages || []).length === 1 && doc.messages[0].channel === 'agent:agent-idle-host' && doc.messages[0].author === 'system:dsh-collab',
+    '宿主形态同样在留言板留下审计留痕（channel=agent:<sessionId>）', JSON.stringify(doc.messages))
+
+  // 2) 宽限期内恢复 running：撤销（状态零变化）。
+  const beforeBusy = map.get(sp)
+  status['agent-busy-host'] = 'idle'
+  onStatus({ agent: { id: 'agent-busy-host' }, status: 'idle' })
+  status['agent-busy-host'] = 'running'
+  onStatus({ agent: { id: 'agent-busy-host' }, status: 'running' })
+  await new Promise((r) => setTimeout(r, 60))
+  ok(map.get(sp) === beforeBusy, '宿主形态：宽限期内恢复 running ⇒ 状态逐字节零变化', 'changed')
 }
 
 h.finish()
