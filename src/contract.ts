@@ -22,9 +22,28 @@ export interface CollabFs {
   readText(target: FileRef): Promise<string>
   writeText(target: FileRef, content: string, opts?: { kind?: string; version?: number }): Promise<unknown>
   processPath(target: FileRef): string
+  /**
+   * 可选：列举目录的直接子项（跨项目观测用）。真实 fs 服务提供
+   * `listDir(target, signal?): Promise<FsDirEntry[]>`（`dsh-fs/lib/types/index.d.ts:199`，
+   * `FsDirEntry = { name, type, target, version?, size? }`）；受限宿主可能不给 ——
+   * 那时 `overview` 只报当前项目，**不编造**别的项目。
+   */
+  listDir?(target: FileRef, signal?: unknown): Promise<Array<{ name?: string; type?: string; target?: FileRef }>>
 }
 
-export interface SessionLike { header?: { cwd?: string } }
+/**
+ * 会话头。`cwd` 是项目隔离键；`parentSession` 是**血缘**（谁派生了我）。
+ *
+ * 血缘的来源与实测：子代理创建时把 `parentSession: parentHeader.id`、
+ * `origin: 'subagent'`、`delegationDepth` 写进会话头
+ * （`dsh-subagent/lib/types/child-agent.js:117-123`），类型定义见部署内
+ * `dsh-agent/lib/types/index.d.ts:66`（`SessionHeader.parentSession?: SessionId`）。
+ * 祖先链可上溯的先例：`dsh-subagent/lib/types/continuation-activation.js:381-388`。
+ *
+ * 它**只用于冲突判定**（见 collab-core.ts 的 inFamily）：父子会话共享写域，
+ * 所以父的独占锁不该拒绝自家子代理。血缘不落盘，每次从运行时现算。
+ */
+export interface SessionLike { header?: { cwd?: string; parentSession?: string } }
 export interface AgentLike {
   id?: string
   session?: SessionLike
@@ -205,7 +224,7 @@ export interface DelegationSettings {
    * 关掉后 agent/status → idle 不再触发任何释放，声明只由 op=release / 租约到期回收。
    */
   releaseOnLoopEnd: boolean
-  /** 上面那条的宽限期（秒），默认 15，夹在 [LOOP_END_GRACE_SEC_MIN, LOOP_END_GRACE_SEC_MAX]。 */
+  /** 上面那条的宽限期（秒），0.9.11 起默认 120（此前 15），夹在 [LOOP_END_GRACE_SEC_MIN, LOOP_END_GRACE_SEC_MAX]。 */
   loopEndGraceSec: number
 }
 

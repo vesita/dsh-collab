@@ -15,7 +15,7 @@
 //   3) 到点复核：fire 时 agent.status 已是 running（没有新事件）→ 仍然不释放；
 //   4) 设置 releaseOnLoopEnd=false → **不武装**（连计时器都不建）；
 //   5) 活的设置变更：武装之后、到点之前关掉开关 → 到点也不释放；
-//   6) loopEndGraceSec 可配（默认 15s）→ 计时器毫秒数与文案秒数都跟着走；
+//   6) loopEndGraceSec 可配（0.9.11 起默认 120s，此前 15s）→ 计时器毫秒数与文案秒数都跟着走；
 //   7) 两个群体的告知：读者（release 同一条投递面，文案说"自动释放"）+ 被释放会话本人
 //      （"你已不再持锁，重新 claim 再写"）；每一条来源都显式非 user；
 //   8) 审计留痕：状态文件里追加一条 channel=agent:<holderId> 的留言，`collab_board op=read` 读得到；
@@ -81,7 +81,7 @@ function makeFs(store, versions) {
  *
  * @param opts.claims    预置状态文件里的 claims（会自动补 readers/messages/holders 空字段）
  * @param opts.agents    装机时就在注册表里的 agent（id -> status），用来测"已 idle 时补武装"
- * @param opts.settings  用户设置（缺省 = releaseOnLoopEnd:true / loopEndGraceSec:15）
+ * @param opts.settings  用户设置（缺省 = releaseOnLoopEnd:true / loopEndGraceSec:120，与 spec.ts 的默认值一致）
  */
 async function makeHarness(opts = {}) {
   const store = new Map()
@@ -97,11 +97,11 @@ async function makeHarness(opts = {}) {
 
   // 注册表：id -> 假 agent（带真实契约里存在的 status / inject / session 三面）。
   const registry = new Map()
-  const addAgent = (id, status) => {
+  const addAgent = (id, status, parentSession) => {
     const agent = {
       id,
       status,
-      session: { header: { cwd: CWD }, id },
+      session: { header: parentSession ? { cwd: CWD, parentSession } : { cwd: CWD }, id },
       inject: (message) => { deliveries.push({ sessionId: id, message }) }
     }
     registry.set(id, agent)
@@ -110,7 +110,7 @@ async function makeHarness(opts = {}) {
   for (const [id, status] of Object.entries(opts.agents || {})) addAgent(id, status)
 
   let hooks = null
-  let value = Object.assign({ exposeDelegationDiscipline: true, enforceWriteLock: true, releaseOnLoopEnd: true, loopEndGraceSec: 15 }, opts.settings || {})
+  let value = Object.assign({ exposeDelegationDiscipline: true, enforceWriteLock: true, releaseOnLoopEnd: true, loopEndGraceSec: 120 }, opts.settings || {})
 
   const ctx = new Context()
   const withAgents = opts.withAgents !== false
@@ -212,7 +212,7 @@ console.log('# 核心路径：idle → 宽限 15s 到点 → 自动释放')
   hh.emitStatus('A', 'idle')
   await settle()
   ok(hh.timers.length === 1, 'idle 武装了一个宽限期计时器', JSON.stringify(hh.timers.map((t) => t.ms)))
-  ok(hh.timers[0] && hh.timers[0].ms === 15000, '默认宽限期是 15 秒（15000ms）', String(hh.timers[0] && hh.timers[0].ms))
+  ok(hh.timers[0] && hh.timers[0].ms === 120000, '默认宽限期是 120 秒（120000ms，0.9.11 从 15 调长）', String(hh.timers[0] && hh.timers[0].ms))
   ok(hh.readState().claims.length === 2, '宽限期内**还没**释放', JSON.stringify(hh.readState().claims.map((c) => c.claimId)))
 
   await hh.flush()
@@ -224,7 +224,7 @@ console.log('# 核心路径：idle → 宽限 15s 到点 → 自动释放')
   ok(m && m.channel === 'agent:A', '留痕频道寻址到持有者本人（agent:<sessionId>，不重复拼前缀）', String(m && m.channel))
   ok(m && m.author === 'system:dsh-collab', '留痕作者是 system:dsh-collab（不是任何会话）', String(m && m.author))
   ok(m && Array.isArray(m.mentions) && m.mentions[0] === 'agent:A', '留痕 mention 持有者', JSON.stringify(m && m.mentions))
-  ok(m && String(m.body).includes('自动释放') && String(m.body).includes('15 秒'), '留痕正文写明触发条件与宽限期', String(m && m.body))
+  ok(m && String(m.body).includes('自动释放') && String(m.body).includes('120 秒'), '留痕正文写明触发条件与宽限期', String(m && m.body))
 
   // 两个群体：读者 agent:B + 被释放的 agent:A。
   const toB = hh.deliveries.find((d) => d.sessionId === 'B')
@@ -235,7 +235,7 @@ console.log('# 核心路径：idle → 宽限 15s 到点 → 自动释放')
     JSON.stringify(hh.deliveries.map((d) => d.message && d.message.source)))
   ok(!textOf(toB && toB.message).includes('已释放 c_44') && textOf(toB && toB.message).includes('自动释放'),
     '读者文案说的是"自动释放"，不是"X 主动释放"', textOf(toB && toB.message))
-  ok(!textOf(toB && toB.message).includes('15 秒') === false, '读者文案带上宽限期秒数', textOf(toB && toB.message))
+  ok(!textOf(toB && toB.message).includes('120 秒') === false, '读者文案带上宽限期秒数', textOf(toB && toB.message))
   ok(textOf(toA && toA.message).includes('自动释放') && textOf(toA && toA.message).includes('重新执行 collab_lock op=claim'),
     '本人文案说明"已自动释放"并给出恢复动作（重新 claim）', textOf(toA && toA.message))
   ok(textOf(toA && toA.message).includes('你此前持有'), '本人文案是第二人称（收件人不同，措辞也不同）', textOf(toA && toA.message))
@@ -464,6 +464,76 @@ console.log('# 源码级：auto-release 不唤醒会话、不自造消息')
     ok(/agent\/status/.test(code), '接线在 agent/status 上', 'agent/status')
     ok(/inject/.test(readFileSync(path.join(ROOT, '../src/push.ts'), 'utf8')), 'push.ts 仍是投递面（本功能经它发通知）')
   }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// 12. 第四道闸门（0.9.11）：有自家子代理在 running → 不释放
+// ════════════════════════════════════════════════════════════════════════
+console.log('# 第四道闸门：有子代理在 running 时不释放，跑完再放')
+{
+  const hh = await makeHarness({
+    claims: [mkClaim({ claimId: 'c_p', holderId: 'agent:P', paths: ['src/deploy/'] })]
+  })
+  hh.addAgent('P', 'running')
+  hh.addAgent('C', 'running', 'P') // 子代理：session.header.parentSession = 'P'
+  hh.emitStatus('P', 'idle')
+  await settle()
+  ok(hh.timers.length === 1, 'idle 武装了宽限计时器', JSON.stringify(hh.timers.map((t) => t.ms)))
+  await hh.flush()
+  ok(hh.readState().claims.length === 1, '子代理在 running ⇒ 父会话声明**不**被释放',
+    JSON.stringify(hh.readState().claims.map((c) => c.claimId)))
+  ok(hh.timers.length === 1, '重新武装了一轮（下一轮回来看，而不是放着不管）', String(hh.timers.length))
+  ok(hh.readState().messages.length === 0, '没发生释放 ⇒ 不留痕', String(hh.readState().messages.length))
+
+  // 子代理跑完 → 再一轮到点就该正常释放。
+  hh.emitStatus('C', 'idle')
+  await hh.flush()
+  ok(hh.readState().claims.length === 0, '子代理停下后再到点：正常释放',
+    JSON.stringify(hh.readState().claims.map((c) => c.claimId)))
+
+  // 负向对照：没有血缘的第三方在跑，不该拦住我。
+  const solo = await makeHarness({
+    claims: [mkClaim({ claimId: 'c_p2', holderId: 'agent:P2', paths: ['src/deploy/'] })]
+  })
+  solo.addAgent('P2', 'running')
+  solo.addAgent('X', 'running') // 无 parentSession：不是我的子代理
+  solo.emitStatus('P2', 'idle')
+  await settle()
+  await solo.flush()
+  ok(solo.readState().claims.length === 0, '无血缘的第三方在 running 不拦我（判据只看自己的后代）',
+    JSON.stringify(solo.readState().claims.map((c) => c.claimId)))
+  await hh.fiber.dispose(); await solo.fiber.dispose()
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// 13. 降噪（0.9.11）：窗口内重复释放只注入一条，审计留言一条不少
+// ════════════════════════════════════════════════════════════════════════
+console.log('# 降噪：同一 holder 反复释放，注入通知合并，审计留言不合并')
+{
+  const hh = await makeHarness({
+    claims: [mkClaim({ claimId: 'c_n1', holderId: 'agent:N', paths: ['src/deploy/'] })]
+  })
+  hh.addAgent('N', 'running')
+  const agentN = hh.registry.get('N')
+  hh.emitStatus('N', 'idle')
+  await settle()
+  await hh.flush()
+  const first = hh.deliveries.filter((d) => d.sessionId === 'N').length
+  ok(first === 1, '第一次释放：本人的注入通知投出去了', String(first))
+
+  // 重新 claim → 再次 idle → 再次释放（同一 holder，落在合并窗口内）
+  await hh.callTool('collab_lock', { op: 'claim', paths: ['src/deploy/'] }, agentN)
+  ok(hh.readState().claims.length === 1, '前置：重新 claim 成功', JSON.stringify(hh.readState().claims.length))
+  hh.emitStatus('N', 'idle')
+  await settle()
+  await hh.flush()
+  const second = hh.deliveries.filter((d) => d.sessionId === 'N').length
+  ok(second === 1, '窗口内第二次释放：注入被合并（仍然只有 1 条）', String(second))
+  ok(hh.readState().claims.length === 0, '声明照旧被释放（降噪只动通知，不动锁语义）',
+    JSON.stringify(hh.readState().claims.length))
+  ok(hh.readState().messages.length === 2, '审计留言**一条都没合并**（取证账目完整）',
+    JSON.stringify(hh.readState().messages.length))
+  await hh.fiber.dispose()
 }
 
 h.finish()

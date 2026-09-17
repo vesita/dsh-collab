@@ -47,7 +47,7 @@
 │   ├── tools.ts                  # collab_lock / collab_board 注册（消费 store + push）
 │   ├── access.ts                 # 功能 A：访问通知（逐事件经 agent.inject 投递 form:'notice' 的显式来源消息）+ 读者反向注册（tools/post-execute）
 │   ├── gate.ts                   # 功能 C：写/读的原生审批门控（tools/pre-execute）
-│   ├── auto-release.ts           # 循环终止自动释放（agent/status → idle，宽限 15 秒；tools.ts 之外的第二条回收路径）
+│   ├── auto-release.ts           # 循环终止自动释放（agent/status → idle，宽限 120 秒 + 有子代理在跑不放；tools.ts 之外的第二条回收路径）
 │   ├── push.ts                   # 功能 D：释放推送（唯一通道 agent.inject + 显式来源 form:'notice'）+ agent/disposed 生命周期
 │   ├── awareness.ts              # 协作态势注入（运行时上下文 order 130）
 │   ├── delegation.ts             # 委托纪律：settings 偏好 + 随包 skill + 常驻纪律块（order 131）
@@ -97,6 +97,12 @@ legacyCollabDirs(env?)       // 历史落点，用于一次性迁移（env 仅�
 
 `list` / `overview` / `status` 三个 op 都返回 `stateDir` 与 `statePath`，落点随时可核实。
 
+0.9.11 起 `overview` 还会**顺带报出别的项目**：返回里多一个 `otherProjects`（每条给出文件名、
+`statePath`、活跃声明数与占用明细，按声明数降序、最多 10 条；没有活跃声明的项目不列入）。
+它走**输出侧附加**而不是给工具加 `project`/`all` 入参 —— 加参数要同步 4 份契约派生物，而排障
+真正缺的是"我能看见别人占着什么"。宿主 fs 不提供 `listDir`、目录不存在或某个状态文件损坏时，
+只返回 `otherProjects: []` 加一句 `otherProjectsNote`，**本项目的数字一字不动**。
+
 历史落点（`<项目>/.dsh-collab.json`、旧版相对 cwd 的 `.dsh/collab/projects/`、以及早期版本写入的 `<HOME>/~/.dsh/collab/projects/`）在目标文件不存在时被只读扫描并一次性搬入正确位置，文件名一一对应。该迁移由包形态执行；动态形态直接读写正确落点，因此与包形态共享同一份状态。
 
 ---
@@ -136,7 +142,7 @@ agents.currentInitiator()            → 正在装配的那个会话
 
 租约刻意用**绝对 UTC 起止时刻**表示，而不是「还剩几分钟」的倒计时：DSH 只在运行时上下文的文本逐字节变化时才提交新快照，时间无关的摘要因此不会因为过了几分钟而被重复注入。
 
-同项目暂无他人声明时，该上下文退化为一句通用协作规范。读盘走 15 秒 TTL 的后台缓存（`DSH_COLLAB_DIGEST_TTL_MS` 可调），provider 同步返回缓存，刷新失败时沿用上一份。缓存里存的是**该 cwd 的原始活跃占用列表**，「排除自己」按**读取时的发起者**现场做——同一份缓存对所有会话都成立，只有「排除谁」因人而异（0.9.1 前存的是**刷新者视角**渲染好的文本，同 cwd 的父子会话会互相串台，见下）。
+同项目暂无他人声明时，该上下文退化为一句通用协作规范。读盘走 15 秒 TTL 的后台缓存（`DSH_COLLAB_DIGEST_TTL_MS` 可调），provider 同步返回缓存，刷新失败时沿用上一份。缓存里存的是**该 cwd 的原始活跃占用列表**，「排除谁」按**读取时的发起者**现场做——同一份缓存对所有会话都成立，只有「排除谁」因人而异；0.9.11 起排的是**整个会话家族**（自己 + 祖先 + 后代），见「会话家族（血缘）」一节。
 
 关闭方式：包形态设置环境变量 `DSH_COLLAB_NO_PROMPT_HINT=1`。受限的动态宿主形态读不到 `process.env`，因此它**始终注入**；需要彻底关闭时请使用包形态。
 
@@ -160,9 +166,9 @@ agents.currentInitiator()            → 正在装配的那个会话
 | 字段 | `releaseOnLoopEnd` |
 | 类型 / 默认 | `boolean` / `true` |
 | 字段 | `loopEndGraceSec` |
-| 类型 / 默认 | `number` / `15`（夹在 `[1, 3600]`） |
+| 类型 / 默认 | `number` / `120`（夹在 `[1, 3600]`；0.9.11 起，此前 15） |
 
-四个字段同属一个命名空间：前两项控制委托纪律与写保护（见上），后两项控制**循环终止自动释放**（见下文 0.9.10 一节）。
+四个字段同属一个命名空间：前两项控制委托纪律与写保护（见上），后两项控制**循环终止自动释放**（见下文「循环终止自动释放」一节）。
 
 该命名空间经 `ctx.settings.installSection(...)` 注册（schema 由 `@deepseek-ai/schemastery` 描述），因此它出现在设置文档 `${DSH_HOME:-$HOME/.dsh}/settings.yaml` 与设置界面里。值是**活读**的：改完立即生效，无需重启 dsh。命名空间是可选服务，部署里没有 settings 服务时插件按 `true` 行事。
 
@@ -181,7 +187,7 @@ agents.currentInitiator()            → 正在装配的那个会话
 
 打开 **设置 → 插件**（Settings → Plugins）即可看到 `dsh-collab` 的卡片：默认折叠的一行摘要（标题 + 当前三项状态），点开是三行设置项 —— 「委托与验收纪律」（下拉：关闭 / 集群协作，带一个打开随包技能正文的预览按钮）、「原生写保护」（下拉：拦截 / 不拦截）与「循环终止自动释放」（下拉：自动释放 / 不自动释放 + 宽限期秒数输入框）。控件直接写 Host，改完即保存；三种状态都如实呈现——命名空间尚未就绪时给一行加载占位，本部署没有 Host 半边时整张卡片不渲染，只读部署把控件置灰并说明原因。
 
-**预览按钮的行为（0.8.2 起）**：点一下**直接**在右侧栏的文档面板打开随包技能正文，没有二次确认，**也不会关闭设置页**——设置页照常开着，右侧栏多出一份技能文档。按钮就只是「在右侧栏打开技能文档」，文案与行为一致。
+**预览按钮的行为**：点一下**直接**在右侧栏的文档面板打开随包技能正文，没有二次确认，**也不会关闭设置页**——设置页照常开着，右侧栏多出一份技能文档。按钮就只是「在右侧栏打开技能文档」，文案与行为一致。
 
 > **本落点无法关闭设置页**：卡片注册在 `settings.plugin.item`，该槽位的 `standardProps` 只有 `useResource` / `useWorkspaces` / `usePanelInfo` / `useSessions` / `useSessionPendingInteraction`，**没有 `close` 回调**（`settings-plugins` 里就是 `renderSlot("settings.plugin.item", {}, { entryKey: ns })`，业务 props 是空对象）。设置页本身也不是 `layout` 的主面板——它是 `settings-general` 里 `SettingsRoot` 的组件内部 `useState`，因此 `layout.selectPanel(null)` 关不掉它，反而会清空中间主面板的选中项（把会话从中间列弄掉）；0.8.2 已把这个调用**整个删除**。**若将来确需自动关闭设置页，必须改用 `settings.section` 落点**——那里是 `renderSlot("settings.section", { close: onClose }, …)`，是唯一能拿到 `close` 回调的地方。
 
@@ -189,13 +195,59 @@ agents.currentInitiator()            → 正在装配的那个会话
 
 `skills/subagent-delegation/SKILL.md` 随包发布。偏好开启时，插件把它注册进宿主技能注册表（`ctx.skills.register`），标注 `source: 'bundled'`、`provider: 'dsh-collab'`，技能目录里因此能看到它、来源也可辨。注册随 effect disposer 撤回，**可逆**：插件卸载或偏好关闭，该技能随之消失。
 
+技能正文的 §10.4 与常驻纪律文本（`DELEGATION_DISCIPLINE_TEXT`）同时写明一条恢复路径：**子代理意外终止（回合以 `error` / 空收尾结束、久等之后不再是 `running`）时先唤醒它、别急着重派**。唤醒靠 `send_message`（对 `idle` / `ready` 的子代理会**开启一个回合**，且是**同一个会话**，所以它保留着上下文与已完成的工作，比重派便宜），而 `collab_board` 那条通道**唤不醒任何人** —— `agent.inject` 的契约是 `send(msg, 'next-step', wakeup=false)`，只挂进收件箱、不起 driver。两处都提醒：被唤醒的子代理**不知道自己已经丢锁**（循环一停，声明就被自动释放），要让它先 `collab_lock op=claim` 再动手；同一处最多试一两次，之后自己写。
+
 插件的**动态宿主形态**（`hostCode` 字符串）刻意不注册该技能：受限动态环境没有包目录、也没有 `import`，无法定位 `<pkg>/skills/subagent-delegation/SKILL.md`。这是环境限制，不是遗漏。
 
 包形态的 `DSH_COLLAB_NO_PROMPT_HINT=1` 关掉**所有**运行时注入 —— 态势上下文、委托纪律文本、以及功能 A 的访问通知（后者也是运行时派生再注入进会话的内容）。它不影响技能注册。
 
 ---
 
-## 0.9.10：循环终止自动释放（告别「循环停了、锁还在」）
+## 会话家族（血缘）
+
+**问题**（backlog §2.1，Top 5 第 3 条）：holder 身份是 `agent:<会话 id>`，而**子代理跑在自己的
+会话里** ⇒ 主会话 `claim src/`（exclusive）之后派子代理去改 `src/` 下的文件，子代理会被这把锁
+**硬拒绝**（本部署审批关闭，`ask` 即 `deny`），而且它无权释放（`release` 只允许持有者本人）——
+只能到留言板求父会话放锁，而父会话的循环可能已经停了。核心工作流（派子代理写代码）就此卡死。
+
+**血缘从哪来**：子代理创建时会把 `parentSession: parentHeader.id`、`origin: 'subagent'`、
+`delegationDepth` 写进会话头（`dsh-subagent/lib/types/child-agent.js:117-123`；类型见部署内
+`dsh-agent/lib/types/index.d.ts:66`）。祖先链可上溯，`store.familyIds()` 因此能现算出
+**自己 + 祖先链 + 后代**这一组 holderId（后代会话从 `agents.list()` 里按祖先链反查）。
+
+**判据**：`collab-core.inFamily(h, holderId)` —— 家族成员之间的独占声明**不构成冲突**。
+它取代了原先散在 6 处的裸判据 `c.holderId === h.holderId`：
+
+| 位置 | 作用 |
+| --- | --- |
+| `collab-core.claim()` | 冲突扫描（子代理 claim 父占的路径） |
+| `collab-core.blockers()` | `op=wait` 的阻塞判据（不 wait 自家人） |
+| `gate.ts` | 原生写门控（子代理写父占的路径） |
+| `awareness.ts` | 常驻态势摘要（不把自家子代理报成"其他会话占用"，backlog §2.2） |
+| `access.ts` | 访问通知（不为自家人发通知） |
+| `collab-plugin.host.ts` | 动态形态的内联副本（同上五处，由 parity 测试对拍） |
+
+**三条纪律**：
+
+1. **只缩不放**——拿不到 `agents` 服务、读不到血缘字段、或 `h.family` 缺省时，判据退化为
+   "只看 holderId 是否相等"，也就是 0.9.10 的语义。**不会**因为判据缺失就放行陌生人。
+2. **不落盘**——`family` 只活在 `HolderInput` 上（`holder()` 只挑已知字段写状态文件），
+   每次从运行时现算。血缘因此**不进契约**（`src/schema/collab.schema.json` 的 4 份派生物
+   一份都不用改）。
+3. **带环保护与深度上限**（16 层）——血缘字段来自会话头，不能假设它良构。
+
+**与自动释放的次序**：家族豁免必须**先**落地。它是"父独占、子代理写不了"的正解，而自动释放
+只是那个死锁的临时出口；先放宽宽限期（或加第四道闸门）会把死锁还回来。理由记在
+「循环终止自动释放」一节。
+
+**测试**：`tests/collab-pure-logic.mjs`（正负对照：自家人放行 / 无血缘第三方仍 conflict /
+血缘缺省仍 conflict / 父写子占的路径放行 / holders 表不出现 `family`）、
+`tests/collab-inline-parity.mjs`（`inFamily` 进同名集合，7 条语料逐输出对拍两形态）、
+`tests/collab-access-gate.mjs`（门控侧）。
+
+---
+
+## 循环终止自动释放
 
 **问题**：父会话 `claim` 后把写入交给子代理，**自己循环停了**。子代理被门控硬拒绝，到留言板
 `@` 它也没用 —— `agent.inject` 是 `send(msg, 'next-step', wakeup=false)`，**不唤醒 driver**
@@ -205,15 +257,21 @@ agents.currentInitiator()            → 正在装配的那个会话
 **判据**：`agent/status` 从 `running` 翻到 `idle`（循环停了）。**不是** `agent/disposed` ——
 idle 的 agent 仍在 `agents.list()` 里、仍可唤醒，所以 W7「dispose 不释放」没有被推翻。
 
-**三道闸门**（方向都是"少放"）：宽限期 `loopEndGraceSec`（默认 **15 秒**）排除回合之间的
-正常停顿；宽限期内任何状态变化都让本次武装作废（代次）；到点**必须**解析到那个 agent 且它
-此刻仍是 `idle` —— 服务缺失 / `get()` 抛错 / 已 dispose / 非 idle，**一律不放**。放的时候
+**四道闸门**（前三道方向都是"少放"）：宽限期 `loopEndGraceSec`（0.9.11 起默认 **120 秒**，
+此前 15）排除回合之间的正常停顿；宽限期内任何状态变化都让本次武装作废（代次）；到点**必须**
+解析到那个 agent 且它此刻仍是 `idle` —— 服务缺失 / `get()` 抛错 / 已 dispose / 非 idle，
+**一律不放**；第四道是 0.9.11 新增的**「有自家子代理在 running 就不放」**（见
+「会话家族（血缘）」一节）：子代理在跑说明锁还在被用，它只是不在我的循环里。放的时候
 只释放该 holder **未过期**的声明。
 
 **释放后两条告知**（都经 `agent.inject` 的显式来源 notice）：等待者收到「锁已自动释放」（不是
 "X 已释放"，释放者不是持有者）；被释放的会话本人收到「你的声明已被自动释放，恢复工作前重新
 `claim`」—— 后者是安全阀，否则它恢复后仍以为自己持锁。同时在状态文件里留一条审计留言
 （`channel` = `agent:<sessionId>`，作者 `system:dsh-collab`），`collab_board op=read` 可回读。
+
+0.9.11 降噪：**发给本人的那条注入通知**按 `holderId` 在 60 秒窗口内合并（第二次起记
+`error: 'deduped'`），专治"claim→release→claim"抖动；**审计留言一条都不合并**——那是取证账目，
+合并它等于篡改证据。等待者的通知仍按 `(claimId, reader)` 去重，语义不变。
 
 | 回收路径 | 触发 | 说明 |
 | --- | --- | --- |
@@ -227,9 +285,13 @@ idle 的 agent 仍在 `agents.list()` 里、仍可唤醒，所以 W7「dispose �
 它收不到告知（注入面对未加载会话不可达），恢复后必然会以为自己还持锁，所以交给租约到期与
 `op=reap`。
 
-**设置**：`releaseOnLoopEnd`（默认 `true`）、`loopEndGraceSec`（默认 `15`，夹在 `[1, 3600]`），
+**设置**：`releaseOnLoopEnd`（默认 `true`）、`loopEndGraceSec`（0.9.11 起默认 `120`，夹在 `[1, 3600]`），
 **活读**——武装后到点前关掉也照样拦住。**取舍**：宽限期排不掉"等真人回复"这种停顿，超过宽限期
 同样会放锁；想让锁活得比循环长就关掉 `releaseOnLoopEnd` 或调大 `loopEndGraceSec`。
+
+**为什么 0.9.11 才敢把 15 秒调长**：15 秒对"派完子代理、等它跑几分钟"这种长流程几乎必然误放。
+但自动释放本身是「会话家族」落地前"父独占、子代理写不了"的**唯一**出口，先调长就等于把死锁
+还回去 —— 所以次序是：**先做家族豁免（子代理不再需要父会话放锁），再调宽限期、再加第四道闸门**。
 
 **两形态**：包形态 `src/auto-release.ts`（释放 + 两条通知）；动态形态 `hostCode` 内联等价释放
 逻辑但**不投递通知**（受限环境没有 `@deepseek-ai/dsh-llm`，造不出显式来源消息，不许退回会冒充
@@ -238,18 +300,7 @@ idle 的 agent 仍在 `agents.list()` 里、仍可唤醒，所以 W7「dispose �
 `tests/collab-auto-release.mjs`。`collab_lock` 描述与常驻纪律文本各加一句"循环一停就自动放锁：
 恢复工作前先重新 claim"（常驻文本仍是纯常量、无阿拉伯数字）。
 
-## 0.9.9：skill 正文与常驻纪律文本凝练
-
-- `skills/subagent-delegation/SKILL.md`：**320 行 / 24141 字节 → 112 行 / 7991 字节**。
-  只留能改变行为的规则，删掉机制原理长文、重复强调与不再影响动作的示例；`name` 逐字保留，
-  `description` / `whenToUse` 压到预算内（≤120 / ≤180 字符）但保留全部触发语义。
-  判据、动作序列、规格模板（停止边界 / 最值钱的三样 / 第一行标签）、报告体积、验收不外包、
-  独立性与成本、工具与并发、目标轮次、可执行踩坑与硬禁令全部保留；§10/§11 合并为「硬禁令与并发」。
-- `src/spec.ts` 的 `DELEGATION_DISCIPLINE_TEXT`（常驻纪律，PromptContext order 131）：**九行 → 五行**，
-  规则一条不少；仍是纯常量、仍不含任何阿拉伯数字，`tests/collab-skill.mjs` 的
-  「常量」「无数字」「含 `[dsh-collab]` 标记」断言继续生效。
-
-## 0.9.8：僵尸声明的显式回收（`op=reap`）
+## 僵尸声明的显式回收（`op=reap`）
 
 **要解决的问题（实测，不是推演）**：2026-09-13 深夜，一个子代理会话（W10）被强杀（dsh 重启），
 它持有的 `src/` + `tests/` exclusive 声明**留在了状态文件里**。声明只有持有者本人能 `release`
@@ -303,7 +354,7 @@ idle 的 agent 仍在 `agents.list()` 里、仍可唤醒，所以 W7「dispose �
 
 ---
 
-## 0.9.6：释放通知不再冒充用户 + 声明生命周期只认租约
+## 释放通知与声明生命周期
 
 **修的是两个真问题（都实测过）**：
 
@@ -342,7 +393,7 @@ idle 的 agent 仍在 `agents.list()` 里、仍可唤醒，所以 W7「dispose �
 
 ---
 
-## 0.9.4：提示词硬化：子代理禁止 client 平台 Inspect + 探索阶段默认先派
+## 子代理禁止 client 平台检视 + 探索阶段默认先派
 
 **修的是真故障（实测定位）**：
 - **症状**：子代理执行 `cordis_inspect_query` 查询 `platform: 'client'`（如 `Slots` / `Theme`）会**永久挂起**。故障实测中子代理会话 `769c2e33` 调 `listSubTree` 空挂 344.8 秒直到被主 AI 中断；主会话做相同调用则瞬时返回。
@@ -354,7 +405,7 @@ idle 的 agent 仍在 `agents.list()` 里、仍可唤醒，所以 W7「dispose �
 
 ---
 
-## 0.9.1：修掉态势摘要的跨会话串台，纪律文本点名「探索阶段先派」
+## 态势摘要按 cwd 缓存原始占用
 
 **修的是真 bug（已实测复现）**：`dsh-collab/awareness` 的运行时候选摘要原先**只按 cwd 缓存「某个人视角
 渲染好的文本」**，而「排除自己」的过滤做在**刷新侧**。同 cwd 的多个会话（父会话与其子代理）各自刷新，
@@ -378,7 +429,7 @@ claim 删除并强制刷新后双方都回落通用规范。修复前实测 `6 p
 
 ---
 
-## 0.9.0：架构拆分、契约守卫与「跳过即失败」
+## 架构拆分、契约守卫与「跳过即失败」
 
 这一版**没有新增用户可见功能**，全是在夯地基——目标是让「两形态漂移」「契约漂移」「静默失败」
 这三类问题在**下一次改动时当场变红**，而不是靠事后排查。
@@ -411,39 +462,7 @@ claim 删除并强制刷新后双方都回落通用规范。修复前实测 `6 p
 
 **使用上已知的别扭之处与优化方向**：见 `docs/collab-ux-backlog.md`。
 
-## 0.8.0：访问通知、原生写保护与读者推送
-
-> **0.8.4 的历史修复（功能 D 的投递通道）—— 该修复已于 0.9.6 整体删除，仅作沿革记录**：
-> 读者若是**由 subagent 路由托管的会话**，`sessionController.prompt` 会被 DSH 结构化拒绝
-> （`session/agent-busy`，message `session "…" is owned by subagent routing`，details 里明写
-> `use subagent delivery for this child session`）。0.8.3 之前这条拒绝只留下一条
-> `prompt-failed`，通知实际发不出去。0.8.4 在这种情况改用 **`ctx.subagents.sendMessage`**
-> 再投一次，并在 `notify` 里把"走的哪个通道"与失败原因分开记。**安全闸门一条都没放宽**：
-> 仍然只对 `isLiveSession()` 为真的读者投递 —— 回退通道会对"缺席的直接子会话"
-> cold-resume，所以那道闸门对两个通道统一生效；拿不到释放者的活 Agent、或 `subagents`
-> 不可用时不回退。
->
-> **0.9.6：上面这两条通道连同 `prompt-failed` / `not-adjacent` / `subagent-failed` 三个
-> reason 一起从 `src/push.ts` 删除。** 理由见下文「功能 D」：两个 API 都只收 `content`、
-> 消息由宿主代造并写死 `source: { kind: 'user', rpcId: 'dsh-collab-…' }`，在 GUI 里就是
-> **用户气泡**（冒充真人输入，违反 `AGENTS.md` §1）。现在的唯一投递面是 `agent.inject` +
-> 显式 `plugin/notice` 来源。
-
-> **0.8.3 修复（bug + 可观测性）**：0.8.2 的 `sweep()` 会按「会话是否加载」判据清理 `readers`，
-> 而该判据对**休眠但可唤回**的会话返回 `undefined` —— 只是空闲的读者会在下一次任意写路径上
-> 被删掉，claim 释放时已无人可推（静默丢通知）。0.8.3 让 `sweep()` 不再触碰 readers，
-> 并在 `op=release` 的返回上新增 `notify` 汇总，把"没有人需要通知"与"通道坏了"分开。
-> 详见下文「功能 D」。
-
-> **0.8.2 修复（交互）**：设置卡片「预览」原先是「两步内联确认 → `layout.selectPanel(null)` 关设置页 → 右侧打开」。
-> 前两步都错：`selectPanel(null)` 对设置页无效（它不是 `layout` 的主面板），却会清空中间主面板的选中项，
-> 把会话从中间列弄掉；本槽位也根本没有关闭句柄。0.8.2 删掉二次确认与整个 `selectPanel(null)` 调用，
-> 点「预览」直接打开右侧技能文档，设置页保持打开。详见上文「设置界面里的那张卡片」。
-
-> **0.8.1 修复（bug）**：0.8.0 的写保护门控在收集阻塞声明时漏了 `mode` 过滤，把**他人的
-> `shared` / `read` 声明也当成写阻塞** —— 后果是另一个会话按提示用 `mode=read` 声明 `src/`
-> 之后，所有人的写入都会被硬拒绝（本部署 `ask` = deny），`shared` 的两个共享方也会互相挡死。
-> 0.8.1 让门控与 `claim()` 用同一判据：**只有他人的 `exclusive` 声明阻塞他人**。
+## 访问通知、原生写保护与读者推送
 
 ### 功能 A — 访问时的路径相关通知（逐事件经 `agent.inject` 投递 notice）
 
@@ -461,16 +480,8 @@ claim 删除并强制刷新后双方都回落通用规范。修复前实测 `6 p
 任何异常都等价于"这次没有通知"，绝不进入 waterfall。
 
 > **规范**：**严禁冒充用户**（见 `AGENTS.md` §1）—— 消息可以投，来源必须诚实。
-> 这里曾经逐字复刻 `dsh-llm` 的 `createUserMessage`，并把消息塞进 `additionalContexts`；
-> 该副本（`src/plugin-message.ts`）已删除，且由 `tests/collab-message-provenance.mjs`
-> 守着不许复活。构造一律走**真实的** `@deepseek-ai/dsh-llm`：`id` / `role` / 深冻结
-> 全部由构造函数补。
->
-> **历史教训**：这条规范一度被读成"**一份也不许构造**"，于是访问通知被逼去挤
-> `systemPrompt.context` 的运行时快照 —— 提交单位从"一行"变成**整份合并快照**
-> （持久化事件 581 B → 3124 B）、投递**依赖 `systemPrompt` 服务可用**、通知**没有自己的一行**。
-> 收窄到"禁止冒充"之后回到了生态的通行写法（对照 `dsh-tool-jobs:208-226` 的作业完成通知）。
-> 完整的代价与取舍数字见 `AGENTS.md` §1。
+> 构造一律走**真实的** `@deepseek-ai/dsh-llm`：`id` / `role` / 深冻结全部由构造函数补，
+> `source` 显式 `plugin/notice` 且 `form:'notice'` 必须带非空 `summary`。
 
 通知文案与态势摘要同源：只用**绝对 UTC 租约窗口**，不含倒计时。
 
@@ -669,7 +680,7 @@ cargo test --manifest-path crates/collab-cli/Cargo.toml
 | 行为 | 阈值 | 说明 |
 | --- | --- | --- |
 | 过期声明回收 | 租约到期 | 过期声明随每次读取失效，不再阻塞他人 |
-| **僵尸声明显式回收** | **仅 `op=reap` + `confirm:true`** | **绝不自动**：dry-run 默认、判据见 0.9.8 一节；被强杀的会话留下的未到期声明由调用方显式确认后回收 |
+| **僵尸声明显式回收** | **仅 `op=reap` + `confirm:true`** | **绝不自动**：dry-run 默认、判据见「僵尸声明的显式回收」一节；被强杀的会话留下的未到期声明由调用方显式确认后回收 |
 | 留言保留 | 最近 `MAX_MESSAGES = 2000` 条 | 超出部分从最旧的开始丢弃，写入时回报 `swept.droppedMessages`（`swept` 是**条件字段**：仅当本次 `droppedMessages > 0` 或 `prunedHolders > 0` 时才出现在返回里，且不含 readers 相关字段） |
 | 陈旧 holder 回收 | 无活跃声明且 `HOLDER_TTL_MS = 24h` 未出现 | 回收由 `sweep()` 执行；`list` 另用 `holderView()` 给出 `ageSec` / `active` / `stale` 与 `staleHolders` |
 | holder 废弃预警 | 无活跃声明且静默 `HOLDER_STALE_WARN_MS = 1h` | `stale` 走这条更短的阈值，因此它是"看起来已废弃"的先行信号，在 `list` 上始终可达 |

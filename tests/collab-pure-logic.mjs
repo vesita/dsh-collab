@@ -8,7 +8,7 @@ import { createHarness } from './_harness.mjs'
 import { readFileSync } from 'node:fs'
 import {
   norm, ov, cleanName, init, publish, expire, sweep, HOLDER_TTL_MS, holder, claim, release, heartbeat,
-  post, overview, related, filterMessages, blockers, holderView, holderFresh, MODES,
+  post, overview, related, filterMessages, blockers, holderView, holderFresh, MODES, reap,
 } from '../lib/collab-core.js'
 
 const h = createHarness()
@@ -327,6 +327,86 @@ console.log('# hostCode inline vs core (drift guard)')
   const hostSwept = hs(hostState, 1000 + HOLDER_TTL_MS + 1)
   ok(JSON.stringify(coreSwept) === JSON.stringify(hostSwept), 'hostCode sweep returns the same diagnostics as core')
   ok(JSON.stringify(coreState) === JSON.stringify(hostState), 'hostCode sweep mutates state identically to core')
+}
+
+// ===== 会话家族（血缘）豁免（0.9.11，C1）=====
+// 正负对照都要有：既要证明"自家人放行"，也要证明"外人一个都没放开"。
+console.log('# 会话家族（血缘）豁免')
+{
+  const mkParent = () => {
+    const st = init()
+    claim(st, { holderId: 'agent:parent', name: '父会话' }, { paths: ['src/deploy/'] }, T)
+    return st
+  }
+  const child = { holderId: 'agent:child', name: '子代理', family: ['agent:child', 'agent:parent'] }
+  const stranger = { holderId: 'agent:stranger', name: '陌生会话', family: ['agent:stranger'] }
+
+  // 正：子代理带着血缘 claim 父会话已独占的路径 → 放行
+  const st1 = mkParent()
+  const r1 = claim(st1, child, { paths: ['src/deploy/installer/'] }, T)
+  ok(r1.ok === true, '子代理 claim 父会话已独占的路径：放行', JSON.stringify(r1.data && r1.data.error))
+  ok(st1.claims.length === 2, '两条声明并存（各自持有，不是合并）', JSON.stringify(st1.claims.map(c => c.holderId)))
+
+  // 负 1：无血缘的第三方 → 仍然 conflict
+  const st2 = mkParent()
+  let threw2 = null
+  try { claim(st2, stranger, { paths: ['src/deploy/installer/'] }, T) } catch (e) { threw2 = e }
+  ok(!!threw2 && threw2.collabConflict === true, '无血缘的第三方：仍然抛 conflict（没放开外人）')
+
+  // 负 2：血缘缺省 → 退化为 0.9.10 的语义（自家人不认）
+  const st3 = mkParent()
+  let threw3 = null
+  try { claim(st3, { holderId: 'agent:child' }, { paths: ['src/deploy/installer/'] }, T) } catch (e) { threw3 = e }
+  ok(!!threw3 && threw3.collabConflict === true, '血缘缺省：仍是 conflict（缺省 = 旧语义）')
+
+  // 反向：父会话去占自家子代理已占的路径
+  const st4 = init()
+  claim(st4, { holderId: 'agent:child', name: '子代理' }, { paths: ['src/child/'] }, T)
+  const r4 = claim(st4, { holderId: 'agent:parent', name: '父会话', family: ['agent:parent', 'agent:child'] }, { paths: ['src/child/'] }, T)
+  ok(r4.ok === true, '父会话 claim 自家子代理已占的路径：放行')
+
+  // wait/blockers 同源：家族成员不算阻塞，外人照旧算
+  const st5 = mkParent()
+  ok(blockers(st5, t0, child, ['src/deploy/']).length === 0, 'blockers 不把自家父会话算成阻塞')
+  ok(blockers(st5, t0, stranger, ['src/deploy/']).length === 1, 'blockers 对陌生会话仍然算阻塞')
+
+  // 血缘不落盘：holder() 只写已知字段
+  ok(st1.holders.every((x) => x.family === undefined), 'holders 表里不出现 family 字段（血缘不落盘）')
+}
+
+// ===== reap 级联清 holders（0.9.11，C4）=====
+console.log('# reap 级联清 holders')
+{
+  const mkZombie = () => {
+    const st = init()
+    const old = T() - 3600 * 1000
+    const mk = (claimId, holderId, p) => ({ claimId, holderId, holderName: holderId, paths: [p], mode: 'exclusive', ttlSec: 1800, expiresAt: T() + 600000, createdAt: old, readable: true, readers: [] })
+    st.claims.push(mk('c_z', 'agent:zombie', 'src/z/'))
+    st.claims.push(mk('c_live', 'agent:live', 'src/l/'))
+    st.claims.push(mk('c_me', 'agent:me', 'src/m/'))
+    for (const id of ['agent:zombie', 'agent:live', 'agent:me']) st.holders.push({ holderId: id, name: id, kind: 'agent', sessionId: id.slice(6), lastSeenAt: T() })
+    return st
+  }
+  const live = ['agent:live', 'agent:me']
+  const st = mkZombie()
+  const dry = reap(st, { holderId: 'agent:me' }, { confirm: false, olderThanSec: 600 }, live, T())
+  ok(dry.changed === false && st.holders.length === 3, 'dry-run 不动 holders', JSON.stringify(st.holders.length))
+  ok(Array.isArray(dry.data.candidateHolders) && dry.data.candidateHolders.join(',') === 'agent:zombie',
+    'dry-run 报出将被摘掉的残留 holder', JSON.stringify(dry.data.candidateHolders))
+
+  const done = reap(st, { holderId: 'agent:me' }, { confirm: true, olderThanSec: 600 }, live, T())
+  ok(st.claims.length === 2, '只回收僵尸声明', JSON.stringify(st.claims.map(c => c.claimId)))
+  ok(Array.isArray(done.data.reapedHolders) && done.data.reapedHolders.join(',') === 'agent:zombie',
+    'confirm 后级联摘掉僵尸 holder', JSON.stringify(done.data.reapedHolders))
+  ok(st.holders.map(x => x.holderId).sort().join(',') === 'agent:live,agent:me',
+    'holders 表同步变短（活体与自己都留着）', JSON.stringify(st.holders.map(x => x.holderId)))
+
+  // 活体检查不可用 ⇒ 一个也不收，holders 也不动
+  const st2 = init()
+  st2.claims.push({ claimId: 'c_z2', holderId: 'agent:zombie2', paths: ['src/z2/'], mode: 'exclusive', ttlSec: 1800, expiresAt: T() + 600000, createdAt: T() - 3600 * 1000, readable: true, readers: [] })
+  st2.holders.push({ holderId: 'agent:zombie2', name: 'Z2', kind: 'agent', sessionId: 'zombie2', lastSeenAt: T() })
+  const r = reap(st2, { holderId: 'agent:me' }, { confirm: true, olderThanSec: 600 }, null, T())
+  ok(r.changed === false && st2.holders.length === 1, '活体检查不可用：一个也不收，holders 不动', JSON.stringify(st2.holders.length))
 }
 
 h.finish()

@@ -23,6 +23,13 @@ export interface StateStore {
   now(): number
   /** 功能 D 的存活判据：三态（live / not-live / failed）—— 基础设施故障不得折叠成"读者没在线"。 */
   livenessOf(sessionId: string): { state: 'live' | 'not-live' | 'failed'; error?: string }
+  /**
+   * 会话家族（血缘）的 holderId 集合：自己 + 祖先链 + 后代。**只用于冲突判定，不落盘。**
+   * 拿不到 agents 服务时退化为 `[self]`（= 0.9.10 的语义）。
+   */
+  familyIds(agentId: string | null, agent?: AgentLike): string[]
+  /** 后代会话 id（不含自己）。自动释放的"有子代理在跑"判据用。 */
+  descendantIds(agentId: string | null): string[]
   cwdOf(agentId: string | null, agent?: AgentLike): Promise<string | null>
   load(agentId: string | null, agent?: AgentLike): Promise<LoadResult>
   mutate(fn: (s: StateDocument) => OpResult, agentId: string | null, agent?: AgentLike): Promise<ToolResult>
@@ -116,6 +123,82 @@ export function installStore(ctx: CollabContext): StateStore {
     } catch (e) {
       return null
     }
+  }
+
+  // ---- 会话家族（血缘）：只用于冲突判定，**不进状态文件** ----
+  //
+  // 为什么要它：子代理跑在自己的会话里，holderId 是 `agent:<子会话 id>`，与父会话不等。
+  // 于是"父会话 claim src/ 再派子代理改 src/"会被自己的锁硬拒绝（本部署 ask = deny），
+  // 而子代理无权 release（只有持有者本人能）。父子是同一个写域。
+  // 血缘来源：子代理创建时写入的 `session.header.parentSession`
+  // （`dsh-subagent/lib/types/child-agent.js:117-123`）；祖先链写法照
+  // `dsh-subagent/lib/types/continuation-activation.js:381-388` 的先例。
+  //
+  // 三条纪律：
+  //   1. **只缩不放**——拿不到 agents 服务 / 读不到血缘时退化为 `[self]`，语义与 0.9.10 一致；
+  //   2. **不落盘**——每次从运行时现算，holder() 只挑已知字段写状态文件；
+  //   3. **带上环保护与深度上限**——血缘字段来自会话头，不能假设它是良构的。
+  const LINEAGE_MAX_DEPTH = 16
+
+  /** 某个会话的父会话 id（拿不到就 null，**不猜**）。 */
+  const parentSessionOf = (id: string, self?: AgentLike): string | null => {
+    try {
+      let a: AgentLike | undefined
+      if (self && self.id && String(self.id) === id) a = self
+      else {
+        const svc = ctx.get('agents') as AgentsLookupService | undefined
+        a = svc && typeof svc.get === 'function' ? svc.get(id) : undefined
+      }
+      const p = a && a.session && a.session.header ? a.session.header.parentSession : undefined
+      return typeof p === 'string' && p ? p : null
+    } catch (e) { return null }
+  }
+
+  /** 祖先链（不含自己），由近及远。 */
+  const ancestorIds = (agentId: string, self?: AgentLike): string[] => {
+    const out: string[] = []
+    const seen = new Set<string>([agentId])
+    let cur = parentSessionOf(agentId, self)
+    while (cur && !seen.has(cur) && out.length < LINEAGE_MAX_DEPTH) {
+      seen.add(cur); out.push(cur); cur = parentSessionOf(cur)
+    }
+    return out
+  }
+
+  /**
+   * 后代（不含自己）：`agents.list()` 里祖先链命中我的会话。
+   * 注意 list() **只含此刻加载着的** agent —— 所以这个集合天然会比"我派生过的全部"小，
+   * 这正好是我们要的方向：只放行**还活着**的自家人。
+   */
+  const descendantIds = (agentId: string | null): string[] => {
+    const out: string[] = []
+    if (!agentId) return out
+    try {
+      const svc = ctx.get('agents') as AgentsLookupService | undefined
+      if (!svc || typeof svc.list !== 'function') return out
+      const arr = svc.list()
+      if (!Array.isArray(arr)) return out
+      for (const a of arr) {
+        const id = a && a.id ? String(a.id) : ''
+        if (!id || id === agentId) continue
+        let cur = parentSessionOf(id, a), depth = 0
+        while (cur && depth++ < LINEAGE_MAX_DEPTH) {
+          if (cur === agentId) { out.push(id); break }
+          cur = parentSessionOf(cur)
+        }
+      }
+    } catch (e) {}
+    return out
+  }
+
+  /** 家族 holderId 集合：自己 + 祖先链 + 后代。agentId 为空（human:console）时只有自己。 */
+  const familyIds = (agentId: string | null, agent?: AgentLike): string[] => {
+    const self = agentId ? 'agent:' + agentId : 'human:console'
+    if (!agentId) return [self]
+    const out = [self]
+    for (const id of ancestorIds(agentId, agent)) out.push('agent:' + id)
+    for (const id of descendantIds(agentId)) out.push('agent:' + id)
+    return out
   }
 
   async function cwdOf(agentId: string | null, agent?: AgentLike): Promise<string | null> {
@@ -271,7 +354,10 @@ export function installStore(ctx: CollabContext): StateStore {
     return {
       agent,
       holderId: id ? 'agent:' + id : 'human:console',
-      sessionId: id || undefined
+      sessionId: id || undefined,
+      // 血缘在这里现算一次，随 h 传进纯逻辑（collab-core 的 inFamily）。
+      // 纯逻辑因此不需要认识 agents 服务，仍是可对拍的纯函数。
+      family: familyIds(id, agent)
     }
   }
 
@@ -312,20 +398,68 @@ export function installStore(ctx: CollabContext): StateStore {
     }
   }
 
+  /**
+   * 跨项目观测（0.9.11）：把**别的项目**的占用摘要附在 overview 的返回里。
+   *
+   * 为什么走"输出侧附加"而不是给工具加 `project` / `all` 入参：加参数要改 SSOT 契约
+   * （src/schema/collab.schema.json）并同步 4 份派生物（TS / Python / Rust / 包形态真实 schema），
+   * 而排障真正缺的是"我能看见别人占着什么"，不是"按名字精确查某个项目"。
+   *
+   * 纪律三条：只读（不改任何项目文件）；失败降级（fs 没有 listDir / 目录不存在 / 单个文件损坏
+   * 都只是"看不到别的项目"）；不编造（本项目那几个数字一字不动）。
+   */
+  async function otherProjects(current: FileRef, t: number): Promise<Record<string, unknown>> {
+    try {
+      if (typeof fs.listDir !== 'function') {
+        return { otherProjects: [], otherProjectsNote: '宿主 fs 不提供 listDir：只能看到当前项目' }
+      }
+      const dir = await fs.resolve(collabDir())
+      const entries = await fs.listDir(dir)
+      const here = fs.processPath(current)
+      const out: Array<{ file: string; statePath: string; totalClaims: number; claims: unknown[] }> = []
+      for (const e of entries) {
+        if (!e || typeof e.name !== 'string' || !/\.json$/.test(e.name) || !e.target) continue
+        if (fs.processPath(e.target) === here) continue
+        let doc: any
+        try { doc = JSON.parse(await fs.readText(e.target)) } catch (err) { continue }
+        if (!doc || typeof doc !== 'object') continue
+        const claims = Array.isArray(doc.claims) ? doc.claims : []
+        const active = claims.filter((c: any) => c && typeof c.expiresAt === 'number' && c.expiresAt > t)
+        if (!active.length) continue
+        out.push({
+          file: e.name,
+          statePath: fs.processPath(e.target),
+          totalClaims: active.length,
+          claims: active.map((c: any) => ({
+            holderId: c.holderId,
+            holderName: c.holderName,
+            mode: c.mode,
+            paths: Array.isArray(c.paths) ? c.paths : []
+          }))
+        })
+      }
+      out.sort((a, b) => b.totalClaims - a.totalClaims)
+      return { otherProjects: out.slice(0, 10) }
+    } catch (e) {
+      return { otherProjects: [], otherProjectsNote: '列举其他项目失败：' + describeError(e) }
+    }
+  }
+
   async function overviewOp(agentId: string | null, agent?: AgentLike): Promise<ToolResult> {
     const { state, target, stateDir, warn } = await load(agentId, agent)
     const t = now()
     expire(state, t)
     const o = overview(state)
+    const other = await otherProjects(target, t)
     return {
       ok: true,
-      data: withWarn({
+      data: withWarn(Object.assign({
         statePath: fs.processPath(target),
         stateDir,
         serverTime: t,
         totalClaims: o.totalClaims,
         holders: o.holders
-      }, warn)
+      }, other), warn)
     }
   }
 
@@ -385,7 +519,7 @@ export function installStore(ctx: CollabContext): StateStore {
   }
 
   return {
-    fs, now, livenessOf, cwdOf, load, mutate, holderOf, hname,
+    fs, now, livenessOf, familyIds, descendantIds, cwdOf, load, mutate, holderOf, hname,
     list, overviewOp, status, msgs, reapOp, waitFor
   }
 }

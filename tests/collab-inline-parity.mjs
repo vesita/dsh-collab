@@ -242,10 +242,10 @@ if (!hostCode || typeof hostCode !== 'string') {
 }
 
 // ---------------------------------------------------------------- 期望集合
-// 20 个"逐输出对拍"的同名函数。
+// 22 个"逐输出对拍"的同名函数。
 const EXPECTED_PARITY = [
   'claim', 'cleanName', 'clockUtc', 'dropHolder', 'expire', 'hashProjectKey', 'heartbeat',
-  'holder', 'holderFresh', 'holderView', 'init', 'modeLabel', 'norm', 'ov', 'post', 'reap',
+  'holder', 'holderFresh', 'holderView', 'inFamily', 'init', 'modeLabel', 'norm', 'ov', 'post', 'reap',
   'release', 'releaseOnLoopEnd', 'renderDigest', 'seg', 'sweep'
 ].sort()
 // 同名但**不同形**：宿主的 overview(agentId) 是 async 的 I/O op（load→expire→聚合），
@@ -276,6 +276,7 @@ tryExtract('norm')
 tryExtract('hashProjectKey')
 tryExtract('cleanName')
 tryExtract('init')
+tryExtract('inFamily')
 tryExtract('holderFresh')
 tryExtract('sweep', { holderFresh: host.holderFresh })
 tryExtract('expire', { sweep: host.sweep })
@@ -288,7 +289,7 @@ tryExtract('hostReaders')
 tryExtract('pub', { hostReaders: host.hostReaders })
 tryExtract('conflict')
 tryExtract('withWarn')
-tryExtract('claim', { now: fixedNow, norm: host.norm, ov: host.ov, holder: host.holder, pub: host.pub, conflict: host.conflict })
+tryExtract('claim', { now: fixedNow, norm: host.norm, ov: host.ov, holder: host.holder, pub: host.pub, conflict: host.conflict, inFamily: host.inFamily })
 tryExtract('release', { now: fixedNow, norm: host.norm, ov: host.ov, pub: host.pub })
 // reap（0.9.8）：纯函数 reap(s, h, a, liveHolderIds, t)。宿主内联的默认 age 门槛写成字面量 600，
 // 与 core 的 REAP_DEFAULT_OLDER_THAN_SEC 是否一致由下面的语料守护（含一个不传 olderThanSec 的用例）。
@@ -302,12 +303,16 @@ tryExtract('releaseOnLoopEnd', { pub: host.pub })
 tryExtract('heartbeat', { now: fixedNow })
 tryExtract('post', { now: fixedNow, holder: host.holder })
 let overviewLoad = async () => ({ state: null, target: { path: '/fake/collab/state.json' }, stateDir: '/tmp', warn: null })
+// 跨项目观测的宿主内联副本（0.9.11）：不在同名集合里（core 侧的对应实现住在 store.ts），
+// 只为让抽取出的 overview 能解析到它。fs 桩没有 listDir ⇒ 它会走"只报当前项目"的分支。
+tryExtract('otherProjects', { fs: { processPath: (t) => (t && t.path) || String(t) } })
 tryExtract('overview', {
   load: (id) => overviewLoad(id),
   now: fixedNow,
   expire: host.expire,
   pub: host.pub,
   withWarn: host.withWarn,
+  otherProjects: host.otherProjects,
   fs: { processPath: (t) => (t && t.path) || String(t) }
 })
 
@@ -1027,6 +1032,25 @@ group('overview', '同名但不同形：用桩把宿主的 async op 收敛到聚
   ok(typeof overviewLoad === 'function', 'overview 桩可被注入')
 }
 
+// ---------------------------------------------------------------- inFamily
+group('inFamily', '会话家族判据：自己 / 祖先与后代 / 家族外 / 血缘缺省（退化为 holderId 相等）')
+{
+  const me = { holderId: 'agent:parent', family: ['agent:parent', 'agent:child', 'agent:grand'] }
+  const cases = [
+    ['自己', () => [me, 'agent:parent']],
+    ['后代命中', () => [me, 'agent:child']],
+    ['祖先命中', () => [{ holderId: 'agent:child', family: ['agent:child', 'agent:parent'] }, 'agent:parent']],
+    ['家族外', () => [me, 'agent:stranger']],
+    ['血缘缺省（旧语义：自己）', () => [{ holderId: 'agent:solo' }, 'agent:solo']],
+    ['血缘缺省（旧语义：他人）', () => [{ holderId: 'agent:solo' }, 'agent:other']],
+    ['family 为空数组', () => [{ holderId: 'agent:e', family: [] }, 'agent:other']]
+  ]
+  for (const [label, mk] of cases) pairCase('inFamily', label, () => {
+    const [h, id] = mk()
+    return { hostArgs: [h, id], coreArgs: [h, id] }
+  })
+}
+
 // ---------------------------------------------------------------- 语料完整性守护
 group('corpus', '每个同名函数的语料条数下限（防止语料被悄悄掏空）')
 {
@@ -1035,7 +1059,7 @@ group('corpus', '每个同名函数的语料条数下限（防止语料被悄悄
     const n = g ? g.pass + g.fail : 0
     ok(n >= 4, 'corpus · ' + name + ' 至少 4 条断言', 'actual=' + n)
   }
-  ok(EXPECTED_PARITY.length === 21, '逐输出对拍的同名函数恰好 21 个', String(EXPECTED_PARITY.length))
+  ok(EXPECTED_PARITY.length === 22, '逐输出对拍的同名函数恰好 22 个', String(EXPECTED_PARITY.length))
 }
 
 // ---------------------------------------------------------------- 汇总

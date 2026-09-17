@@ -18,6 +18,27 @@ export interface HolderInput {
   holderId: string
   sessionId?: string
   name?: string
+  /**
+   * **会话家族**（血缘）的 holderId 集合：自己 + 祖先链 + 后代。由上层
+   * （store.familyIds）从运行时现算，**不落盘** —— `holder()` 只挑已知字段写进状态文件。
+   *
+   * 缺省（纯逻辑语料、受限宿主拿不到血缘）时判据退化为"只看 holderId 是否相等"，
+   * 也就是 0.9.10 的行为：既有语料与既有语义一字不变。
+   */
+  family?: string[]
+}
+
+/**
+ * 家族判据（纯逻辑，两形态同源）：`holderId` 是否属于本 holder 的会话家族。
+ *
+ * 为什么需要它：子代理运行在**自己的会话**里，`holderId` 是 `agent:<子会话 id>`，
+ * 与父会话不等 —— 于是"父会话 claim src/ 再派子代理改 src/"时，子代理被自己的锁
+ * 硬拒绝（本部署 ask = deny），而且它无权释放（只有持有者本人能 release）。
+ * 父子是同一个写域，锁不该拦自家人。血缘从 `session.header.parentSession` 现算。
+ */
+export function inFamily(h: HolderInput, holderId: string): boolean {
+  if (holderId === h.holderId) return true
+  return Array.isArray(h.family) && h.family.indexOf(holderId) >= 0
 }
 
 /** claim 操作的输入参数。 */
@@ -602,7 +623,9 @@ export function claim(state: StateDocument, h: HolderInput, a: ClaimInput, tNow:
   // read 是纯观测：不阻塞他人，也不被他人阻塞，直接跳过整个冲突扫描。
   if (mode !== 'read') {
     for (const c of state.claims) {
-      if (c.holderId === h.holderId || c.expiresAt <= t || c.mode === 'shared' || c.mode === 'read') continue
+      // inFamily 取代了裸的 `c.holderId === h.holderId`：自家子代理（或父会话）的声明
+      // 属于同一个写域，不该互相拦。血缘缺省时 inFamily 的语义与旧写法**完全一致**。
+      if (inFamily(h, c.holderId) || c.expiresAt <= t || c.mode === 'shared' || c.mode === 'read') continue
       for (const p of paths) for (const cp of c.paths) if (ov(p, cp)) {
         const remainingSec = Math.max(0, Math.ceil((c.expiresAt - t) / 1000))
         const suggestedAction: ConflictInfo['suggestedAction'] = remainingSec <= 30 ? 'wait' : 'negotiate'
@@ -723,15 +746,34 @@ export function reap(s: StateDocument, h: HolderInput, a: ReapInput, liveHolderI
     })
   })
   const base = { olderThanSec, serverTime: t, livenessCheck: unknown ? 'unavailable' : 'ok' }
+  // 级联清 holder（0.9.11）：被回收的 holder 若在本状态里已无未过期声明，它就是一个纯粹的
+  // 残留登记 —— 顺手从 holders 表里摘掉。没有这一步，reap 之后 holders 会一直留着刚被清掉的
+  // 僵尸，直到 24h 的 sweep 才自愈（`HOLDER_TTL_MS`，见上面的注释）。判据仍然**只缩不放**：
+  // 必须同时满足"是本次被回收的 holder" + "已无未过期声明" + "不在活体名单里"（活体检查没跑成
+  // 时一个也不摘）。租约到期与 sweep 的既有回收口径都没被改动。
+  const gone = new Set(hits.map(c => c.holderId))
+  const stillActive = new Set(s.claims.filter(c => !hits.includes(c)).map(c => c.holderId))
   if (!confirm) {
+    const candidateHolders: string[] = []
+    if (!unknown) for (const hh of s.holders) {
+      if (gone.has(hh.holderId) && !stillActive.has(hh.holderId) && !live.has(hh.holderId)) candidateHolders.push(hh.holderId)
+    }
     // dry-run：**绝不改状态**（changed:false 让上层不会写盘）。
-    return { ok: true, changed: false, state: s, data: Object.assign({ dryRun: true }, base, { candidates: entries }) }
+    return { ok: true, changed: false, state: s, data: Object.assign({ dryRun: true }, base, { candidates: entries, candidateHolders }) }
   }
   if (!hits.length) {
-    return { ok: true, changed: false, state: s, data: Object.assign({ dryRun: false }, base, { reaped: [] }) }
+    return { ok: true, changed: false, state: s, data: Object.assign({ dryRun: false }, base, { reaped: [], reapedHolders: [] }) }
   }
   s.claims = s.claims.filter(c => !hits.includes(c))
-  return { ok: true, changed: true, state: s, data: Object.assign({ dryRun: false }, base, { reaped: entries }) }
+  const reapedHolders: string[] = []
+  if (!unknown) {
+    s.holders = s.holders.filter(hh => {
+      if (!gone.has(hh.holderId) || stillActive.has(hh.holderId) || live.has(hh.holderId)) return true
+      reapedHolders.push(hh.holderId)
+      return false
+    })
+  }
+  return { ok: true, changed: true, state: s, data: Object.assign({ dryRun: false }, base, { reaped: entries, reapedHolders }) }
 }
 
 // 续租。a = {claimId}。
@@ -781,6 +823,7 @@ export function filterMessages(state: StateDocument, a: ReadInput): FilterMessag
 }
 
 // 计算在当前时刻 blocking 的独占声明（供 wait）。
+// 家族成员不算 blocker：wait 自己的子代理/父会话没有意义（它们与我是同一个写域）。
 export function blockers(state: StateDocument, t: number, h: HolderInput, paths: string[]): Claim[] {
-  return state.claims.filter(c => c.expiresAt > t && c.mode === 'exclusive' && c.holderId !== h.holderId && c.paths.some(cp => paths.some(p => ov(p, cp))))
+  return state.claims.filter(c => c.expiresAt > t && c.mode === 'exclusive' && !inFamily(h, c.holderId) && c.paths.some(cp => paths.some(p => ov(p, cp))))
 }

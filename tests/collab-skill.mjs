@@ -191,8 +191,8 @@ console.log('# (b)(c)(g) preference ON (explicit true): skill + constant discipl
     'settings schema defaults enforceWriteLock to true (write protection defaults ON)', JSON.stringify(schemaDefaults))
   ok(!!schemaDefaults && schemaDefaults.releaseOnLoopEnd === true,
     'settings schema defaults releaseOnLoopEnd to true (循环终止自动释放默认开)', JSON.stringify(schemaDefaults))
-  ok(!!schemaDefaults && schemaDefaults.loopEndGraceSec === 15,
-    'settings schema defaults loopEndGraceSec to 15 (宽限期 15 秒)', JSON.stringify(schemaDefaults))
+  ok(!!schemaDefaults && schemaDefaults.loopEndGraceSec === 120,
+    'settings schema defaults loopEndGraceSec to 120 (宽限期 120 秒，0.9.11 从 15 调长)', JSON.stringify(schemaDefaults))
   ok(!!schemaDefaults && Object.keys(schemaDefaults).sort().join(',') === 'enforceWriteLock,exposeDelegationDiscipline,loopEndGraceSec,releaseOnLoopEnd',
     'settings schema exposes exactly the four known fields', Object.keys(schemaDefaults || {}).join(','))
   ok(!!settingsInstall && !!settingsInstall.entry && settingsInstall.entry.exposeDelegationDiscipline === true,
@@ -200,8 +200,8 @@ console.log('# (b)(c)(g) preference ON (explicit true): skill + constant discipl
   ok(!!settingsInstall && !!settingsInstall.entry && settingsInstall.entry.enforceWriteLock === true,
     'composition entry defaults enforceWriteLock to true as well')
   ok(!!settingsInstall && !!settingsInstall.entry && settingsInstall.entry.releaseOnLoopEnd === true &&
-    settingsInstall.entry.loopEndGraceSec === 15,
-    'composition entry defaults 循环终止自动释放 to ON / 15s', JSON.stringify(settingsInstall && settingsInstall.entry))
+    settingsInstall.entry.loopEndGraceSec === 120,
+    'composition entry defaults 循环终止自动释放 to ON / 120s', JSON.stringify(settingsInstall && settingsInstall.entry))
 
   ok(captured.liveRegs === 1, 'exactly one live skill registration before unload', 'live=' + captured.liveRegs)
   ok(captured.contexts.has('dsh-collab/delegation'), 'the discipline context is live before unload')

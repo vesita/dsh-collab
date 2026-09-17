@@ -302,8 +302,8 @@ let injectLog = []
 const resetInject = () => { injectLog = [] }
 /** 从 inject 记录里取正文（防御性：拿不到就返回空串，让断言失败而不是抛）。 */
 const noticeText = (entry) => (entry && entry.message && entry.message.content && entry.message.content[0] && entry.message.content[0].text) || ''
-/** 带记录器的假 agent：inject 把每次调用记进 injectLog。 */
-const withInject = (id) => ({ id, session: { header: { cwd: CWD } }, inject: (m) => injectLog.push({ agent: id, message: m }) })
+/** 带记录器的假 agent：inject 把每次调用记进 injectLog。parentSession 给出时即"某个会话的子代理"。 */
+const withInject = (id, parentSession) => ({ id, session: { header: parentSession ? { cwd: CWD, parentSession } : { cwd: CWD } }, inject: (m) => injectLog.push({ agent: id, message: m }) })
 const ME = withInject('agent-me')
 /** 故意**没有** inject 的 agent：受限宿主上的 agent 形状（契约要求此时不投递、不抛）。 */
 const NO_INJECT_AGENT = { id: 'agent-no-inject', session: { header: { cwd: CWD } } }
@@ -920,6 +920,37 @@ console.log('# C: 一致性 —— writeGate 阻塞集合 ≡ claim() 冲突集�
     'gate=' + gate.decision.kind + ' conflicts=' + JSON.stringify(conflicts.map(c => c.claimId)))
   ok(conflicts.length === 2 && String(gate.decision.reason).includes(conflicts[0].holderName),
     '门控报出的第一位阻塞者与 claim() 的 cs[0] 同一条', String(gate.decision.reason))
+}
+
+// ── 功能 C × 会话家族（血缘，0.9.11）：父会话占着的路径，自家子代理写得过 ──
+console.log('# C · 会话家族：父会话的独占锁不拦自家子代理，仍然拦外人')
+{
+  const parentClaim = mkClaim({
+    claimId: 'c_parent', holderId: 'agent:agent-parent', holderName: 'Parent Session',
+    paths: ['src/a/'], expiresAt: Date.now() + HOUR
+  })
+  const h = await makeHarness({ claims: [parentClaim] })
+
+  // 负向：无血缘的会话（ME）照旧被拦。
+  const blocked = await h.pre(execOf('write', { file_path: 'src/a/1', content: 'x' }))
+  ok(blocked.decision.kind === 'ask', '无血缘：仍然被拦（没放开外人）', JSON.stringify(blocked.decision))
+
+  // 正向：ME 是 agent-parent 的子代理（session.header.parentSession）⇒ 放行。
+  const child = withInject('agent-me', 'agent-parent')
+  const allowed = await h.pre(execOf('write', { file_path: 'src/a/1', content: 'x' }, child))
+  ok(allowed.decision.kind === 'allow' && allowed.nextCalls === 1,
+    '自家子代理写父会话独占的路径：放行（ask 不再产生）', JSON.stringify(allowed))
+
+  // 负向 2：血缘指向别人（不是这条声明的持有者）⇒ 照旧被拦。
+  const unrelated = withInject('agent-me', 'agent-someone-else')
+  const stillBlocked = await h.pre(execOf('write', { file_path: 'src/a/1', content: 'x' }, unrelated))
+  ok(stillBlocked.decision.kind === 'ask', '血缘指向第三方：仍然被拦（判据是"这条声明的持有者"）',
+    JSON.stringify(stillBlocked.decision))
+
+  // 负向 3：血缘字段缺失 ⇒ 退化为 0.9.10 的语义（只认 holderId 相等）。
+  const noLineage = withInject('agent-me')
+  const legacy = await h.pre(execOf('write', { file_path: 'src/a/1', content: 'x' }, noLineage))
+  ok(legacy.decision.kind === 'ask', '血缘缺失：退化为旧语义，仍然被拦', JSON.stringify(legacy.decision))
 }
 
 h.finish()

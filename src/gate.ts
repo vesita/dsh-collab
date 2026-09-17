@@ -5,7 +5,7 @@
 // prefs.enforceWriteLockEnabled() 每次调用都重新结算，用户在设置里一改即可生效。
 // 门控自身故障一律放行（插件的问题不该锁死整个工具面）。
 
-import { claimsCovering, relToProject, isReadable, clockUtc, modeLabel } from './collab-core.js'
+import { claimsCovering, relToProject, isReadable, clockUtc, modeLabel, inFamily } from './collab-core.js'
 import type { Claim } from './collab-core.js'
 import { pathArgsFor } from './spec.js'
 import type { CollabContext } from './contract.js'
@@ -38,7 +38,10 @@ export function installGate(ctx: CollabContext, store: StateStore, prefs: GatePr
     const agent = execCtx && execCtx.agent
     const id = agent && agent.id ? String(agent.id) : null
     const cwd = await store.cwdOf(id, agent)
-    const mine = id ? 'agent:' + id : 'human:console'
+    // holderOf 顺带把**会话家族（血缘）**现算出来（自己 + 祖先 + 后代）。父会话 claim 了 src/ 再派
+    // 子代理改 src/ 时，子代理的写不该被自己家的锁拦下 —— 这正是"子代理用不了"的现场。
+    // 判据与 claim() 的冲突扫描同源（collab-core 的 inFamily），血缘缺省时退化为旧语义。
+    const me = store.holderOf(execCtx)
     const { state } = await store.load(id, agent)
     const t = store.now()
     const hits: Array<{ claim: Claim; target: string; kind: 'write' | 'read' }> = []
@@ -49,7 +52,7 @@ export function installGate(ctx: CollabContext, store: StateStore, prefs: GatePr
         const rel = relToProject(raw, cwd)
         if (!rel) continue
         for (const c of claimsCovering(state.claims, rel, t)) {
-          if (c.holderId === mine) continue
+          if (inFamily(me, c.holderId)) continue
           // mode 过滤与 collab-core.ts 的 claim() 冲突判据**同源**（见 collab-core.ts 中
           // claim() 的冲突扫描：`c.mode === 'shared' || c.mode === 'read'` 一律 continue），
           // 也与 blockers() 的 `c.mode === 'exclusive'` 一致 —— 不是随手加的例外：

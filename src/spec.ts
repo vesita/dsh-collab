@@ -16,11 +16,18 @@ export const DELEGATION_SETTINGS_NAMESPACE = 'dsh-collab'
 
 /**
  * 循环终止自动释放的宽限期（秒）：循环停下（agent/status → idle）后等这么久，
- * 期间会话恢复 running 就**取消**释放。默认 15 秒 ——
- * 它要短到能解开"父会话结束循环、子代理干等锁"的死锁，又要长到不把两个回合之间的
- * 正常停顿（模型思考/工具往返之间的空隙）算成"会话结束了"。
+ * 期间会话恢复 running 就**取消**释放。默认 **120 秒**（0.9.11 起，此前是 15）。
+ *
+ * 为什么从 15 调长：15 秒对"派完子代理、等它跑几分钟"这种最常态的长流程**几乎必然误放** ——
+ * 父会话刚 claim 完就被放掉，醒来或被子代理报错唤回后重新 claim，于是 claim→release→claim
+ * 反复抖动、留言板反复留痕。**但这个改动不能单独上**：家族豁免（collab-core.inFamily）
+ * 落地之前，自动释放是"父独占、子代理写不了"的唯一出口，调长宽限期等于把死锁还回去。
+ * 依赖次序记在 README「循环终止自动释放」与 auto-release.ts 的第四道闸门注释里。
+ *
+ * 它仍然要短到能解开"父会话结束循环、子代理干等锁"的死锁（该场景现在主要由家族豁免 +
+ * 第四道闸门处理），又要长到不把两个回合之间的正常停顿算成"会话结束了"。
  */
-export const LOOP_END_GRACE_SEC_DEFAULT: number = 15
+export const LOOP_END_GRACE_SEC_DEFAULT: number = 120
 export const LOOP_END_GRACE_SEC_MIN: number = 1
 export const LOOP_END_GRACE_SEC_MAX: number = 3600
 
@@ -55,7 +62,8 @@ export const DELEGATION_DISCIPLINE_TEXT = [
   '独立单元同一条消息并行发，一个子代理只回答一个完整问题；验收永远留主 AI：不外包结论，要原始输出作证据，别只看摘要。',
   '只等子代理不算一轮：说清在等谁并结束，别用重复验证或轮询凑数。',
   '子代理禁止 client 检视（无浏览器页面必永久挂起），界面信息由主 AI 预查后写进背景；别凭收尾消息结案（可能静默空收尾），开文件验产物；同一仓库只许一个跑构建，其余只做类型检查。',
-  '循环一停就自动放锁：你结束循环（空闲十几秒）后，持有的声明会被自动释放 —— 恢复工作时先用 collab_lock op=claim 重新声明，再写这些路径。'
+  '循环一停就自动放锁：你结束循环（空闲十几秒）后，持有的声明会被自动释放 —— 恢复工作时先用 collab_lock op=claim 重新声明，再写这些路径。',
+  '子代理意外终止（回合以 error 或空收尾结束、久等之后它不再是 running）先别重派：先 list_agents 看它还在不在（idle / ready 都还能被唤起），在就 send_message 唤醒它接着做 —— 它保留着上下文，比重派便宜；同时提醒它重新 collab_lock op=claim（它一停下，之前的声明就被自动释放了，而它自己不知道）；同一处最多试一两次，再不行就自己写。注意：往留言板 @ 它是唤不醒的，agent.inject 不唤醒 driver，能唤醒的只有 send_message。'
 ].join('\n')
 
 // ---- 功能 C：写/读调用的路径事实源 ----

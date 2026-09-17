@@ -81,6 +81,14 @@ export function installPush(ctx: CollabContext, store: StateStore): PushApi {
   const pushedOrder: Array<{ claimId: string; reader: string }> = []
   const PUSH_DEDUPE_MAX = 2000
 
+  // 0.9.11 降噪：循环终止自动释放**发给本人的**那条通知的合并窗口（见 notifyLoopEndRelease）。
+  // 与上面的 pushedPairs 分工不同：那个按 (claimId, reader) 去重，重新 claim 会得到新的
+  // claimId 于是照发；这里按 holderId 在**时间窗口**内合并，专治"claim→release→claim"抖动。
+  // 本 map 住在 installPush 的闭包里 ⇒ 每个插件实例一份，测试之间天然隔离。
+  const LOOP_END_NOTICE_DEDUP_MS = 60_000
+  const LOOP_END_NOTICE_MAX_KEYS = 500
+  const loopEndNoticeAt = new Map<string, number>()
+
   /** 标记"这一对已推过"；返回 false 表示已经推过，跳过。 */
   function markPushed(claimId: string, reader: string): boolean {
     const seen = pushedPairs.get(claimId)
@@ -347,6 +355,12 @@ export function installPush(ctx: CollabContext, store: StateStore): PushApi {
    * 解析不到本人（已卸载 / 受限宿主）时如实记 `agent-not-resolvable`，
    * **不**回退到任何别的通道（AGENTS.md §1：没有诚实通道就不投）。
    * 那种情况下留痕消息仍在（releaseOnLoopEnd 写在状态文件里），可以从留言板查到。
+   *
+   * 0.9.11 降噪：同一 holder 在 `LOOP_END_NOTICE_DEDUP_MS` 窗口内**反复**被自动释放时，
+   * 发给本人的注入通知只发第一条，其余记 `error: 'deduped'`。**只合并通知，不合并证据** ——
+   * 状态文件里的 `[自动释放]` 审计留言一条不少（那是取证用的账）。窗口存在的前提是：
+   * 收件人此刻多半还 idle，`agent.inject` 不唤醒 driver，所以它**还没读到**上一条，
+   * 内容又一字不差，重复注入只是往它的上下文里塞噪声。
    */
   async function notifyLoopEndRelease(
     released: PublishedClaim[],
@@ -361,6 +375,16 @@ export function installPush(ctx: CollabContext, store: StateStore): PushApi {
       if (!sessionId) return { readers, holder }
       const agents = ctx.get('agents') as AgentsLookupService | undefined
       if (!agents || typeof agents.get !== 'function') return { readers, holder: { ok: false, error: 'no-agents-service' } }
+      const at = store.now()
+      const last = loopEndNoticeAt.get(holderId) || 0
+      if (last && at - last < LOOP_END_NOTICE_DEDUP_MS) {
+        return { readers, holder: { ok: false, error: 'deduped' } }
+      }
+      loopEndNoticeAt.set(holderId, at)
+      // 有界：只保留窗口内的条目，避免长跑进程里无界增长。
+      if (loopEndNoticeAt.size > LOOP_END_NOTICE_MAX_KEYS) {
+        for (const [k, ts] of loopEndNoticeAt) if (at - ts >= LOOP_END_NOTICE_DEDUP_MS) loopEndNoticeAt.delete(k)
+      }
       holder = pushOne(agents, sessionId, loopEndHolderNoticeParts(holderName, released, graceSec))
     } catch (e) {
       holder = { ok: false, error: describeError(e) }

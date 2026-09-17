@@ -60,7 +60,9 @@ export function installAccess(ctx: CollabContext, store: StateStore): void {
     const agent = execCtx && execCtx.agent
     const id = agent && agent.id ? String(agent.id) : null
     const cwd = await store.cwdOf(id, agent)
-    const mine = id ? 'agent:' + id : 'human:console'
+    // 会话家族（自己 + 祖先 + 后代）不算"别人的占用"：自家子代理与我共享写域，
+    // 为它发访问通知只会制造噪声（判据与 claim()/gate 同源）。
+    const fam = new Set(store.familyIds(id, agent))
     const { state } = await store.load(id, agent)
     const t = store.now()
     const seen = new Set<string>()
@@ -69,7 +71,7 @@ export function installAccess(ctx: CollabContext, store: StateStore): void {
       const rel = relToProject(raw, cwd)
       if (!rel) continue
       for (const c of claimsForAccess(state.claims, rel, t)) {
-        if (c.holderId === mine || seen.has(c.claimId)) continue
+        if (fam.has(c.holderId) || seen.has(c.claimId)) continue
         seen.add(c.claimId)
         entries.push(c)
       }

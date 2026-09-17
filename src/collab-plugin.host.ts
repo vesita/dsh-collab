@@ -240,7 +240,58 @@ return {
       }
       return { ok: false, error: 'concurrent-modification', message: 'state busy, retry later' }
     }
-    const holderOf = exec => { const agent = exec && exec.agent; const id = agent && agent.id ? String(agent.id) : null; return { agent, holderId: id ? 'agent:' + id : 'human:console', sessionId: id || undefined } }
+    // ---- 会话家族（血缘）：只用于冲突判定，**不进状态文件**（与包形态 store.familyIds 同源）----
+    // 血缘来自子代理创建时写入的 session.header.parentSession
+    // （dsh-subagent/lib/types/child-agent.js:117-123）；拿不到就退化为"只看 holderId 相等"，
+    // 也就是 0.9.10 的语义。
+    const LINEAGE_MAX_DEPTH = 16
+    const parentSessionOf = (id, self) => {
+      try {
+        let a
+        if (self && self.id && String(self.id) === id) a = self
+        else { const svc = ctx.get('agents'); a = svc && typeof svc.get === 'function' ? svc.get(id) : undefined }
+        const p = a && a.session && a.session.header ? a.session.header.parentSession : undefined
+        return typeof p === 'string' && p ? p : null
+      } catch (e) { return null }
+    }
+    const ancestorIds = (agentId, self) => {
+      const out = []
+      const seen = new Set([agentId])
+      let cur = parentSessionOf(agentId, self)
+      while (cur && !seen.has(cur) && out.length < LINEAGE_MAX_DEPTH) { seen.add(cur); out.push(cur); cur = parentSessionOf(cur) }
+      return out
+    }
+    const descendantIds = agentId => {
+      const out = []
+      if (!agentId) return out
+      try {
+        const svc = ctx.get('agents')
+        if (!svc || typeof svc.list !== 'function') return out
+        const arr = svc.list()
+        if (!Array.isArray(arr)) return out
+        for (const a of arr) {
+          const id = a && a.id ? String(a.id) : ''
+          if (!id || id === agentId) continue
+          let cur = parentSessionOf(id, a), depth = 0
+          while (cur && depth++ < LINEAGE_MAX_DEPTH) { if (cur === agentId) { out.push(id); break } cur = parentSessionOf(cur) }
+        }
+      } catch (e) {}
+      return out
+    }
+    const familyIds = (agentId, agent) => {
+      const self = agentId ? 'agent:' + agentId : 'human:console'
+      if (!agentId) return [self]
+      const out = [self]
+      for (const id of ancestorIds(agentId, agent)) out.push('agent:' + id)
+      for (const id of descendantIds(agentId)) out.push('agent:' + id)
+      return out
+    }
+    // 家族判据（与 collab-core.inFamily **同名同形**，逐输出对拍见 tests/collab-inline-parity.mjs）。
+    function inFamily(h, holderId) {
+      if (holderId === h.holderId) return true
+      return Array.isArray(h.family) && h.family.indexOf(holderId) >= 0
+    }
+    const holderOf = exec => { const agent = exec && exec.agent; const id = agent && agent.id ? String(agent.id) : null; return { agent, holderId: id ? 'agent:' + id : 'human:console', sessionId: id || undefined, family: familyIds(id, agent) } }
     function cleanName(s) {
       if (typeof s !== 'string') return s
       let n = s.replace(/\\s+/g, ' ').trim()
@@ -273,7 +324,7 @@ return {
       // read 是纯观测：不阻塞他人，也不被他人阻塞，整段冲突扫描跳过。
       if (mode !== 'read') {
       for (const c of state.claims) {
-        if (c.holderId === h.holderId || c.expiresAt <= t || c.mode === 'shared' || c.mode === 'read') continue
+        if (inFamily(h, c.holderId) || c.expiresAt <= t || c.mode === 'shared' || c.mode === 'read') continue
         for (const p of paths) for (const cp of c.paths) if (ov(p, cp)) {
           const remainingSec = Math.max(0, Math.ceil((c.expiresAt - t) / 1000))
           const suggestedAction = remainingSec <= 30 ? 'wait' : 'negotiate'
@@ -367,10 +418,28 @@ return {
         })
       })
       const base = { olderThanSec, serverTime: t, livenessCheck: unknown ? 'unavailable' : 'ok' }
-      if (!confirm) return { ok: true, changed: false, state: s, data: Object.assign({ dryRun: true }, base, { candidates: entries }) }
-      if (!hits.length) return { ok: true, changed: false, state: s, data: Object.assign({ dryRun: false }, base, { reaped: [] }) }
+      // 级联清 holder（0.9.11，与包形态 collab-core.reap 同源）：被回收的 holder 若已无
+      // 未过期声明且不在活体名单里，就从 holders 表里摘掉，不必等 24h 的 sweep 自愈。
+      const gone = new Set(hits.map(c => c.holderId))
+      const stillActive = new Set(s.claims.filter(c => !hits.includes(c)).map(c => c.holderId))
+      if (!confirm) {
+        const candidateHolders = []
+        if (!unknown) for (const hh of s.holders) {
+          if (gone.has(hh.holderId) && !stillActive.has(hh.holderId) && !live.has(hh.holderId)) candidateHolders.push(hh.holderId)
+        }
+        return { ok: true, changed: false, state: s, data: Object.assign({ dryRun: true }, base, { candidates: entries, candidateHolders }) }
+      }
+      if (!hits.length) return { ok: true, changed: false, state: s, data: Object.assign({ dryRun: false }, base, { reaped: [], reapedHolders: [] }) }
       s.claims = s.claims.filter(c => !hits.includes(c))
-      return { ok: true, changed: true, state: s, data: Object.assign({ dryRun: false }, base, { reaped: entries }) }
+      const reapedHolders = []
+      if (!unknown) {
+        s.holders = s.holders.filter(hh => {
+          if (!gone.has(hh.holderId) || stillActive.has(hh.holderId) || live.has(hh.holderId)) return true
+          reapedHolders.push(hh.holderId)
+          return false
+        })
+      }
+      return { ok: true, changed: true, state: s, data: Object.assign({ dryRun: false }, base, { reaped: entries, reapedHolders }) }
     }
     // 与 collab-core/包形态的 dropHolder **同形**（同名同签名，由 tests/collab-inline-parity.mjs
     // 逐输出对拍）：把这个已消失的 holder 从所有剩余 claim 的 readers 摘掉，并**只回收它已经过期**的
@@ -439,6 +508,30 @@ return {
       const ex = expire(state, t); const hv = holderView(state, t)
       return { ok: true, data: withWarn({ seq: state.seq, serverTime: t, statePath: fs.processPath(target), stateDir: stateDir, schemaVersion: state.schemaVersion, holders: hv.holders, staleHolders: hv.staleHolders, claims: state.claims.map(pub), expiredCount: ex }, warn) }
     }
+    // 跨项目观测（0.9.11，与包形态 store.otherProjects 同源）：把**别的项目**的占用摘要
+    // 附在 overview 的返回里。只读、失败降级、不编造；宿主 fs 没有 listDir 时只报当前项目。
+    async function otherProjects(current, stateDirPath, t) {
+      try {
+        if (!fs || typeof fs.listDir !== 'function' || !stateDirPath) return { otherProjects: [], otherProjectsNote: '宿主 fs 不提供 listDir：只能看到当前项目' }
+        const dir = await fs.resolve(stateDirPath)
+        const entries = await fs.listDir(dir)
+        const here = fs.processPath(current)
+        const out = []
+        for (const e of entries) {
+          if (!e || typeof e.name !== 'string' || !/\.json$/.test(e.name) || !e.target) continue
+          if (fs.processPath(e.target) === here) continue
+          let doc
+          try { doc = JSON.parse(await fs.readText(e.target)) } catch (err) { continue }
+          if (!doc || typeof doc !== 'object') continue
+          const claims = Array.isArray(doc.claims) ? doc.claims : []
+          const active = claims.filter(c => c && typeof c.expiresAt === 'number' && c.expiresAt > t)
+          if (!active.length) continue
+          out.push({ file: e.name, statePath: fs.processPath(e.target), totalClaims: active.length, claims: active.map(c => ({ holderId: c.holderId, holderName: c.holderName, mode: c.mode, paths: Array.isArray(c.paths) ? c.paths : [] })) })
+        }
+        out.sort((a, b) => b.totalClaims - a.totalClaims)
+        return { otherProjects: out.slice(0, 10) }
+      } catch (e) { return { otherProjects: [] } }
+    }
     async function overview(agentId) {
       const { state, target, stateDir, warn } = await load(agentId); const t = now(); expire(state, t)
       const byHolder = {}
@@ -452,7 +545,8 @@ return {
         const modes = [...new Set(h.claims.map(c => c.mode))]
         return { holderId: h.holderId, holderName: h.holderName, claimCount: h.claims.length, mode: modes.length === 1 ? modes[0] : 'mixed', paths: h.claims.flatMap(c => c.paths), claims: h.claims }
       })
-      return { ok: true, data: withWarn({ statePath: fs.processPath(target), stateDir: stateDir, serverTime: t, totalClaims: state.claims.length, holders }, warn) }
+      const other = await otherProjects(target, stateDir, t)
+      return { ok: true, data: withWarn(Object.assign({ statePath: fs.processPath(target), stateDir: stateDir, serverTime: t, totalClaims: state.claims.length, holders }, other), warn) }
     }
     async function status(a, agentId) {
       const { state, target, stateDir, warn } = await load(agentId); const t = now(); expire(state, t)
@@ -478,7 +572,7 @@ return {
       while (now() < deadline) {
         const { state } = await load(agentId)
         const t = now()
-        blockers = state.claims.filter(c => c.expiresAt > t && c.mode === 'exclusive' && c.holderId !== h.holderId && c.paths.some(cp => paths.some(p => ov(p, cp))))
+        blockers = state.claims.filter(c => c.expiresAt > t && c.mode === 'exclusive' && !inFamily(h, c.holderId) && c.paths.some(cp => paths.some(p => ov(p, cp))))
         if (blockers.length === 0) return { ok: true, data: { paths, blockers: [], waitedMs: Math.round(timeoutMs - Math.max(0, deadline - now())) } }
         await ctx.timer.timeout(400)
       }
@@ -631,9 +725,10 @@ return {
             const hit = digestCache.get(cwd)
             if (!hit || now() - hit.at > DIGEST_TTL_MS) refreshDigest(init).catch(() => {})
             // 视角过滤在**读取侧**：同一份 cwd 缓存对所有会话都成立，"排除谁"才因人而异。
-            const mine = init.id ? 'agent:' + String(init.id) : 'human:console'
+            // 0.9.11 起排的是整个**会话家族**（自己 + 祖先 + 后代），与包形态同源。
+            const fam = new Set(familyIds(init.id ? String(init.id) : null, init))
             const t = now()
-            const others = (hit ? hit.claims : []).filter(c => c.holderId !== mine && c.expiresAt > t)
+            const others = (hit ? hit.claims : []).filter(c => !fam.has(c.holderId) && c.expiresAt > t)
             return others.length ? renderDigest(others) : OPEN_HINT
           } catch (e) { return OPEN_HINT }
         }
@@ -660,9 +755,10 @@ return {
     // + 到点复核 status。**唯一的差别**：这里不投递任何通知 —— 受限动态宿主没有
     // @deepseek-ai/dsh-llm，构造不出「显式来源的 notice」，而 AGENTS.md §1 禁止退回任何会冒充
     // 用户的通道，所以本形态只做状态变更（释放 + 留言板留痕）。包形态才发读者/本人两条告知。
-    // 宽限期**常量 15 秒**：动态形态读不到 settings 服务（包形态的 loopEndGraceSec 默认值也是它）。
+    // 宽限期**常量 120 秒**（0.9.11 起；包形态的 loopEndGraceSec 默认值也是它）：
+    // 动态形态读不到 settings 服务。15 秒会把"派完子代理、等它跑几分钟"误判成循环终止。
     // tests/collab-hostcode-parity.mjs 会真实触发这条接线，断言"未过期声明在宽限期到点后被释放"。
-    const LOOP_END_GRACE_SEC = 15
+    const LOOP_END_GRACE_SEC = 120
     const armedIdle = new Map()
     let idleGen = 0
     let idleClosed = false
@@ -681,6 +777,18 @@ return {
         // 合取闸门：解析不到（已 dispose）或当前不是 idle，一律**不放**。
         // W7 就在这一句里：退场的会话常常恢复并继续干活，而它此刻收不到任何告知。
         if (!cur || agentStatusOf(cur) !== 'idle') return
+        // 第 4 道闸门（0.9.11）：有自家子代理在 running 就不放，重新武装（与包形态同源）。
+        // 判据缺失时按"没人在跑"处理，否则一把没人用的锁永远不会被自动释放。
+        const desc = descendantIds(id)
+        if (desc.length) {
+          let childRunning = false
+          for (const did of desc) {
+            let child
+            try { child = svc.get(did) } catch (e) { continue }
+            if (child && agentStatusOf(child) === 'running') { childRunning = true; break }
+          }
+          if (childRunning) { armIdleRelease(id); return }
+        }
         const holderId = 'agent:' + id
         const name = hname({ holderId: holderId, sessionId: id, agent: cur })
         mutate(s => releaseOnLoopEnd(s, holderId, name, now(), LOOP_END_GRACE_SEC), id, cur).catch(() => {})

@@ -680,11 +680,11 @@ console.log('# agent/status wiring (host inline form): idle releases after the 1
   const sp = (await lockLocal.execute({ op: 'list' }, IDLE)).data.statePath
   timerRequests.length = 0
 
-  // 1) running → idle：武装计时器，宽限期常量必须是 15 秒。
+  // 1) running → idle：武装计时器，宽限期常量必须是 120 秒（0.9.11 从 15 调长）。
   status['agent-idle-host'] = 'idle'
   onStatus({ agent: { id: 'agent-idle-host' }, status: 'idle' })
-  ok(timerRequests.length === 1 && timerRequests[0] === 15000,
-    '宿主内联形态的宽限期常量是 15 秒', JSON.stringify(timerRequests))
+  ok(timerRequests.length === 1 && timerRequests[0] === 120000,
+    '宿主内联形态的宽限期常量是 120 秒', JSON.stringify(timerRequests))
   await new Promise((r) => setTimeout(r, 60))
   let doc = JSON.parse(map.get(sp))
   ok(!(doc.claims || []).some((c) => c.holderId === 'agent:agent-idle-host'),

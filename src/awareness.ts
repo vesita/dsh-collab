@@ -79,9 +79,11 @@ export function installAwareness(ctx: CollabContext, store: StateStore): Awarene
           if (!hit || store.now() - hit.at > DIGEST_TTL_MS) void refreshDigest(init)
           // 视角过滤在**读取侧**做：同一份 cwd 缓存对所有会话都成立，"排除谁"才因人而异。
           // （0.9.1 前这里直接返回 hit.text —— 那是"最后一次刷新者"的视角，会把持有者自己的锁报给自己。）
-          const mine = init.id ? 'agent:' + String(init.id) : 'human:console'
+          // 0.9.11 起排的是**整个会话家族**（自己 + 祖先 + 后代）：自家子代理与我共享写域，
+          // 把它报成"其他会话占用"会让父 AI 去协商一个根本不存在的竞争者（backlog §2.2）。
+          const fam = new Set(store.familyIds(init.id ? String(init.id) : null, init))
           const t = store.now()
-          const others = (hit ? hit.claims : []).filter(c => c.holderId !== mine && c.expiresAt > t)
+          const others = (hit ? hit.claims : []).filter(c => !fam.has(c.holderId) && c.expiresAt > t)
           return others.length ? renderDigest(others) : OPEN_HINT
         } catch (e) {
           return OPEN_HINT
