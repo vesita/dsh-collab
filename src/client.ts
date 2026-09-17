@@ -2,12 +2,11 @@
   id: 'dsh-collab',
   factory: (require: (id: string) => any) => {
     /**
-     * dsh-collab 的浏览器半边：Settings → Plugins 下 `dsh-collab` 命名空间的配置卡片。
+     * dsh-collab 的浏览器半边：设置 → 插件分区里 `dsh-collab` 那个标签页。
      *
-     * 卡片是一个**默认折叠的配置摘要行**：标题 + 右侧一行当前状态，点击展开。其中
-     * 「委托与验收纪律」带一个下拉（关闭 / 集群协作）与一个「预览」按钮：预览用 DSH
-     * 自己的右侧文档面板打开随包技能正文，**不关闭设置页** —— 本卡片所在的
-     * `settings.plugin.item` 槽位拿不到任何关闭句柄（详见 README）。
+     * 页里的「委托与验收纪律」带一个下拉（关闭 / 集群协作）与一个「预览」按钮：
+     * 预览用 DSH 自己的右侧文档面板打开随包技能正文，**不关闭设置页** ——
+     * `settings.plugins.tab` 不传任何 props，也拿不到关闭句柄（详见 README）。
      *
      * 两处只能由 Host 交出的事实，走 host 半边注册的只读 loopback 路由
      * `GET /dsh-collab/skill-index`：随包 skill 的**绝对路径**（浏览器拿不到包的安装
@@ -41,6 +40,9 @@
     const GRACE_DEFAULT = 15
     /** Host 半边注册的只读技能索引路由。 */
     const SKILL_ROUTE = '/dsh-collab/skill-index'
+    /** 设置 → 插件分区里本插件那个标签页的标题与次序。 */
+    const TAB_LABEL = '协作'
+    const TAB_ORDER = 20
     /** 下拉的两档文案。 */
     const OFF_LABEL = '关闭'
     const ON_LABEL = '集群协作'
@@ -257,13 +259,13 @@
       }
 
       /**
-       * `dsh-collab` 命名空间的配置卡片：默认折叠的摘要行 + 展开后的设置项。
+       * `dsh-collab` 标签页的内容：三行设置项。
        *
        * 三种快照状态都如实处理：加载中给一行安静占位；命名空间不可用（本部署没装
        * Host 半边）就完全不渲染；只读部署把控件禁用而不是假装可写。技能索引读不到
-       * 时只收起预览按钮并说明原因 —— 卡片本身照常可用来改偏好。
+       * 时只收起预览按钮并说明原因 —— 页面本身照常可用来改偏好。
        */
-      function CollabSettingsCard() {
+      function CollabConfigPage() {
         const [snapshot, setSnapshot] = React.useState(() => scope.getSnapshot() as ScopeSnapshot)
         const [saving, setSaving] = React.useState(false)
         const [failed, setFailed] = React.useState(false)
@@ -596,8 +598,11 @@
         )
       }
 
-      ctx.slots.inject('settings.plugin.item', () =>
-        ctx.slots.register({ name: 'settings.plugin.item', key: NS }, CollabSettingsCard)
+      ctx.slots.inject('settings.plugins.tab', () =>
+        ctx.slots.register(
+          { name: 'settings.plugins.tab', id: NS, order: TAB_ORDER, label: TAB_LABEL },
+          CollabConfigPage
+        )
       )
     }
 

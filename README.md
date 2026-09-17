@@ -53,7 +53,7 @@
 │   ├── delegation.ts             # 委托纪律：settings 偏好 + 随包 skill + 常驻纪律块（order 131）
 │   ├── skill.ts                  # 随包 skill 读盘与 buildSkillIndex（delegation 与路由共用）
 │   ├── client-route.ts           # 浏览器半边只读 loopback 路由（技能索引）
-│   ├── client.ts                 # 浏览器半边：Settings → Plugins 下的 dsh-collab 设置卡片
+│   ├── client.ts                 # 浏览器半边：设置 → 插件 里 dsh-collab 标签页
 │   ├── collab-plugin.host.ts     # 自包含 Cordis Host 插件源码（导出 hostCode 字符串，可直接作为 code.host）
 │   ├── schema/
 │   │   └── collab.schema.json    # JSON Schema v1：状态文档 + 工具参数（单一契约）
@@ -181,15 +181,15 @@ agents.currentInitiator()            → 正在装配的那个会话
 
 纪律文本是**纯常量**：没有时间戳、计数或任何会漂移的字符。DSH 的运行时上下文快照按整串相等去重，常量块因此每个会话只提交一次；一旦掺入随步变化的文本，整块快照就会被反复重发。
 
-### 设置界面里的那张卡片
+### 设置界面里的那个标签页
 
-偏好能出现在 UI 里，靠的是插件带的浏览器半边 `lib/client.js`（`package.json` 声明 `dsh.client` 与 `exports["./client"]`）。原因很直接：设置页只**枚举**命名空间、从不解释它，一张卡片是由拥有该命名空间的插件按 `settings.plugin.item` 槽位、以命名空间为 key 注册进来的——**谁拥有设置，谁自带卡片**。
+偏好能出现在 UI 里，靠的是插件带的浏览器半边 `lib/client.js`（`package.json` 声明 `dsh.client` 与 `exports["./client"]`）。原因很直接：设置 → 插件 分区只**枚举**标签页、从不解释它，一个配置页是由插件自己按 `settings.plugins.tab` 槽位、以 id 注册进来的——**谁拥有配置，谁自带页面**。
 
-打开 **设置 → 插件**（Settings → Plugins）即可看到 `dsh-collab` 的卡片：默认折叠的一行摘要（标题 + 当前三项状态），点开是三行设置项 —— 「委托与验收纪律」（下拉：关闭 / 集群协作，带一个打开随包技能正文的预览按钮）、「原生写保护」（下拉：拦截 / 不拦截）与「循环终止自动释放」（下拉：自动释放 / 不自动释放 + 宽限期秒数输入框）。控件直接写 Host，改完即保存；三种状态都如实呈现——命名空间尚未就绪时给一行加载占位，本部署没有 Host 半边时整张卡片不渲染，只读部署把控件置灰并说明原因。
+打开 **设置 → 插件** 并切到 `dsh-collab` 标签页，即可看到三行设置项 —— 「委托与验收纪律」（下拉：关闭 / 集群协作，带一个打开随包技能正文的预览按钮）、「原生写保护」（下拉：拦截 / 不拦截）与「循环终止自动释放」（下拉：自动释放 / 不自动释放 + 宽限期秒数输入框）。控件直接写 Host，改完即保存；三种状态都如实呈现——命名空间尚未就绪时给一行加载占位，本部署没有 Host 半边时整页不渲染，只读部署把控件置灰并说明原因。
 
 **预览按钮的行为**：点一下**直接**在右侧栏的文档面板打开随包技能正文，没有二次确认，**也不会关闭设置页**——设置页照常开着，右侧栏多出一份技能文档。按钮就只是「在右侧栏打开技能文档」，文案与行为一致。
 
-> **本落点无法关闭设置页**：卡片注册在 `settings.plugin.item`，该槽位的 `standardProps` 只有 `useResource` / `useWorkspaces` / `usePanelInfo` / `useSessions` / `useSessionPendingInteraction`，**没有 `close` 回调**（`settings-plugins` 里就是 `renderSlot("settings.plugin.item", {}, { entryKey: ns })`，业务 props 是空对象）。设置页本身也不是 `layout` 的主面板——它是 `settings-general` 里 `SettingsRoot` 的组件内部 `useState`，因此 `layout.selectPanel(null)` 关不掉它，反而会清空中间主面板的选中项（把会话从中间列弄掉）；0.8.2 已把这个调用**整个删除**。**若将来确需自动关闭设置页，必须改用 `settings.section` 落点**——那里是 `renderSlot("settings.section", { close: onClose }, …)`，是唯一能拿到 `close` 回调的地方。
+> **本落点拿不到关闭句柄**：`settings.plugins.tab` 不传任何 props，所以页面无法自行关闭设置页。需要关闭能力时改用 `settings.section` 落点——那里是 `renderSlot("settings.section", { close: onClose }, …)`。
 
 ### 随包发布的委托技能
 
