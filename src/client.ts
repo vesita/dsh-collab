@@ -2,11 +2,11 @@
   id: 'dsh-collab',
   factory: (require: (id: string) => any) => {
     /**
-     * dsh-collab 的浏览器半边：设置 → 插件分区里 `dsh-collab` 那个标签页。
+     * dsh-collab 的浏览器半边：侧边栏「插件」页里 dsh-collab 那张 bundle 卡上的配置区。
      *
-     * 页里的「委托与验收纪律」带一个下拉（关闭 / 集群协作）与一个「预览」按钮：
-     * 预览用 DSH 自己的右侧文档面板打开随包技能正文，**不关闭设置页** ——
-     * `settings.plugins.tab` 不传任何 props，也拿不到关闭句柄（详见 README）。
+     * 卡里的「委托与验收纪律」带一个下拉（关闭 / 集群协作）与一个「预览」按钮：
+     * 预览用 DSH 自己的右侧文档面板打开随包技能正文，**不离开插件页** ——
+     * `plugins.bundle.config` 只给 `view` 一个 prop，也拿不到关闭句柄（详见 README）。
      *
      * 两处只能由 Host 交出的事实，走 host 半边注册的只读 loopback 路由
      * `GET /dsh-collab/skill-index`：随包 skill 的**绝对路径**（浏览器拿不到包的安装
@@ -40,9 +40,8 @@
     const GRACE_DEFAULT = 15
     /** Host 半边注册的只读技能索引路由。 */
     const SKILL_ROUTE = '/dsh-collab/skill-index'
-    /** 设置 → 插件分区里本插件那个标签页的标题与次序。 */
-    const TAB_LABEL = '协作'
-    const TAB_ORDER = 20
+    /** 侧边栏「插件」页里本插件那张配置卡的键：必须是 bundle 的包名（= package.json 的 name）。 */
+    const BUNDLE_KEY = 'dsh-collab'
     /** 下拉的两档文案。 */
     const OFF_LABEL = '关闭'
     const ON_LABEL = '集群协作'
@@ -106,45 +105,12 @@
      * （settings-plugins 的卡片 / ValueField 样式），不猜变量名。
      */
     const styles: Record<string, any> = {
-      card: {
-        border: '0.5px solid var(--dsw-alias-border-l4)',
-        background: 'var(--dsw-alias-bg-layer-3)',
-        borderRadius: '16px',
-        listStyle: 'none'
-      },
-      header: {
-        appearance: 'none',
-        width: '100%',
-        font: 'inherit',
-        color: 'inherit',
-        textAlign: 'left',
-        cursor: 'pointer',
-        background: '0 0',
-        border: 0,
-        borderRadius: '16px',
-        display: 'flex',
-        alignItems: 'center',
-        gap: '12px',
-        padding: '14px 16px'
-      },
-      chevron: { flex: 'none', color: 'var(--dsw-alias-label-tertiary)' },
-      headText: { minWidth: 0, flex: 1, display: 'flex', flexDirection: 'column', gap: '4px' },
-      name: {
-        color: 'var(--dsw-alias-label-primary)',
-        fontSize: '15px',
-        fontWeight: 600,
-        lineHeight: 1.4
-      },
       summary: {
         color: 'var(--dsw-alias-label-tertiary)',
         fontSize: '13px',
         lineHeight: 1.5
       },
-      body: {
-        borderTop: '0.5px solid var(--dsw-alias-border-l2)',
-        margin: '0 16px',
-        paddingBottom: '8px'
-      },
+      page: { display: 'flex', flexDirection: 'column', gap: '8px' },
       item: { display: 'flex', flexDirection: 'column', gap: '6px', padding: '12px 0' },
       itemHead: { display: 'flex', alignItems: 'center', gap: '8px' },
       itemLabel: {
@@ -215,7 +181,6 @@
         lineHeight: 1.5
       },
       placeholder: {
-        listStyle: 'none',
         color: 'var(--dsw-alias-label-tertiary)',
         margin: 0,
         padding: '14px 16px',
@@ -259,17 +224,16 @@
       }
 
       /**
-       * `dsh-collab` 标签页的内容：三行设置项。
+       * 侧边栏「插件」页里 dsh-collab 那张配置卡的内容：三行设置项。
        *
        * 三种快照状态都如实处理：加载中给一行安静占位；命名空间不可用（本部署没装
        * Host 半边）就完全不渲染；只读部署把控件禁用而不是假装可写。技能索引读不到
        * 时只收起预览按钮并说明原因 —— 页面本身照常可用来改偏好。
        */
-      function CollabConfigPage() {
+      function CollabConfigEntry(props: any) {
         const [snapshot, setSnapshot] = React.useState(() => scope.getSnapshot() as ScopeSnapshot)
         const [saving, setSaving] = React.useState(false)
         const [failed, setFailed] = React.useState(false)
-        const [open, setOpen] = React.useState(false)
         const [skill, setSkill] = React.useState({ status: 'loading', skill: null, error: null } as SkillState)
         const [notice, setNotice] = React.useState(null as string | null)
         /**
@@ -374,9 +338,16 @@
           }
         }
 
+        // 插件页按 `view` 要两种视图：`summary` 出标题下的一句话，`page` 出表单正文。
+        // 本槽位（plugins.bundle.config）实际只被要 `page`，`summary` 是为契约完整保留的。
+        const summaryView = props !== null && typeof props === 'object' && props.view === 'summary'
+
         // hooks 必须无条件调用，早退只能发生在它们之后。
         if (snapshot.status === 'loading') {
-          return h('li', { style: styles.placeholder, role: 'status' }, '正在加载设置…')
+          const loading = '正在加载设置…'
+          return summaryView
+            ? h('span', null, loading)
+            : h('div', { style: styles.placeholder, role: 'status' }, loading)
         }
         if (snapshot.status === 'unavailable') return null
 
@@ -391,6 +362,13 @@
           : GRACE_DEFAULT
         const disabled = snapshot.writable !== true || saving
         const stateLabel = enabled ? ON_LABEL : OFF_LABEL
+        const summaryText =
+          '委托与验收纪律 · ' +
+          stateLabel +
+          ' · 写保护 ' +
+          (writeLock ? LOCK_ON_LABEL : LOCK_OFF_LABEL) +
+          ' · ' +
+          (autoRelease ? AUTO_ON_LABEL + ' ' + graceSec + ' 秒' : AUTO_OFF_LABEL)
 
         /**
          * 把宽限期草稿写回 Host；非法值直接丢弃（回到 Host 的值）。
@@ -405,26 +383,6 @@
           if (clamped === graceSec) return
           write(AUTO_RELEASE_GRACE_FIELD, clamped)
         }
-
-        const header = h(
-          'button',
-          {
-            type: 'button',
-            'aria-expanded': open,
-            style: styles.header,
-            onClick: () => {
-              setOpen(!open)
-            }
-          },
-          h('span', { style: styles.chevron, 'aria-hidden': 'true' }, open ? '▾' : '▸'),
-          h(
-            'span',
-            { style: styles.headText },
-            h('span', { style: styles.name }, 'collab 配置'),
-            h('span', { style: styles.summary }, '委托与验收纪律 · ' + stateLabel + ' · 写保护 ' + (writeLock ? LOCK_ON_LABEL : LOCK_OFF_LABEL) +
-              ' · ' + (autoRelease ? AUTO_ON_LABEL + ' ' + graceSec + ' 秒' : AUTO_OFF_LABEL))
-          )
-        )
 
         const controls = [
           h(
@@ -459,150 +417,147 @@
             : null
         ]
 
+        if (summaryView) {
+          return h('span', null, summaryText)
+        }
+
         return h(
-          'li',
-          { style: styles.card },
-          header,
-          open
-            ? h(
-                'div',
-                { style: styles.body },
-                h(
-                  'div',
-                  { style: styles.item },
-                  h(
-                    'div',
-                    { style: styles.itemHead },
-                    h('span', { style: styles.itemLabel }, '委托与验收纪律'),
-                    h('span', { style: styles.itemType }, '技能')
-                  ),
-                  h('div', { style: styles.controls }, ...controls),
-                  h(
-                    'p',
-                    { style: styles.hint },
-                    '集群协作：把委托与验收纪律文本注入会话上下文，并注册随包技能；关闭则两者都撤回。'
-                  ),
-                  skill.status === 'error'
-                    ? h('p', { style: styles.failed, role: 'status' }, '无法读取技能信息：' + skill.error)
-                    : null,
-                  skill.status === 'ready' && skill.skill === null
-                    ? h('p', { style: styles.hint }, '该设置当前没有关联的技能文件。')
-                    : null,
-                  skill.status === 'ready' && skill.skill !== null
-                    ? h('p', { style: styles.hint }, skill.skill.description)
-                    : null
-                ),
-                h(
-                  'div',
-                  { style: styles.item },
-                  h(
-                    'div',
-                    { style: styles.itemHead },
-                    h('span', { style: styles.itemLabel }, '原生写保护'),
-                    h('span', { style: styles.itemType }, '门控')
-                  ),
-                  h(
-                    'div',
-                    { style: styles.controls },
-                    h(
-                      'select',
-                      {
-                        key: 'lock',
-                        style: styles.select,
-                        value: writeLock ? 'on' : 'off',
-                        disabled,
-                        'aria-label': '原生写保护',
-                        onChange: (event: any) => {
-                          write(WRITE_LOCK_FIELD, event.target.value === 'on')
-                        }
-                      },
-                      h('option', { key: 'on', value: 'on' }, LOCK_ON_LABEL),
-                      h('option', { key: 'off', value: 'off' }, LOCK_OFF_LABEL)
-                    )
-                  ),
-                  h(
-                    'p',
-                    { style: styles.hint },
-                    '拦截：写入/修改他人已声明占用的路径前先走原生审批（本部署没有审批提示时，ask 会变成硬拒绝）；关闭则完全不拦。'
-                  )
-                ),
-                h(
-                  'div',
-                  { style: styles.item },
-                  h(
-                    'div',
-                    { style: styles.itemHead },
-                    h('span', { style: styles.itemLabel }, '循环终止自动释放'),
-                    h('span', { style: styles.itemType }, '锁生命周期')
-                  ),
-                  h(
-                    'div',
-                    { style: styles.controls },
-                    h(
-                      'select',
-                      {
-                        key: 'auto',
-                        style: styles.select,
-                        value: autoRelease ? 'on' : 'off',
-                        disabled,
-                        'aria-label': '循环终止自动释放',
-                        onChange: (event: any) => {
-                          write(AUTO_RELEASE_FIELD, event.target.value === 'on')
-                        }
-                      },
-                      h('option', { key: 'on', value: 'on' }, AUTO_ON_LABEL),
-                      h('option', { key: 'off', value: 'off' }, AUTO_OFF_LABEL)
-                    ),
-                    h('input', {
-                      key: 'grace',
-                      type: 'number',
-                      style: styles.number,
-                      min: GRACE_MIN,
-                      max: GRACE_MAX,
-                      step: 1,
-                      // 草稿优先；跟随 Host 时用归一后的值。
-                      value: graceDraft !== null ? graceDraft : String(graceSec),
-                      // **不**因 saving 而 disable：输入框一 disabled 就会失焦，多位数会输不完。
-                      disabled: snapshot.writable !== true || !autoRelease,
-                      'aria-label': '空闲宽限期（秒）',
-                      onChange: (event: any) => {
-                        setGraceDraft(String(event.target.value))
-                      },
-                      onBlur: () => {
-                        commitGrace(graceDraft)
-                      },
-                      onKeyDown: (event: any) => {
-                        if (event && event.key === 'Enter') commitGrace(graceDraft)
-                      }
-                    }),
-                    h('span', { style: styles.unit }, '秒')
-                  ),
-                  h(
-                    'p',
-                    { style: styles.hint },
-                    '会话循环停下（空闲超过上面的秒数）后，它持有的声明会被自动释放，让等在后面的会话能接着干；' +
-                    '宽限期内被唤醒则取消释放。释放后会通知等待者，并给该会话留一条「你的锁已被自动释放」的告知。'
-                  )
-                ),
-                h(
-                  'div',
-                  null,
-                  snapshot.writable !== true
-                    ? h('p', { style: styles.hint, role: 'status' }, '本部署的设置为只读，无法在此修改。')
-                    : null,
-                  failed ? h('p', { style: styles.failed, role: 'status' }, '写入失败，设置未改变。') : null,
-                  notice !== null ? h('p', { style: styles.hint, role: 'status' }, notice) : null
-                )
+          'div',
+          { style: styles.page },
+          h('p', { style: styles.summary }, summaryText),
+          h(
+            'div',
+            { style: styles.item },
+            h(
+              'div',
+              { style: styles.itemHead },
+              h('span', { style: styles.itemLabel }, '委托与验收纪律'),
+              h('span', { style: styles.itemType }, '技能')
+            ),
+            h('div', { style: styles.controls }, ...controls),
+            h(
+              'p',
+              { style: styles.hint },
+              '集群协作：把委托与验收纪律文本注入会话上下文，并注册随包技能；关闭则两者都撤回。'
+            ),
+            skill.status === 'error'
+              ? h('p', { style: styles.failed, role: 'status' }, '无法读取技能信息：' + skill.error)
+              : null,
+            skill.status === 'ready' && skill.skill === null
+              ? h('p', { style: styles.hint }, '该设置当前没有关联的技能文件。')
+              : null,
+            skill.status === 'ready' && skill.skill !== null
+              ? h('p', { style: styles.hint }, skill.skill.description)
+              : null
+          ),
+          h(
+            'div',
+            { style: styles.item },
+            h(
+              'div',
+              { style: styles.itemHead },
+              h('span', { style: styles.itemLabel }, '原生写保护'),
+              h('span', { style: styles.itemType }, '门控')
+            ),
+            h(
+              'div',
+              { style: styles.controls },
+              h(
+                'select',
+                {
+                  key: 'lock',
+                  style: styles.select,
+                  value: writeLock ? 'on' : 'off',
+                  disabled,
+                  'aria-label': '原生写保护',
+                  onChange: (event: any) => {
+                    write(WRITE_LOCK_FIELD, event.target.value === 'on')
+                  }
+                },
+                h('option', { key: 'on', value: 'on' }, LOCK_ON_LABEL),
+                h('option', { key: 'off', value: 'off' }, LOCK_OFF_LABEL)
               )
-            : null
+            ),
+            h(
+              'p',
+              { style: styles.hint },
+              '拦截：写入/修改他人已声明占用的路径前先走原生审批（本部署没有审批提示时，ask 会变成硬拒绝）；关闭则完全不拦。'
+            )
+          ),
+          h(
+            'div',
+            { style: styles.item },
+            h(
+              'div',
+              { style: styles.itemHead },
+              h('span', { style: styles.itemLabel }, '循环终止自动释放'),
+              h('span', { style: styles.itemType }, '锁生命周期')
+            ),
+            h(
+              'div',
+              { style: styles.controls },
+              h(
+                'select',
+                {
+                  key: 'auto',
+                  style: styles.select,
+                  value: autoRelease ? 'on' : 'off',
+                  disabled,
+                  'aria-label': '循环终止自动释放',
+                  onChange: (event: any) => {
+                    write(AUTO_RELEASE_FIELD, event.target.value === 'on')
+                  }
+                },
+                h('option', { key: 'on', value: 'on' }, AUTO_ON_LABEL),
+                h('option', { key: 'off', value: 'off' }, AUTO_OFF_LABEL)
+              ),
+              h('input', {
+                key: 'grace',
+                type: 'number',
+                style: styles.number,
+                min: GRACE_MIN,
+                max: GRACE_MAX,
+                step: 1,
+                // 草稿优先；跟随 Host 时用归一后的值。
+                value: graceDraft !== null ? graceDraft : String(graceSec),
+                // **不**因 saving 而 disable：输入框一 disabled 就会失焦，多位数会输不完。
+                disabled: snapshot.writable !== true || !autoRelease,
+                'aria-label': '空闲宽限期（秒）',
+                onChange: (event: any) => {
+                  setGraceDraft(String(event.target.value))
+                },
+                onBlur: () => {
+                  commitGrace(graceDraft)
+                },
+                onKeyDown: (event: any) => {
+                  if (event && event.key === 'Enter') commitGrace(graceDraft)
+                }
+              }),
+              h('span', { style: styles.unit }, '秒')
+            ),
+            h(
+              'p',
+              { style: styles.hint },
+              '会话循环停下（空闲超过上面的秒数）后，它持有的声明会被自动释放，让等在后面的会话能接着干；' +
+              '宽限期内被唤醒则取消释放。释放后会通知等待者，并给该会话留一条「你的锁已被自动释放」的告知。'
+            )
+          ),
+          h(
+            'div',
+            null,
+            snapshot.writable !== true
+              ? h('p', { style: styles.hint, role: 'status' }, '本部署的设置为只读，无法在此修改。')
+              : null,
+            failed ? h('p', { style: styles.failed, role: 'status' }, '写入失败，设置未改变。') : null,
+            notice !== null ? h('p', { style: styles.hint, role: 'status' }, notice) : null
+          )
         )
       }
 
-      ctx.slots.inject('settings.plugins.tab', () =>
-        ctx.slots.register(
-          { name: 'settings.plugins.tab', id: NS, order: TAB_ORDER, label: TAB_LABEL },
-          CollabConfigPage
-        )
+      // 配置挂到侧边栏「插件」页里 dsh-collab 那张 bundle 卡上：键是包名。标题、图标、
+      // 面包屑由插件页自绘，所以这里只出 `view: 'page'` 的表单正文。
+      ctx.slots.inject('plugins.bundle.config', () =>
+        ctx.slots.register({ name: 'plugins.bundle.config', key: BUNDLE_KEY }, CollabConfigEntry)
       )
     }
 
