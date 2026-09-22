@@ -118,14 +118,15 @@
 - **测试里"跳过"默认判失败**：只有显式 `COLLAB_ALLOW_SKIP=1` 才放行，且要打「未验证」横幅。
   见 `README.md`「运行测试」。
 - **两形态必须同步**：`src/index.ts` 一侧（包形态）与 `src/collab-plugin.host.ts`（动态形态内联副本）
-  改动语义时要一起改，并由 `tests/collab-inline-parity.mjs`（18 个同名函数逐输出对拍）
+  改动语义时要一起改，并由 `tests/collab-inline-parity.mjs`（25 个同名函数逐输出对拍）
   与 `tests/collab-hostcode-parity.mjs`（行为对拍）守护。
 - **契约只有一份**：`src/schema/collab.schema.json` 是 SSOT，TS / Python / Rust 三份派生物由
   `tests/collab-contract-derivation.mjs` 逐字段核对。
 - **不验证不许说"没问题"**：区分「没测出问题」与「没有问题」；用户可见文案改动要配负向对照。
 - **使用上的已知别扭之处**（含实测统计）见 `docs/collab-ux-backlog.md`，改之前先看有没有人已经记过。
 - **与官方 `Agent Teams` 的分工是已核实的结论，别再重新论证**：判据、边界与三条接缝（家族豁免、
-  同名工具遮蔽、双向不可见）在 `README.md`「与官方 Agent Teams 的分工（定位）」一节 ——
-  官方管树内（成员派生 + 任务 DAG），本仓库管树间（跨会话/跨进程的路径占用）。
+  同名工具遮蔽、单向交叉预警）在 `README.md`「与官方 Agent Teams 的分工（定位）」一节 ——
+  官方管树内（成员派生 + 任务 DAG），本仓库管树间（跨会话/跨进程的路径占用）；
+  0.11.0 起本仓库读官方在跑任务的 `write_scopes` 做交叉预警（只报不锁），服务缺席时输出一字不变。
 - **本仓库的 `lib/` 是构建产物**：`build` 先 `rm -rf lib`。`tsc` 不清理已删源文件的输出，
   残留的僵尸产物曾经**掩盖**一个真实失败。

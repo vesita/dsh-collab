@@ -33,6 +33,7 @@ import path from 'node:path'
 import os from 'node:os'
 import { readFileSync, existsSync } from 'node:fs'
 import { createHarness } from './_harness.mjs'
+import { loadCosmokit } from './_harness.mjs'
 
 const cordis = await import('@deepseek-ai/cordis').catch(() => import('../node_modules/.pnpm/node_modules/@deepseek-ai/cordis/lib/index.js'))
 const { Context } = cordis
@@ -77,20 +78,18 @@ function makeFs(store, versions) {
  * （`{ get() }`），改值 = 更新引用内容 + 发 `loader/volatile-update`，
  * 与 `cordis-plugin-loader` 的 `_commitVolatile` 同形，插件**不重载**。
  */
-function volatileConfig(values) {
-  const refs = {}
-  for (const [key, value] of Object.entries(values)) {
-    const box = { current: value }
-    refs[key] = { get: () => box.current, set: (next) => { box.current = next } }
-  }
-  return refs
+const { updateVolatile } = await loadCosmokit()
+
+function pluginConfig(values) {
+  // 普通值交给 ctx.plugin：cordis 自己按 Config schema 校验并生成 volatile 引用。
+  return values
 }
 
 /** 按 Loader 的 volatile 通道改一个字段：更新引用内容 + 把路径发给插件。 */
 function volatileWrite(fiber, ctx, patch) {
   const paths = []
   for (const key of Object.keys(patch)) {
-    fiber.config[key].set(patch[key])
+    updateVolatile(fiber.config[key], { get: () => patch[key] })
     paths.push([key])
   }
   ctx.emit('loader/volatile-update', paths)
@@ -160,7 +159,7 @@ async function makeHarness(opts = {}) {
   ctx.set('systemPrompt', { context: () => () => {} })
 
   // 0.1.7 起偏好是本插件的 Config：`.volatile()` 字段是稳定引用，由 Loader 就地更新。
-  const fiber = await ctx.plugin(collabPlugin, volatileConfig(Object.assign(
+  const fiber = await ctx.plugin(collabPlugin, pluginConfig(Object.assign(
     { exposeDelegationDiscipline: true, enforceWriteLock: true, releaseOnLoopEnd: true, loopEndGraceSec: 120 },
     opts.settings || {}
   )))

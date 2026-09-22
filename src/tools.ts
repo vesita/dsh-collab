@@ -4,7 +4,7 @@
 //
 // 依赖：状态存取面（store）+ 推送面（push）。
 
-import { claim, release, heartbeat, post } from './collab-core.js'
+import { claim, release, heartbeat, post, teamScopeOverlaps } from './collab-core.js'
 import type { HolderInput, PublishedClaim } from './collab-core.js'
 import type {
   AgentLike, CollabArgs, CollabContext, OpHandler, ToolDefinition, ToolExecContext, ToolResult
@@ -27,7 +27,7 @@ export function installTools(ctx: CollabContext, store: StateStore, push: PushAp
   }
 
   const lockHandler = exec((a, h, aId, agent) => {
-    if (a.op === 'claim') return store.mutate(s => claim(s, h, a, store.now), aId, agent)
+    if (a.op === 'claim') return claimWithTeamAdvisory(a, h, aId, agent)
     if (a.op === 'release') return releaseWithNotify(a, h, aId, agent)
     if (a.op === 'heartbeat') return store.mutate(s => heartbeat(s, h, a, store.now), aId, agent)
     if (a.op === 'list') return store.list(aId, agent)
@@ -37,6 +37,33 @@ export function installTools(ctx: CollabContext, store: StateStore, push: PushAp
     if (a.op === 'reap') return reapWithNotify(a, h, aId, agent)
     return { ok: false, error: 'bad-request', message: '未知操作：' + String(a.op) }
   })
+
+  /**
+   * op=claim + 官方 Agent Teams 的**advisory** 交叉预警（0.11.0）。
+   *
+   * 纪律：**不改锁语义**。`claim()` 的返回（ok / conflicts / claim）与冲突判定一字不动，
+   * 这里只在成功返回的 `data` 上追加一个 `teamOverlaps` —— "你正要声明的这些路径，官方团队
+   * 某个在跑任务的 write_scopes 也声称要动"。官方那侧只是 advisory（不挡写入），本插件也
+   * 不据此拒绝；它的价值是让模型在动手前看见重叠。
+   *
+   * `store.teamTasks()` 返回 null（服务缺席 / 读不到）⇒ 一个字段都不加，返回原样。
+   */
+  async function claimWithTeamAdvisory(a: CollabArgs, h: HolderInput, aId: string | null, agent?: AgentLike): Promise<ToolResult> {
+    const res = await store.mutate(s => claim(s, h, a, store.now), aId, agent)
+    try {
+      if (res && res.ok === true && res.data) {
+        const team = store.teamTasks(agent)
+        if (team !== null) {
+          const paths = (Array.isArray(a.paths) ? a.paths : []).filter((p): p is string => typeof p === 'string' && !!p)
+          // 三态刻意可分辨：服务缺席 ⇒ 没有这个字段；服务在场 ⇒ 字段在（可能为空数组）。
+          res.data.teamOverlaps = teamScopeOverlaps(team, paths)
+        }
+      }
+    } catch (e) {
+      // 预警是旁路：它出问题绝不影响 claim 的结果。
+    }
+    return res
+  }
 
   /**
    * 显式 op=release + 功能 D 的推送。

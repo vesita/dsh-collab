@@ -1,4 +1,5 @@
 import { createHarness } from './_harness.mjs'
+import { loadCosmokit } from './_harness.mjs'
 
 // collab-skill.mjs
 // 随包发布的 subagent-delegation skill + 委托纪律常驻上下文 + 偏好设置的回归测试。
@@ -49,19 +50,17 @@ const settle = () => new Promise((r) => setTimeout(r, 30))
  * （`{ get() }`），与 `cordis-plugin-loader` 的 `_commitVolatile` 同形。
  */
 function makeConfig(initial) {
-  const refs = {}
-  for (const [key, value] of Object.entries(initial)) {
-    const box = { current: value }
-    refs[key] = { get: () => box.current, set: (next) => { box.current = next } }
-  }
-  return refs
+  // 普通值交给 ctx.plugin：cordis 自己按 Config schema 校验并生成 volatile 引用。
+  return initial
 }
 
 /** 按 Loader 的 volatile 通道改字段：更新引用内容 + 把路径发给插件（模拟用户在设置里改）。 */
+const { updateVolatile } = await loadCosmokit()
+
 function writeConfig(fiber, ctx, patch) {
   const paths = []
   for (const key of Object.keys(patch)) {
-    fiber.config[key].set(patch[key])
+    updateVolatile(fiber.config[key], { get: () => patch[key] })
     paths.push([key])
   }
   ctx.emit('loader/volatile-update', paths)

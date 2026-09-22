@@ -67,3 +67,20 @@ class ConflictInfo:
     holderName: Optional[str] = None
     remainingSec: Optional[int] = None
     suggestedAction: Optional[SuggestedAction] = None
+
+@dataclass
+class TeamScopeTask:
+    # 官方 Agent Teams 任务的只读视图（数据由 dsh-experimental-agent-team 拥有，非本插件状态）
+    id: str
+    status: Literal["pending", "in_progress", "completed", "deleted"]
+    writeScopes: List[str]
+    subject: Optional[str] = None
+    ownerName: Optional[str] = None
+
+@dataclass
+class TeamScopeOverlap:
+    # 团队任务写域与 collab_lock 声明的重叠（advisory 交叉预警，不改变任何门控）
+    taskId: str
+    scope: str
+    path: str
+    subject: Optional[str] = None

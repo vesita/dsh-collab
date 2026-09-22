@@ -78,6 +78,26 @@ export interface ConflictInfo {
   remainingSec?: number;
 }
 
+/**
+ * 官方 Agent Teams 任务的只读视图（`$defs.TeamScopeTask`）：数据由 dsh-experimental-agent-team 拥有，
+ * 不是本插件的状态；只取在跑任务（status `in_progress`）的 `writeScopes`（项目相对路径前缀）做 advisory 交叉预警。
+ */
+export interface TeamScopeTask {
+  id: string;
+  subject?: string;
+  status: 'pending' | 'in_progress' | 'completed' | 'deleted';
+  ownerName?: string;
+  writeScopes: string[];
+}
+
+/** 团队任务写域与 collab_lock 声明的重叠（`$defs.TeamScopeOverlap`，advisory 预警，不改变任何门控）。 */
+export interface TeamScopeOverlap {
+  taskId: string;
+  subject?: string;
+  scope: string;
+  path: string;
+}
+
 export interface CollabLockParams {
   op: 'claim' | 'release' | 'list' | 'overview' | 'status' | 'heartbeat' | 'wait' | 'reap';
   paths?: string[];

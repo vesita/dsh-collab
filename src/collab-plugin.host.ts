@@ -532,7 +532,7 @@ return {
         return { otherProjects: out.slice(0, 10) }
       } catch (e) { return { otherProjects: [] } }
     }
-    async function overview(agentId) {
+    async function overview(agentId, agent) {
       const { state, target, stateDir, warn } = await load(agentId); const t = now(); expire(state, t)
       const byHolder = {}
       for (const c of state.claims) {
@@ -546,7 +546,14 @@ return {
         return { holderId: h.holderId, holderName: h.holderName, claimCount: h.claims.length, mode: modes.length === 1 ? modes[0] : 'mixed', paths: h.claims.flatMap(c => c.paths), claims: h.claims }
       })
       const other = await otherProjects(target, stateDir, t)
-      return { ok: true, data: withWarn(Object.assign({ statePath: fs.processPath(target), stateDir: stateDir, serverTime: t, totalClaims: state.claims.length, holders }, other), warn) }
+      // 官方团队在跑任务的 advisory 写域（0.11.0）：服务缺席 ⇒ 一个字段都不加（一字不变）。
+      const team = teamTasks(agent)
+      const teamField = team === null
+        ? {}
+        : (team.length
+          ? { teamTasks: team, teamTasksNote: '来自官方 Agent Teams 的在跑任务；write_scopes 是 advisory，不参与本插件的门控' }
+          : { teamTasks: [], teamTasksNote: '官方 Agent Teams 服务在场：此刻没有在跑任务' })
+      return { ok: true, data: withWarn(Object.assign({ statePath: fs.processPath(target), stateDir: stateDir, serverTime: t, totalClaims: state.claims.length, holders }, other, teamField), warn) }
     }
     async function status(a, agentId) {
       const { state, target, stateDir, warn } = await load(agentId); const t = now(); expire(state, t)
@@ -593,8 +600,23 @@ return {
       } catch (e) { return null }
     }
     const exec = (fn) => async (args, e) => { args = args || {}; const h = holderOf(e); const name = hname(h); const aId = h.sessionId || null; try { return await fn(args, h, name, aId, h.agent) } catch (err) { return { ok: false, error: 'internal', message: String((err && err.message) || err) } } }
+    // op=claim + 官方 Agent Teams 的 advisory 交叉预警（0.11.0，与包形态 tools.ts 同语义）：
+    // claim 的结果与冲突判定**一字不动**，只在成功返回的 data 上追加 teamOverlaps。
+    async function claimWithTeamAdvisory(a, h, name, aId, agent) {
+      const res = await mutate(s => claim(s, h, name, a), aId, agent)
+      try {
+        if (res && res.ok === true && res.data) {
+          const team = teamTasks(agent)
+          if (team !== null) {
+            const paths = (Array.isArray(a.paths) ? a.paths : []).filter(p => typeof p === 'string' && !!p)
+            res.data.teamOverlaps = teamScopeOverlaps(team, paths)
+          }
+        }
+      } catch (e) {}
+      return res
+    }
     const lock = exec((a, h, name, aId, agent) => {
-      if (a.op === 'claim') return mutate(s => claim(s, h, name, a), aId, agent)
+      if (a.op === 'claim') return claimWithTeamAdvisory(a, h, name, aId, agent)
       if (a.op === 'release') return mutate(s => release(s, h, a), aId, agent)
       if (a.op === 'heartbeat') return mutate(s => heartbeat(s, h, a), aId, agent)
       if (a.op === 'list') return list(aId, agent)
@@ -698,6 +720,101 @@ return {
       const more = ordered.length > 3 ? '；另有 ' + (ordered.length - 3) + ' 条' : ''
       return '[dsh-collab] 同项目其他会话当前占用：' + parts.join('；') + more + '。改动这些路径前请先执行 collab_lock op=wait 或用 collab_board 协商。'
     }
+    // 官方 Agent Teams 交叉预警（0.11.0，与 collab-core.ts 的三个同名导出**逐字节等价**，
+    // 由 tests/collab-inline-parity.mjs 的 name-set + 逐输出对拍守护）：
+    // 把官方**在跑任务**（status='in_progress'）的 advisory writeScopes 当"外部占用"报出来。
+    // 只读、不参与任何门控；服务缺席时上层拿到的 teamTasks 是 null，输出一字不变。
+    //
+    // 坑（实测踩过，别重踩）：hostCode 本身是 TS 模板字面量，内联代码里凡是要生成转义序列的地方，
+    // 反斜杠必须写两个（例如"换行"要写成反斜杠+反斜杠+n）。只写一个反斜杠会被外层模板先吃掉：
+    // 生成的源码里要么出现真实换行（字符串未闭合）、要么出现裸 NUL 字节 —— 两种都让 hostCode
+    // 无法 new Function，由 tests/collab-hostcode-parity.mjs 当场抓住。
+    function teamTaskScopeLine(tasks) {
+      const rows = (Array.isArray(tasks) ? tasks : []).filter(t => t && typeof t.id === 'string' && t.id && Array.isArray(t.writeScopes) && t.writeScopes.length > 0)
+      if (!rows.length) return null
+      const ordered = rows.slice().sort((a, b) => String(a.id).localeCompare(String(b.id)))
+      const parts = ordered.slice(0, 3).map(t => {
+        const scopes = t.writeScopes.slice(0, 3).join(' ') + (t.writeScopes.length > 3 ? ' 等 ' + t.writeScopes.length + ' 条' : '')
+        return t.id + (t.subject ? '（' + t.subject + '）' : '') + ' → ' + scopes
+      })
+      const more = ordered.length > 3 ? '；另有 ' + (ordered.length - 3) + ' 条' : ''
+      return '[dsh-collab] 官方 Agent Teams 在跑任务的写域（advisory，非锁）：' + parts.join('；') + more + '。'
+    }
+    function teamScopeOverlaps(tasks, paths) {
+      const ps = []
+      for (const p of (Array.isArray(paths) ? paths : [])) { const n = norm(p); if (n && !ps.includes(n)) ps.push(n) }
+      if (!ps.length) return []
+      const seen = new Set()
+      const out = []
+      for (const t of (Array.isArray(tasks) ? tasks : [])) {
+        if (!t || typeof t.id !== 'string' || !t.id || !Array.isArray(t.writeScopes)) continue
+        for (const scope of t.writeScopes) {
+          const ns = norm(scope)
+          if (!ns) continue
+          for (const p of ps) {
+            if (!ov(ns, p)) continue
+            const key = t.id + '\\u0000' + ns + '\\u0000' + p
+            if (seen.has(key)) continue
+            seen.add(key)
+            out.push({ taskId: t.id, subject: t.subject || '', scope: scope, path: p })
+          }
+        }
+      }
+      out.sort((a, b) => (a.taskId.localeCompare(b.taskId)) || (a.scope.localeCompare(b.scope)) || (a.path.localeCompare(b.path)))
+      return out
+    }
+    function teamCrossWarnLine(tasks, claims) {
+      const rows = []
+      const seen = new Set()
+      for (const t of (Array.isArray(tasks) ? tasks : [])) {
+        if (!t || typeof t.id !== 'string' || !t.id || !Array.isArray(t.writeScopes)) continue
+        for (const scope of t.writeScopes) {
+          const ns = norm(scope)
+          if (!ns) continue
+          for (const c of (Array.isArray(claims) ? claims : [])) {
+            if (!c || !Array.isArray(c.paths)) continue
+            let hit = null
+            for (const p of c.paths) { const np = norm(p); if (np && ov(ns, np)) { hit = p; break } }
+            if (hit === null) continue
+            const holder = c.holderName || c.holderId || ''
+            const key = t.id + '\\u0000' + ns + '\\u0000' + hit + '\\u0000' + holder
+            if (seen.has(key)) continue
+            seen.add(key)
+            rows.push({ taskId: t.id, scope: scope, path: hit, holder: holder })
+          }
+        }
+      }
+      if (!rows.length) return null
+      rows.sort((a, b) => (a.taskId.localeCompare(b.taskId)) || (a.scope.localeCompare(b.scope)) || (a.path.localeCompare(b.path)))
+      const parts = rows.slice(0, 2).map(r => '任务 ' + r.taskId + ' 的写域 ' + r.scope + ' 与「' + r.holder + '」的声明 ' + r.path + ' 重叠')
+      const more = rows.length > 2 ? '；另有 ' + (rows.length - 2) + ' 条' : ''
+      return '[dsh-collab] 交叉预警：' + parts.join('；') + more + '（advisory：官方 write_scopes 不挡写入；先 collab_board 协商或换写域）。'
+    }
+    // 官方 Agent Teams 在跑任务的只读视图（0.11.0，与包形态 store.teamTasks 同语义）：
+    // 服务缺席 / 读不到 ⇒ null（调用方一字不变）；服务在场但此刻没有在跑任务 ⇒ []。
+    function teamTasks(agent) {
+      try {
+        const svc = ctx.get('agentTeams')
+        if (!svc || typeof svc.listTasks !== 'function' || !agent) return null
+        const rows = svc.listTasks(agent)
+        if (!Array.isArray(rows)) return null
+        const out = []
+        for (const r of rows) {
+          if (!r || typeof r !== 'object') continue
+          const id = typeof r.id === 'string' ? r.id : (r.id === undefined || r.id === null ? '' : String(r.id))
+          if (!id) continue
+          const status = typeof r.status === 'string' ? r.status : ''
+          if (status !== 'in_progress') continue
+          const scopes = Array.isArray(r.writeScopes) ? r.writeScopes.filter(s => typeof s === 'string' && s.trim().length > 0) : []
+          if (!scopes.length) continue
+          const t = { id: id, subject: typeof r.subject === 'string' ? r.subject : '', status: status, writeScopes: scopes }
+          if (typeof r.ownerName === 'string' && r.ownerName) t.ownerName = r.ownerName
+          out.push(t)
+        }
+        out.sort((a, b) => a.id.localeCompare(b.id))
+        return out
+      } catch (e) { return null }
+    }
     async function refreshDigest(agent) {
       const id = agent && agent.id ? String(agent.id) : null
       const cwd = await cwdOf(id, agent)
@@ -729,7 +846,15 @@ return {
             const fam = new Set(familyIds(init.id ? String(init.id) : null, init))
             const t = now()
             const others = (hit ? hit.claims : []).filter(c => !fam.has(c.holderId) && c.expiresAt > t)
-            return others.length ? renderDigest(others) : OPEN_HINT
+            // 0.11.0 交叉预警（只读、advisory）：teamTasks 为 null（服务缺席 / 读不到）时
+            // teamLine 与 xwarn 都是 null ⇒ 本函数输出**一字不变**。
+            const team = teamTasks(init)
+            const teamLine = teamTaskScopeLine(team)
+            const xwarn = teamCrossWarnLine(team, others)
+            const lines = [others.length ? renderDigest(others) : OPEN_HINT]
+            if (teamLine) lines.push(teamLine)
+            if (xwarn) lines.push(xwarn)
+            return lines.join('\\n')
           } catch (e) { return OPEN_HINT }
         }
       }))

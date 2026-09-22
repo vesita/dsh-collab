@@ -242,11 +242,13 @@ if (!hostCode || typeof hostCode !== 'string') {
 }
 
 // ---------------------------------------------------------------- 期望集合
-// 22 个"逐输出对拍"的同名函数。
+// 25 个"逐输出对拍"的同名函数。
 const EXPECTED_PARITY = [
   'claim', 'cleanName', 'clockUtc', 'dropHolder', 'expire', 'hashProjectKey', 'heartbeat',
   'holder', 'holderFresh', 'holderView', 'inFamily', 'init', 'modeLabel', 'norm', 'ov', 'post', 'reap',
-  'release', 'releaseOnLoopEnd', 'renderDigest', 'seg', 'sweep'
+  'release', 'releaseOnLoopEnd', 'renderDigest', 'seg', 'sweep',
+  // 0.11.0 官方 Agent Teams 交叉预警的三个同名纯函数（两形态逐输出对拍）。
+  'teamCrossWarnLine', 'teamScopeOverlaps', 'teamTaskScopeLine'
 ].sort()
 // 同名但**不同形**：宿主的 overview(agentId) 是 async 的 I/O op（load→expire→聚合），
 // core 的 overview(state) 是纯状态变换。两者不是同一形状的函数，不能逐参对拍；
@@ -306,6 +308,12 @@ let overviewLoad = async () => ({ state: null, target: { path: '/fake/collab/sta
 // 跨项目观测的宿主内联副本（0.9.11）：不在同名集合里（core 侧的对应实现住在 store.ts），
 // 只为让抽取出的 overview 能解析到它。fs 桩没有 listDir ⇒ 它会走"只报当前项目"的分支。
 tryExtract('otherProjects', { fs: { processPath: (t) => (t && t.path) || String(t) } })
+// 官方 Agent Teams 交叉预警（0.11.0）：三个同名纯函数进对拍；teamTasks 是宿主侧 I/O 读，
+// 不是 core 导出，只作为 overview 抽取的依赖注入（这里给一个"服务缺席"的桩 ⇒ 返回 null）。
+tryExtract('teamTaskScopeLine')
+tryExtract('teamScopeOverlaps', { norm: host.norm, ov: host.ov })
+tryExtract('teamCrossWarnLine', { norm: host.norm, ov: host.ov })
+tryExtract('teamTasks', { ctx: { get: () => undefined } })
 tryExtract('overview', {
   load: (id) => overviewLoad(id),
   now: fixedNow,
@@ -313,6 +321,7 @@ tryExtract('overview', {
   pub: host.pub,
   withWarn: host.withWarn,
   otherProjects: host.otherProjects,
+  teamTasks: host.teamTasks,
   fs: { processPath: (t) => (t && t.path) || String(t) }
 })
 
@@ -534,6 +543,78 @@ group('renderDigest', '占用摘要文本：逐字节等价 + 顺序无关')
   const readOnly = coreFns.renderDigest([c3])
   ok(readOnly.includes('Three（只读）占用 src/three/'), 'core 渲染 read → 只读', readOnly)
 }
+// ---------------------------------------------------------------- 官方 Agent Teams 交叉预警（0.11.0）
+// 三个同名纯函数：两形态必须逐输出等价。语料同时覆盖"服务缺席"的 null 态与"有任务"的渲染态。
+// 三个 group 分别以函数名命名，以接入下面的「语料完整性守护」。
+const task = (over) => Object.assign({ id: 'task-1', subject: 'probe', status: 'in_progress', writeScopes: ['src/backend/'] }, over)
+const claimRec = (over) => Object.assign({ claimId: 'c_1', holderId: 'agent:x', holderName: 'X', paths: ['src/backend/'] }, over)
+
+group('teamTaskScopeLine', '官方团队写域一行摘要：两形态逐输出等价 + null / 异常输入')
+{
+  const fixtures = [
+    ['null', null], ['undefined', undefined], ['非数组', 'nope'], ['空数组', []],
+    ['单任务', [task()]],
+    ['无 subject', [task({ subject: '' })]],
+    ['四个任务（截断到 3）', [task({ id: 'task-1' }), task({ id: 'task-2' }), task({ id: 'task-3' }), task({ id: 'task-4' })]],
+    ['四个写域（截断到 3）', [task({ writeScopes: ['a/', 'b/', 'c/', 'd/'] })]],
+    ['空写域被过滤', [task({ writeScopes: [] }), task({ id: 'task-9' })]],
+    ['id 非字符串', [task({ id: 7 })]],
+    ['id 为空', [task({ id: '' })]],
+    ['乱序输入', [task({ id: 'task-b' }), task({ id: 'task-a' })]]
+  ]
+  for (const [label, list] of fixtures) {
+    cmp('teamTaskScopeLine · ' + label,
+      outcome(run(host.teamTaskScopeLine, [list])), outcome(run(coreFns.teamTaskScopeLine, [list])))
+  }
+  ok(coreFns.teamTaskScopeLine([task()]) === coreFns.teamTaskScopeLine([task()]), '无时间/顺序抖动')
+  ok(String(coreFns.teamTaskScopeLine([task({ writeScopes: [] })])) === 'null', '空写域 ⇒ null')
+  const sample = coreFns.teamTaskScopeLine([task()])
+  ok(typeof sample === 'string' && sample.indexOf('advisory') >= 0, '文案显式声明 advisory（不冒充锁）', sample)
+}
+
+group('teamScopeOverlaps', '团队写域 × collab 路径的纯重叠：两形态逐输出等价')
+{
+  const overlapTasks = [
+    task({ id: 'task-1', writeScopes: ['src/backend/'], subject: 's1' }),
+    task({ id: 'task-2', writeScopes: ['docs/'] })
+  ]
+  const fixtures = [
+    ['null', null], ['undefined', undefined], ['空数组', []], ['精确命中', ['src/backend/']],
+    ['子路径命中', ['src/backend/models/a.ts']],
+    ['兄弟前缀不算', ['src/backendor/']],
+    ['尾斜杠不敏感', ['src/backend']],
+    ['重复路径去重', ['docs/x', 'docs/x']],
+    ['多任务命中', ['src/backend/a', 'docs/b']],
+    ['非字符串项', [42, null, 'src/backend/a']],
+    ['空串项', ['', 'docs/x']]
+  ]
+  for (const [label, paths] of fixtures) {
+    cmp('teamScopeOverlaps · ' + label,
+      outcome(run(host.teamScopeOverlaps, [overlapTasks, paths])),
+      outcome(run(coreFns.teamScopeOverlaps, [overlapTasks, paths])))
+  }
+  ok(coreFns.teamScopeOverlaps(overlapTasks, ['docs/b', 'src/backend/a'])[0].taskId === 'task-1', '按 taskId 确定性排序')
+  ok(coreFns.teamScopeOverlaps([task({ writeScopes: [] })], ['src/backend/']).length === 0, '空写域不产生重叠')
+}
+
+group('teamCrossWarnLine', '反向交叉预警文本：两形态逐输出等价（截断到 2 条）')
+{
+  const fixtures = [
+    ['null 两侧', null, null], ['无任务', [], [claimRec()]], ['无声明', [task()], []],
+    ['重叠', [task()], [claimRec()]],
+    ['不重叠', [task()], [claimRec({ paths: ['other/'] })]],
+    ['退化为 holderId', [task()], [claimRec({ holderName: undefined })]],
+    ['三条重叠（截断到 2）', [task()], [claimRec({ claimId: 'c_1' }), claimRec({ claimId: 'c_2' }), claimRec({ claimId: 'c_3' })]],
+    ['声明 paths 缺失', [task()], [claimRec({ paths: undefined })]]
+  ]
+  for (const [label, ts, cs] of fixtures) {
+    cmp('teamCrossWarnLine · ' + label,
+      outcome(run(host.teamCrossWarnLine, [ts, cs])), outcome(run(coreFns.teamCrossWarnLine, [ts, cs])))
+  }
+  const sample = coreFns.teamCrossWarnLine([task()], [claimRec()])
+  ok(typeof sample === 'string' && sample.indexOf('advisory') >= 0, '文案显式声明 advisory（不冒充门控）', sample)
+}
+
 // ---------------------------------------------------------------- holderFresh
 group('holderFresh', '新鲜度判据：24h 回收边界 + 5min 未来偏移容忍')
 {
@@ -1059,7 +1140,7 @@ group('corpus', '每个同名函数的语料条数下限（防止语料被悄悄
     const n = g ? g.pass + g.fail : 0
     ok(n >= 4, 'corpus · ' + name + ' 至少 4 条断言', 'actual=' + n)
   }
-  ok(EXPECTED_PARITY.length === 22, '逐输出对拍的同名函数恰好 22 个', String(EXPECTED_PARITY.length))
+  ok(EXPECTED_PARITY.length === 25, '逐输出对拍的同名函数恰好 25 个', String(EXPECTED_PARITY.length))
 }
 
 // ---------------------------------------------------------------- 汇总

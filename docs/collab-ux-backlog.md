@@ -256,20 +256,112 @@
 
 ---
 
-### 2.21 与官方 Agent Teams 的接缝：家族豁免 + 双向不可见【代码依据 + 未验证】
+### 2.21 与官方 Agent Teams 的接缝：家族豁免 + 单向交叉预警（0.11.0 实测并实现）
 
 - **场景**：同一棵会话树里跑官方 `Agent Teams` 的 teammate（`spawn_teammate` 造出的直属
   continuable 子会话，`TeamId` = Lead 的 `SessionId`）时，两边都看不见对方的路径声明。
-- **代码依据（本仓库侧）**：`store.familyIds()` 的口径是"自己 + 祖先链 + 后代"
-  （`src/store.ts:194-195`），teammate 作为直属后代命中豁免 ⇒ `awareness.ts:82-84` 的态势摘要、
-  `access.ts:63-65` 的访问通知、`collab-core.inFamily` 的冲突判据都不把它当"别人"。
-  官方侧的写域只是 advisory（`dsh-experimental-tool-agent-team/lib/index.js:23`），因此树内
-  没有任何强制的占用可见性。
-- **未验证**：teammate 会话是否真的拿到本插件的态势注入（是否装配 `systemPrompt.context`）；
-  以及同族互不可见在真实团队工作流里是否真造成覆盖写。要在装了 agent-team bundle 的部署里实测。
-- **可能的方向**（不改锁语义、不重复官方任务 DAG 的前提）：把官方在跑任务的 `write_scopes`
-  当占用读出来并进态势摘要 / 冲突判据（交叉预警）；反向则是在团队建任务时提示与外部
-  `collab_lock` 声明的重叠。两者都要 `ctx.agentTeams` 在场，本部署当前没有这个服务。
+- **怎么测的（可复现）**：隔离 profile `~/.dsh/profiles/teamlab` = `dsh-base` + `dsh-headless` +
+  `@deepseek-ai/dsh-experimental-agent-team-profile` + 本仓库 symlink 进 `node_modules/dsh-collab`
+  （`profiles/web` 那套组合的等价物，但不动线上 profile）。真实会话：`cd /tmp/collab-evidence &&
+  DSH_PERMISSION_MODE=danger-full-access dsh --profile teamlab "<步骤化提示>"`；证据一律从**持久化的
+  会话日志**（`~/.dsh/sessions/--tmp-collab-evidence--/<id>/session.v4.jsonl.zstd`）与 collab 状态
+  文件里取，不看模型的自我叙述。原始命令与输出片段：`docs/agent-teams-interop-evidence.md`。
+
+- **实测结论四件**：
+  1. **teammate 确实拿到本插件的态势注入**。teammate 会话（`917be146-…`，日志里有
+     `subagent/descriptor`，即 Lead 的直属子会话）持久化的 `user/message`
+     （`source.kind='runtime-context'`, `form='snapshot'`）里带着 `dsh-collab/awareness` 与
+     `dsh-collab/delegation` 两段。机制：teammate 与 Lead 同进程、同 cordis 根、继承 Lead 的 preset，
+     而 `systemPrompt.context` 对所有 scope 的会话生效。
+  2. **家族豁免让"自动态势"和"写门控"对 Lead↔teammate 失效；`op=overview` 却看得见。**
+     Lead `collab_lock op=claim paths=["seam.txt"] mode="exclusive"` → `ok:true`（`c_1`）；
+     teammate 的 awareness 段仍只有 OPEN_HINT；teammate 的 `collab_lock op=overview` 报
+     `totalClaims: 1` 并列出该声明；随后 teammate `write seam.txt` **成功**（`Updated file`），
+     文件从 `LEAD_CONTENT` 被覆盖成 `TEAMMATE_WROTE`。
+     **负向对照**：另一个**无血缘**的独立会话对同一路径强制写入 → `Error: the user rejected tool "write"`，
+     并收到 `[dsh-collab] 你刚访问的路径处于其他会话的占用范围内…` 的访问通知。
+     ⇒ 门控本身有效，失效只来自家族豁免。**更正 README 原先的"双方都看不见"**：自动注入与门控看不见，
+     显式 `op=overview`/`op=status` 看得见；同层级的两个 teammate 互不为祖先/后代，故彼此可见。
+  3. **`send_message` / `list_agents` 语义换了，但"先唤醒、别重派"仍然成立**（真跑了一次唤醒）。
+     `list_agents` → `[{"target":"lead","role":"lead","status":"running"},{"target":"probe-w",
+     "role":"teammate","status":"inactive"}]`（名字寻址 + running/inactive 词表）；
+     `send_message {target,message}` → `{"messageId":"team-message-…","status":"accepted"}`；
+     只剩 inactive 成员时 `wait_agent` 返回
+     `{"timedOut":false,"noProgress":{"reason":"no-active-peer","message":"…use send_message to wake each
+     required inactive teammate before waiting again."}}`。唤醒后 teammate 会话 `turn/start` 从 1 → 3，
+     并按第二条消息里的指令写了两个文件 ⇒ **恢复路径有效**。
+     真正变的是"主体"：legacy `tool-subagent*` 被 agent-team bundle 在部署层禁用，`list_agents` 不再
+     列出它们（Web profile 的 preset 里仍有 legacy 控件，只是被同名团队工具**遮蔽**）。因此 0.11.0 在
+     `ctx.agentTeams` 在场时给委托纪律追加一段面向 teammate 的措辞（`TEAM_DISCIPLINE_ADDENDUM`），
+     未启用时那段纪律一字不变。
+  4. **`write_scopes` 实测纯 advisory，没有任何人按它写**。`team_task_create write_scopes=["inside/"]`
+     → `writeScopes:["inside"]`；`team_task_update action=claim` → `status:"in_progress"`、
+     `writeScopeWarnings:[]`；被唤醒的 teammate 同时写 `outside/proof.txt`（**在声明写域之外**）与
+     `inside/proof.txt`，两个都 `Created file`，无警告、无拒绝；teammate 自己 `team_task_list` 看到的
+     也只是同一份 advisory 视图。与官方自述一致（`dsh-experimental-tool-agent-team/lib/index.js:23`、
+     `dsh-experimental-agent-team/README.md:138`）。
+
+- **0.11.0 的实现（交叉预警：不改锁语义、不重做任务 DAG）**：
+  - **正向（本插件读官方）**：`ctx.agentTeams.listTasks(活 Agent)` 里 `status='in_progress'` 且
+    `writeScopes` 非空的任务被当作 advisory 占用 —— 进态势摘要（`teamTaskScopeLine`，order 130 那一段）、
+    进 `collab_lock op=overview` 的 `teamTasks` + `teamTasksNote`、进 `op=claim` 成功返回的 `teamOverlaps`。
+    这些数据**永远不参与** `blockers()` / `claimsCovering()` / gate 的判定。
+  - **反向（本插件提示官方一侧）**：官方没有给第三方插件"任务即将创建"的钩子，但它和别的工具一样走
+    DSH 的 `tools/pre-execute`。本插件在 `team_task_create` / `team_task_update` 上做**只提示不阻断**的
+    交叉预警：`write_scopes` 与外部（非家族、非 shared/read、未过期）的 collab 声明重叠时，投一条
+    `agent.inject` + `form:'notice'` 的显式来源消息；没有重叠就什么都不发。host 动态形态没有
+    `tools/pre-execute` 接线（§2.15），那一侧退化为文档约定。
+  - **降级契约（负向对照逐个断言）**：服务缺席 / `listTasks` 抛错（如 `TEAM_NOT_MEMBER`）都折成三态里的
+    `null` ⇒ 本插件所有输出**一字不变**；服务在场但没有在跑任务 ⇒ `teamTasks: []` + 明说"没有在跑任务"。
+    `tests/collab-agent-teams.mjs` 对"一字不变"逐字段断言。
+- **契约**：`TeamScopeTask` / `TeamScopeOverlap` 进 SSOT `src/schema/collab.schema.json`，
+  并同步 TS / Python / Rust 四份派生物（`tests/collab-contract-derivation.mjs`）。这两个类型描述的是
+  **别的插件拥有的数据**，所以写进契约（与 `otherProjects` 那种纯排障字段不同）。
+- **仍未验证**：`fork` 上下文的 teammate 与 `fresh` 在可见性上是否有差异；同一 checkout、两个 dsh
+  进程时官方 Team 状态不跨进程而本插件的路径占用跨进程 —— 两者叠加的表现没测；多 teammate 并发争用
+  同一写域时的实际覆盖顺序没测。
+
+---
+
+### 2.22 插件页里 collab 的配置卡片"没有内容"（0.11.0 已修）
+
+- **场景（用户报）**：启用官方 agent-team bundle 之后，"collab 的设置页配置可能看不见了"。
+- **定位（实测，2026-09-22）**：**与 agent-team 无关**，是 0.10.0 起的既有回归。用官方的 Config 检视
+  读**活体树**（不是磁盘上的组合结果）：
+  ```
+  cordis_inspect_query(host/Config, listConfigs, {name:"dsh-collab"})
+  → {"id":"include:collab","patchId":"collab","name":"dsh-collab","status":"absent",
+     "packageDir":"/home/vesita/.dsh/profiles/web/node_modules/dsh-collab"}
+  ```
+  `status:'absent'` 的定义是 **`fiber.runtime.Config` 为 undefined**
+  （`dsh-tool-cordis/lib/types/config.js:12-14`），而 `fiber.runtime` 就是插件的**默认导出对象**
+  （`cordis/lib/index.js:1347` 的 `resolveConfig(this.runtime, config)`）。0.10.0 把偏好迁到
+  profile Config 时，`Config` 只留了具名导出，默认导出仍是 `{ name, inject, apply }` ⇒ Loader 没有
+  可投影的 Config ⇒ 浏览器半边的卡片（其实注册得好好的：`plugins.bundle.config` 的 occupant
+  `dsh-collab` 一直是 `active: true`）拿不到表单，于是看起来"配置消失了"。
+  **对照**：`dsh-antigravity` 的默认导出是 `{ name, inject, apply, Config }`，同一检视报
+  `status:'schema'`；两者差的就是这一项。
+- **修（0.11.0）**：`src/index.ts` 的默认导出补上 `Config`；
+  `tests/collab-client-config-page.mjs` 新增 ⑦ 段钉死它（默认导出带 Config、与具名导出同引用、
+  本部署 profile 里那四个值能被校验通过）。修前 `Object.keys(default)` 实测为
+  `['name','inject','apply']`，修后为 `['name','inject','apply','Config']`。
+  连带修的两处**测试基建**（都不改产品行为）：
+  1. `tests/_harness.mjs` 说清"测试里造插件 Config 的正确方式"：把**普通值**交给
+     `ctx.plugin`，由 cordis 按 `Config` schema 校验并生成 volatile 引用；改值用 cosmokit 的
+     `updateVolatile`（与 `cordis-plugin-loader` 的 `_commitVolatile` 同一个函数）。
+     `collab-access-gate.mjs` / `collab-auto-release.mjs` / `collab-skill.mjs` 里手工造 `{get,set}`
+     引用的写法已删除 —— 那种写法会绕过校验，声明 `Config` 之后必然
+     `ValidationError: expected boolean but got [object Object]`。
+  2. `tests/collab-skill-real.mjs`（`npm run test:real`）**从 0.9.0 起就没再跟上 0.1.7**：
+     它把 `@deepseek-ai/dsh-settings-file` 列为前置依赖，而该包在 0.1.7 已被 `dsh-settings`
+     取代（0.1.7 的 `dsh-settings` 里没有 `installSection`），所以 `npm run test:real` 一直是
+     **硬失败**（拒绝静默跳过，按设计 exit 1）。偏好既然已经是插件自己的 Config，这个文件改为：
+     真实 `SkillRegistry` + **真实 cordis 的 Config 校验/volatile 引用**，用 `updateVolatile` 模拟
+     用户在插件页改开关。现状 `npm run test:real` 17 条断言全绿。
+- **生效条件**：这是**代码**修复，需要重新打包安装进 `profiles/web`（或让该插件从本仓库加载）
+  并重载插件；运行中的进程仍加载着旧的 0.10.1 模块。
+- **未验证**：重装后在浏览器里那张卡片真的渲染出四个字段（本次只验证到 Host 侧
+  `default.Config` 存在、schema 接受本部署的值、且卡片注册面未变）。
 
 ---
 
@@ -376,6 +468,14 @@
   §2.16（`src/delegation.ts:36`）、§5 全部。
 - **实测（强，隔离副本上运行时复现）**：§2.17、§2.18 —— 在 `/tmp` 的隔离副本里构建 0.9.0 后直接调用
   工具拿到原始返回，**不是**读代码推断。
+- **实测（强，真实会话 + 持久化日志取证）**：§2.21 —— 在隔离 profile `teamlab`（base + headless +
+  官方 agent-team bundle + 本仓库）上跑真实 `dsh --profile teamlab` 会话，四件结论各自的原始命令、
+  原始工具返回与会话日志片段见 `docs/agent-teams-interop-evidence.md`；覆盖写、门控拒绝、唤醒轮次
+  都是从会话日志与文件内容读出的事实，不是模型叙述。
+- **实测（强，官方检视工具读活体树 + 编译产物对照）**：§2.22 —— 用 `cordis_inspect_query` 的
+  `host/Config` 读**活体**条目状态（`collab` → `absent`，`antigravity` → `schema` 作对照），
+  再由 `status` 的定义（`fiber.runtime.Config`）与 Loader 取 `runtime` 的那行代码定位到
+  默认导出缺项；修前/修后 `Object.keys(default)` 都实测过。
 - **记录取证（强，只读会话记录）**：§4 全部数字（81 次调用、op 分布、16 个 holderId、
   17 种 holderName、0 次 wait/heartbeat/status、1354 次占用行、415 快照/237 对倒计时）。
   数法见 §4 各表；原始记录未改动，解压在 `/tmp` 临时目录。

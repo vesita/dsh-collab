@@ -363,6 +363,125 @@ export function renderDigest(claims: Claim[]): string {
   return '[dsh-collab] 同项目其他会话当前占用：' + parts.join('；') + more + '。改动这些路径前请先执行 collab_lock op=wait 或用 collab_board 协商。'
 }
 
+// ---- 官方 Agent Teams 交叉预警（0.11.0）：只读团队任务的 advisory 写域 ----
+//
+// 定位（README「与官方 Agent Teams 的分工」）：官方管**树内**（成员派生 + 任务 DAG），
+// 本插件管**树间**（同一 checkout 上的路径占用）。两边此前互不可见（backlog §2.21 实测）：
+//   - 官方任务的 `writeScopes` 只是 advisory（`dsh-experimental-tool-agent-team/lib/index.js:23`），
+//     没有任何写入门控读它；
+//   - 团队成员的会话家族豁免让 teammate 既看不到 Lead 的 collab_lock，写门控也不拦它。
+// 这里补的是**只读的交叉预警**：把官方**在跑任务**（status='in_progress'）的 writeScopes 当
+// "advisory 占用"报给本插件一侧的态势摘要 / overview / claim 返回。**不改锁语义**：
+// 这些数据永远不参与 blockers()/claimsCovering()/gate 的判定，只出现在输出侧与提示文本里。
+// 服务缺席（未启用 agent-team）时上层返回 null，本插件的一切输出**一字不变**。
+//
+// 时间稳定性同样是硬约束（与 renderDigest 同因）：团队任务视图没有时间字段，渲染只依赖
+// 任务集合与写域本身，所以同一组任务永远渲染同一串文本，不会击穿 DSH 的快照去重。
+
+/** 官方 Agent Teams 任务的只读视图（本插件消费的最小面；字段名对齐 TeamTaskView）。 */
+export interface TeamScopeTask {
+  id: string
+  /** 任务标题；仅用于渲染，缺省时空串。 */
+  subject: string
+  /** 官方状态；本插件只把 'in_progress' 当"在跑"。 */
+  status: string
+  /** 认领者名字（官方 TeamTaskView.ownerName）；无主时为 undefined。 */
+  ownerName?: string
+  /** 工作区相对路径前缀（官方 validation.js 已归一化，尾斜杠可能被剥掉）。 */
+  writeScopes: string[]
+}
+
+/** 团队任务写域与 collab 路径的重叠（advisory 交叉预警；**不是**冲突判据）。 */
+export interface TeamScopeOverlap {
+  taskId: string
+  subject: string
+  /** 团队任务声明的写域。 */
+  scope: string
+  /** 与之重叠的 collab 路径（已归一化）。 */
+  path: string
+}
+
+/**
+ * 渲染"官方团队在跑任务的写域"为一行 advisory 文本；没有在跑任务时返回 null。
+ * 有界（最多 3 条任务 × 3 个写域）且**无时间参数** —— 与 renderDigest 同一纪律。
+ */
+export function teamTaskScopeLine(tasks: TeamScopeTask[] | null | undefined): string | null {
+  const rows = (Array.isArray(tasks) ? tasks : []).filter(t =>
+    t && typeof t.id === 'string' && t.id && Array.isArray(t.writeScopes) && t.writeScopes.length > 0)
+  if (!rows.length) return null
+  const ordered = rows.slice().sort((a, b) => String(a.id).localeCompare(String(b.id)))
+  const parts = ordered.slice(0, 3).map(t => {
+    const scopes = t.writeScopes.slice(0, 3).join(' ') + (t.writeScopes.length > 3 ? ' 等 ' + t.writeScopes.length + ' 条' : '')
+    return t.id + (t.subject ? '（' + t.subject + '）' : '') + ' → ' + scopes
+  })
+  const more = ordered.length > 3 ? '；另有 ' + (ordered.length - 3) + ' 条' : ''
+  return '[dsh-collab] 官方 Agent Teams 在跑任务的写域（advisory，非锁）：' + parts.join('；') + more + '。'
+}
+
+/**
+ * 团队任务写域 × collab 路径的纯重叠计算（分段前缀，与 ov 同源）。
+ * 输出**确定性排序 + 去重**，可直接进 JSON 返回（overview / claim 的 advisory 字段）。
+ */
+export function teamScopeOverlaps(tasks: TeamScopeTask[] | null | undefined, paths: string[] | null | undefined): TeamScopeOverlap[] {
+  const ps: string[] = []
+  for (const p of (Array.isArray(paths) ? paths : [])) { const n = norm(p); if (n && !ps.includes(n)) ps.push(n) }
+  if (!ps.length) return []
+  const seen = new Set<string>()
+  const out: TeamScopeOverlap[] = []
+  for (const t of (Array.isArray(tasks) ? tasks : [])) {
+    if (!t || typeof t.id !== 'string' || !t.id || !Array.isArray(t.writeScopes)) continue
+    for (const scope of t.writeScopes) {
+      const ns = norm(scope)
+      if (!ns) continue
+      for (const p of ps) {
+        if (!ov(ns, p)) continue
+        const key = t.id + '\u0000' + ns + '\u0000' + p
+        if (seen.has(key)) continue
+        seen.add(key)
+        out.push({ taskId: t.id, subject: t.subject || '', scope, path: p })
+      }
+    }
+  }
+  out.sort((a, b) => (a.taskId.localeCompare(b.taskId)) || (a.scope.localeCompare(b.scope)) || (a.path.localeCompare(b.path)))
+  return out
+}
+
+/**
+ * 反向预警文本：**团队任务的写域**与**外部会话的 collab 声明**重叠时提示一句。
+ * 这是"官方读不到本插件声明"那条接缝上唯一能做到的一侧：本插件能同时看到两边，
+ * 于是把重叠说给团队听（advisory，不改变任何门控）。没有重叠时返回 null。
+ */
+export function teamCrossWarnLine(tasks: TeamScopeTask[] | null | undefined, claims: Claim[] | null | undefined): string | null {
+  const rows: Array<{ taskId: string; scope: string; path: string; holder: string }> = []
+  const seen = new Set<string>()
+  for (const t of (Array.isArray(tasks) ? tasks : [])) {
+    if (!t || typeof t.id !== 'string' || !t.id || !Array.isArray(t.writeScopes)) continue
+    for (const scope of t.writeScopes) {
+      const ns = norm(scope)
+      if (!ns) continue
+      for (const c of (Array.isArray(claims) ? claims : [])) {
+        if (!c || !Array.isArray(c.paths)) continue
+        let hit: string | null = null
+        for (const p of c.paths) {
+          const np = norm(p)
+          if (np && ov(ns, np)) { hit = p; break }
+        }
+        if (hit === null) continue
+        const holder = c.holderName || c.holderId || ''
+        const key = t.id + '\u0000' + ns + '\u0000' + hit + '\u0000' + holder
+        if (seen.has(key)) continue
+        seen.add(key)
+        rows.push({ taskId: t.id, scope, path: hit, holder })
+      }
+    }
+  }
+  if (!rows.length) return null
+  rows.sort((a, b) => (a.taskId.localeCompare(b.taskId)) || (a.scope.localeCompare(b.scope)) || (a.path.localeCompare(b.path)))
+  const parts = rows.slice(0, 2).map(r => '任务 ' + r.taskId + ' 的写域 ' + r.scope + ' 与「' + r.holder + '」的声明 ' + r.path + ' 重叠')
+  const more = rows.length > 2 ? '；另有 ' + (rows.length - 2) + ' 条' : ''
+  return '[dsh-collab] 交叉预警：' + parts.join('；') + more + '（advisory：官方 write_scopes 不挡写入；先 collab_board 协商或换写域）。'
+}
+
 // ---- 访问路径判定（功能 A：访问时的旁路通知；功能 C：写保护的原生审批）----
 //
 // 这里只放**可单测的纯逻辑**；注册 ctx.on('tools/pre-execute'|'tools/post-execute')

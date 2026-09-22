@@ -25,6 +25,30 @@
 /** 只有显式 COLLAB_ALLOW_SKIP=1 才允许跳过；其余一律按失败计。 */
 export const ALLOW_SKIP = process.env.COLLAB_ALLOW_SKIP === '1'
 
+// ── 插件 Config 在测试里的正确构造方式（0.11.0 起）────────────────────────────
+// 本插件在**默认导出**上声明了 `Config`（插件页的配置表单与 `fiber.runtime.Config` 都靠它，
+// 见 docs/collab-ux-backlog.md §2.22）。于是 `ctx.plugin(plugin, config)` 会**自己**走完 Loader
+// 的两段式：先按 schema 校验**普通值**，再把 `.volatile()` 字段换成稳定引用（只有 `get()`）。
+//
+// 所以交给 `ctx.plugin` 的必须是**普通值**（就是 profile patch 里写的那种），
+// **不要**再手工造 `{ get, set }` 引用：那等于把"校验后的产物"又喂回校验，会直接
+// `ValidationError: expected boolean but got [object Object]`。校验后 `fiber.config` 上就是真引用。
+//
+// 改一个 volatile 字段：用 cosmokit 的 `updateVolatile(ref, { get })` —— 与
+// cordis-plugin-loader 的 `_commitVolatile` 调的是同一个函数（不是手抄"改引用内容"的替身）。
+// cosmokit 与本仓库的 cordis 一样不是直接依赖，从 pnpm 虚拟 store 的回退路径解析。
+
+/**
+ * 解析 cosmokit（Loader 用的那个 volatile 实现），解析不到的失败**不许**吞成跳过。
+ * @returns {Promise<{ updateVolatile: Function, isVolatile: Function }>}
+ */
+export async function loadCosmokit () {
+  const mod = await import('@deepseek-ai/cosmokit')
+    .catch(() => import('../node_modules/.pnpm/node_modules/@deepseek-ai/cosmokit/lib/index.js'))
+  if (typeof mod.updateVolatile !== 'function') throw new Error('cosmokit 没有导出 updateVolatile')
+  return mod
+}
+
 const BAR = '='.repeat(72)
 
 /**

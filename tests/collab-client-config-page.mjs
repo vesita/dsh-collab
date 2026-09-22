@@ -185,5 +185,25 @@ const numberSpec = specs.find((spec) => spec && spec.field === 'loopEndGraceSec'
 ok('宽限期用 settingsNumberField（数字字段）',
   !!numberSpec && numberSpec.kind === 'number', JSON.stringify(numberSpec))
 
+// ── ⑦ Host 默认导出必须带上 Config（插件页那张卡片真正的前置条件）──────────
+// 0.10.0 把偏好迁到 profile Config 时，`Config` 只留在具名导出上 → Loader 的
+// `resolveConfig(fiber.runtime, config)` 取不到（runtime = 默认导出对象，见
+// cordis/lib/index.js:1347）→ Host 侧条目没有可投影的 Config，插件页的表单为空，
+// 卡片看似"消失了"。这一条把它钉成一次命令可判定的规则。
+{
+  const hostPkg = await import(new URL('../lib/index.js', import.meta.url).href)
+  ok('Host 半边的默认导出带 Config（不是只有具名导出）',
+    !!hostPkg.default && !!hostPkg.default.Config, JSON.stringify(Object.keys(hostPkg.default || {})))
+  ok('默认导出上的 Config 就是具名导出那个对象',
+    !!hostPkg.default && hostPkg.default.Config === hostPkg.Config, '两者不是同一个引用')
+  const profileConfig = { exposeDelegationDiscipline: true, enforceWriteLock: true, releaseOnLoopEnd: true, loopEndGraceSec: 120 }
+  let validated = null
+  try { validated = hostPkg.Config(profileConfig) } catch (e) { validated = null }
+  ok('本部署 profile patch 里那四个值能被 Config 校验通过', !!validated, String(validated))
+  for (const field of expected) {
+    ok(`校验结果里保留 ${field}`, !!validated && field in validated, JSON.stringify(validated && Object.keys(validated)))
+  }
+}
+
 console.log('\n' + (failed === 0 ? 'ALL PASS: ' : 'FAILURES: ') + passed + ' passed, ' + failed + ' failed')
 process.exit(failed === 0 ? 0 : 1)

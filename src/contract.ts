@@ -268,6 +268,27 @@ export interface ConnectionService {
 }
 
 /**
+ * ctx.agentTeams 中本插件实际使用的最小接口；**可选服务**（0.11.0）。
+ *
+ * 来源：官方实验 bundle `@deepseek-ai/dsh-experimental-agent-team-profile`。服务是**进程级**注册的
+ * （`dsh-experimental-agent-team/lib/index.js:1655-1656` 的 `super(ctx, 'agentTeams')`），
+ * 但每个读方法都以**活的 Agent 作为授权凭据**：`listTasks(caller)` 解析 caller 的 Team 归属，
+ * 非成员抛 TEAM_NOT_MEMBER；没有 Team 记录的顶层会话是"自己的空团队"的隐式 Lead，返回空数组。
+ *
+ * 本插件**只读**、只在服务在场时使用，且任何失败都按"读不到"处理（调用方降级为一字不变）。
+ * `TeamTaskView` 的真实形状见 `dsh-experimental-agent-team/lib/types/types.d.ts:67-78`。
+ */
+export interface AgentTeamsServiceLike {
+  listTasks(caller: unknown): Array<{
+    id?: unknown
+    subject?: unknown
+    status?: unknown
+    ownerName?: unknown
+    writeScopes?: unknown
+  }>
+}
+
+/**
  * ctx.webServer 中本插件实际使用的最小接口；**可选服务**。
  * 与部署里 open-in-app 注册路由的形态一致（kind/path/handler，返回 disposer）。
  */

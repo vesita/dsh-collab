@@ -80,6 +80,22 @@ export const DELEGATION_DISCIPLINE_TEXT = [
   '子代理意外终止（回合以 error 或空收尾结束、久等之后它不再是 running）先别重派：先 list_agents 看它还在不在（idle / ready 都还能被唤起），在就 send_message 唤醒它接着做 —— 它保留着上下文，比重派便宜；同时提醒它重新 collab_lock op=claim（它一停下，之前的声明就被自动释放了，而它自己不知道）；同一处最多试一两次，再不行就自己写。注意：往留言板 @ 它是唤不醒的，agent.inject 不唤醒 driver，能唤醒的只有 send_message。'
 ].join('\n')
 
+/**
+ * 启用官方 Agent Teams 时**追加**在委托纪律后面的那一段（0.11.0）。只在 `ctx.agentTeams` 在场时追加；
+ * 未启用时那段纪律一字不变（README「与官方 Agent Teams 的分工」的降级契约）。
+ *
+ * 依据是实测（docs/collab-ux-backlog.md §2.21 的原始输出）：
+ *   - 团队成员作用域里的 `list_agents` / `send_message` 是**官方工具**：按 `target` 名字寻址，
+ *     状态词是 running / inactive（不是 legacy 的 idle / ready），返回里不再有 subagent id；
+ *   - 部署层的 legacy `tool-subagent*` 被 agent-team bundle 禁用；
+ *   - `wait_agent` 明确**不**唤醒 inactive 成员（实测返回 noProgress.reason='no-active-peer'），
+ *     所以"先看它还在不在、再唤醒"的恢复路径仍然成立，但唤醒动作只能用 `send_message`。
+ * 纪律正文里**不许出现阿拉伯数字**（tests/collab-skill.mjs 的守护），这一段同样遵守。
+ */
+export const TEAM_DISCIPLINE_ADDENDUM = [
+  '[dsh-collab] 同装官方 Agent Teams 时：委派对象是 teammate（spawn_teammate 派生）；list_agents 只列本团队成员，状态词是 running / inactive；唤醒只能用 send_message（按 target 名字寻址）—— wait_agent 不会唤醒 inactive 成员，agent.inject 也不会。'
+].join('\n')
+
 // ---- 功能 C：写/读调用的路径事实源 ----
 // 工具名与**参数名**逐条来自实测（不是猜的），证据：
 //   write / edit        : @deepseek-ai/dsh-tool-fs/lib/index.js:597,742 —— 参数 `file_path`

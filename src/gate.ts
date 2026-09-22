@@ -8,15 +8,24 @@
 import { claimsCovering, relToProject, isReadable, clockUtc, modeLabel, inFamily } from './collab-core.js'
 import type { Claim } from './collab-core.js'
 import { pathArgsFor } from './spec.js'
-import type { CollabContext } from './contract.js'
+import type { AgentLike, CollabContext } from './contract.js'
 import type { StateStore } from './store.js'
+import type { PushApi } from './push.js'
 
 /** 门控需要的偏好读取面（由 delegation 安装器交出）。 */
 export interface GatePrefs {
   enforceWriteLockEnabled(): boolean
 }
 
-export function installGate(ctx: CollabContext, store: StateStore, prefs: GatePrefs): void {
+/**
+ * 官方 Agent Teams 的**建任务/改任务**工具名（0.11.0 反向预警的触发面）。
+ * 官方没有给第三方插件任何"任务即将创建"的钩子，但它这两个工具走的就是 DSH 的
+ * `tools/pre-execute`，与本插件的写门控同一条缝 —— 于是"团队建任务时提示与外部
+ * collab_lock 声明的重叠"可以在这里做到，且**只提示、不阻断**（不改任何门控语义）。
+ */
+const TEAM_TASK_TOOLS: readonly string[] = ['team_task_create', 'team_task_update']
+
+export function installGate(ctx: CollabContext, store: StateStore, prefs: GatePrefs, push?: PushApi): void {
   // ---- 功能 C：写保门的门控判定 ----
 
   /** 把命中渲染成 ask 的理由（含持有者、路径、**绝对 UTC** 租约窗口）。 */
@@ -80,6 +89,63 @@ export function installGate(ctx: CollabContext, store: StateStore, prefs: GatePr
     return { kind: 'ask', reason: gateReason(hit.claim, hit.target, hit.kind) }
   }
 
+  /**
+   * 反向交叉预警（0.11.0）：团队在建/改任务的 `write_scopes` 与**外部会话**的 collab_lock 声明重叠时，
+   * 给发起这条工具调用的会话 inject 一条 advisory notice。
+   *
+   * 纪律：
+   *   - **只提示，不阻断** —— 返回 void，调用方照常 `next()`；官方 write_scopes 本来就是 advisory；
+   *   - 只在**真有重叠**时投递（没有重叠 = 没有事件，不发"一切正常"的噪声）；
+   *   - 过滤口径与写门控同源：不认自家家族（inFamily）、不认 shared/read、只看未过期的声明；
+   *   - 任何失败都静默（包括 push 缺失 / inject 失败）—— 预警是旁路，不该影响工具本身。
+   */
+  async function teamScopeNotice(execCtx: any): Promise<void> {
+    if (!push) return
+    // 服务缺席 ⇒ 这条支路整体不存在（"服务缺席时输出一字不变"的降级契约要字面成立，
+    // 而不是靠"官方工具只在该服务在场时存在"这条外部事实兜底）。
+    if (!ctx.get('agentTeams')) return
+    const toolName = execCtx && typeof execCtx.name === 'string' ? execCtx.name : ''
+    if (!TEAM_TASK_TOOLS.includes(toolName)) return
+    const args = (execCtx && execCtx.arguments) || {}
+    // 官方工具参数是 snake_case `write_scopes`；service 面是 camelCase `writeScopes`。
+    const raw = Array.isArray(args.write_scopes) ? args.write_scopes
+      : (Array.isArray(args.writeScopes) ? args.writeScopes : [])
+    const scopes = raw.filter((s: unknown): s is string => typeof s === 'string' && !!s.trim())
+    if (!scopes.length) return
+    const agent = execCtx && execCtx.agent as AgentLike | undefined
+    const id = agent && (agent as AgentLike).id ? String((agent as AgentLike).id) : null
+    const cwd = await store.cwdOf(id, agent)
+    const me = store.holderOf(execCtx)
+    const { state } = await store.load(id, agent)
+    const t = store.now()
+    const hits: Array<{ claim: Claim; target: string }> = []
+    const seen = new Set<string>()
+    for (const scope of scopes) {
+      const rel = relToProject(scope, cwd)
+      if (!rel) continue
+      for (const c of claimsCovering(state.claims, rel, t)) {
+        if (inFamily(me, c.holderId)) continue
+        if (c.mode === 'shared' || c.mode === 'read') continue
+        const key = c.claimId + '\u0000' + rel
+        if (seen.has(key)) continue
+        seen.add(key)
+        hits.push({ claim: c, target: rel })
+      }
+    }
+    if (!hits.length) return
+    hits.sort((a, b) => a.claim.claimId.localeCompare(b.claim.claimId))
+    const parts = hits.slice(0, 2).map(hh => {
+      const who = hh.claim.holderName || hh.claim.holderId
+      return '写域 ' + hh.target + ' 已被外部会话「' + who + '」以 ' + modeLabel(hh.claim.mode) + ' 声明占用'
+    })
+    const more = hits.length > 2 ? '；另有 ' + (hits.length - 2) + ' 条' : ''
+    const text = '[dsh-collab] 交叉预警：你要给团队任务声明的' + parts.join('；') + more +
+      '（租约 ' + clockUtc(hits[0].claim.expiresAt) + '）。官方 write_scopes 只是 advisory，不会挡住对方；' +
+      '建议先 collab_board 与对方协商，或把任务写域换到别处。'
+    const label = 'collab 团队写域与外部锁重叠 · ' + hits[0].target
+    push.pushNotice(agent, text, label)
+  }
+
   // ---- 功能 C：写/读的原生审批门控 ----
   // 未命中任何他人声明（或工具不是写/读类、或开关关掉）→ return next() 原样放行。
   // 本部署的已知后果：审批提示被禁用时 dsh-tools 的 serviceAsk 把 ask 变成 deny
@@ -92,6 +158,12 @@ export function installGate(ctx: CollabContext, store: StateStore, prefs: GatePr
       if (decision) return decision
     } catch (e) {
       // 门控自身故障时放行：插件的问题不该锁死整个工具面。
+    }
+    // 反向预警在**放行之后**才发：被门控拒掉的调用不该再收到一条"你的团队写域和别人重叠"。
+    try {
+      await teamScopeNotice(execCtx)
+    } catch (e) {
+      // 预警是旁路：任何失败都不影响工具本身。
     }
     return next()
   })

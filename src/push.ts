@@ -61,6 +61,12 @@ export interface PushApi {
     holderName: string,
     graceSec: number
   ): Promise<LoopEndReleaseOutcome>
+  /**
+   * 一次性 **advisory** notice（0.11.0 的团队写域交叉预警）：直接投给**给定的活 Agent**。
+   * 与 notifyReaders 共用同一条诚实投递面（`agent.inject` + 显式来源 `dsh-collab/notice`），
+   * 不新造通道、绝不冒充用户。**绝不抛**：拿不到 agent / 没有 inject 面 / inject 抛错都如实返回。
+   */
+  pushNotice(agent: AgentLike | undefined, text: string, label: string): PushOutcome
 }
 
 export function installPush(ctx: CollabContext, store: StateStore): PushApi {
@@ -424,5 +430,21 @@ export function installPush(ctx: CollabContext, store: StateStore): PushApi {
     } catch (e) {}
   }, { global: true })
 
-  return { notifyReaders, notifyLoopEndRelease }
+  /**
+   * advisory notice 的**单条同步投递**：调用方已经拿着活 Agent（tools/pre-execute 的 execCtx.agent），
+   * 不需要（也不该）再走 sessionId 解析。失败三态与 pushOne 同一口径，只是错误名更直白。
+   */
+  function pushNotice(agent: AgentLike | undefined, text: string, label: string): PushOutcome {
+    if (!agent || typeof (agent as { inject?: unknown }).inject !== 'function') {
+      return { ok: false, error: 'agent-has-no-inject' }
+    }
+    try {
+      ;(agent as { inject(m: unknown): void }).inject(releaseNoticeMessage({ text, summary: boundContextSummary(label) }))
+      return { ok: true }
+    } catch (e) {
+      return { ok: false, error: String((e && (e as Error).message) || e) }
+    }
+  }
+
+  return { notifyReaders, notifyLoopEndRelease, pushNotice }
 }

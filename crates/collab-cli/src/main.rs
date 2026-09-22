@@ -125,6 +125,35 @@ pub struct ConflictInfo {
     pub suggested_action: Option<SuggestedAction>,
 }
 
+/// schema `$defs.TeamScopeTask` 的 Rust 派生：官方 Agent Teams 任务的**只读**视图。
+/// 数据由 dsh-experimental-agent-team 拥有，**不是本插件的状态**；只取在跑任务（status
+/// `in_progress`）的 writeScopes（项目相对路径前缀）做 advisory 交叉预警。
+/// 只读类型：CLI 从不构造它，只反序列化宿主给的任务视图。
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TeamScopeTask {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_name: Option<String>,
+    pub write_scopes: Vec<String>,
+}
+
+/// schema `$defs.TeamScopeOverlap` 的 Rust 派生：团队任务写域与 collab_lock 声明的重叠
+/// （advisory 交叉预警，**不改变任何门控**）。`scope` = 团队任务声明的写域，
+/// `path` = 相撞的那条 collab 路径。
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TeamScopeOverlap {
+    pub task_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    pub scope: String,
+    pub path: String,
+}
+
 pub fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

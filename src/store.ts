@@ -11,10 +11,11 @@ import {
   expire, cleanName, norm, projectStorageFileName, reap
 } from './collab-core.js'
 import type { Claim, HolderInput, OpResult, PublishedClaim, StateDocument } from './collab-core.js'
+import type { TeamScopeTask } from './collab-core.js'
 import { LEGACY_PROJECT_FILE, collabDir, projectStateFile, legacyCollabDirs } from './paths.js'
 import type {
-  AgentLike, AgentsLookupService, CollabArgs, CollabContext, CollabFs, FileRef, LoadResult,
-  SessionsService, SessionTitleService, ToolExecContext, ToolResult
+  AgentLike, AgentTeamsServiceLike, AgentsLookupService, CollabArgs, CollabContext, CollabFs, FileRef,
+  LoadResult, SessionsService, SessionTitleService, ToolExecContext, ToolResult
 } from './contract.js'
 
 /** 状态存取面：installStore() 对外暴露的东西，也是其他 installer 的唯一状态入口。 */
@@ -30,6 +31,14 @@ export interface StateStore {
   familyIds(agentId: string | null, agent?: AgentLike): string[]
   /** 后代会话 id（不含自己）。自动释放的"有子代理在跑"判据用。 */
   descendantIds(agentId: string | null): string[]
+  /**
+   * 官方 Agent Teams **在跑任务**（status='in_progress'）的 advisory 写域（0.11.0）。
+   * 语义三态，必须区分：
+   *   - `null`  = 服务缺席 / 读不到（agentTeams 未启用、caller 非成员、宿主抛错）⇒ 上层**一字不变**；
+   *   - `[]`    = 服务在场、但此刻没有在跑任务；
+   *   - 非空数组 = 在跑任务的写域。**只读**，绝不参与门控/冲突判定。
+   */
+  teamTasks(agent?: AgentLike): TeamScopeTask[] | null
   cwdOf(agentId: string | null, agent?: AgentLike): Promise<string | null>
   load(agentId: string | null, agent?: AgentLike): Promise<LoadResult>
   mutate(fn: (s: StateDocument) => OpResult, agentId: string | null, agent?: AgentLike): Promise<ToolResult>
@@ -445,12 +454,67 @@ export function installStore(ctx: CollabContext): StateStore {
     }
   }
 
+  /**
+   * 官方 Agent Teams 在跑任务的只读写域（0.11.0）。**唯一**碰 `ctx.agentTeams` 的地方之一。
+   *
+   * 为什么要"活读 + 三态"：
+   *   - 服务可能根本不在（未启用 agent-team bundle）⇒ 返回 null，调用方一字不加（README 的定位契约）；
+   *   - `listTasks(caller)` 以**活 Agent** 作授权凭据，非成员会抛 TEAM_NOT_MEMBER，所以整个调用包在
+   *     try/catch 里，任何异常都折叠成 null（"读不到" ≠ "没有任务"）；
+   *   - agents 服务可能迟到，因此每次调用现场 `ctx.get('agents')`/`ctx.get('agentTeams')`，
+   *     与 familyIds/descendantIds 的活读纪律一致（store.ts 顶部注释）。
+   *
+   * 只取 `status === 'in_progress'` 且 `writeScopes` 非空的任务：官方任务一被 claim 就进 in_progress
+   * （实测 `team_task_update action=claim` → status:"in_progress"），那正是"在跑"的口径。
+   */
+  function teamTasks(agent?: AgentLike): TeamScopeTask[] | null {
+    try {
+      const svc = ctx.get('agentTeams') as AgentTeamsServiceLike | undefined
+      if (!svc || typeof svc.listTasks !== 'function' || !agent) return null
+      const rows = svc.listTasks(agent)
+      if (!Array.isArray(rows)) return null
+      const out: TeamScopeTask[] = []
+      for (const r of rows) {
+        if (!r || typeof r !== 'object') continue
+        const id = typeof r.id === 'string' ? r.id : (r.id === undefined || r.id === null ? '' : String(r.id))
+        if (!id) continue
+        const status = typeof r.status === 'string' ? r.status : ''
+        if (status !== 'in_progress') continue
+        const scopes = Array.isArray(r.writeScopes)
+          ? r.writeScopes.filter((s: unknown): s is string => typeof s === 'string' && s.trim().length > 0)
+          : []
+        if (!scopes.length) continue
+        const t: TeamScopeTask = {
+          id,
+          subject: typeof r.subject === 'string' ? r.subject : '',
+          status,
+          writeScopes: scopes
+        }
+        if (typeof r.ownerName === 'string' && r.ownerName) t.ownerName = r.ownerName
+        out.push(t)
+      }
+      // 确定性顺序（官方按创建序返回，这里再按 id 排一次，保证同一集合渲染同一串文本）。
+      out.sort((a, b) => a.id.localeCompare(b.id))
+      return out
+    } catch (e) {
+      return null
+    }
+  }
+
   async function overviewOp(agentId: string | null, agent?: AgentLike): Promise<ToolResult> {
     const { state, target, stateDir, warn } = await load(agentId, agent)
     const t = now()
     expire(state, t)
     const o = overview(state)
     const other = await otherProjects(target, t)
+    // 官方团队在跑任务的 advisory 写域（0.11.0）：**输出侧附加**，与 otherProjects 同一纪律。
+    // 服务缺席 ⇒ 一个字段都不加（一字不变）；服务在场但此刻没有在跑任务 ⇒ `teamTasks: []` + 明说。
+    const team = teamTasks(agent)
+    const teamField = team === null
+      ? {}
+      : (team.length
+        ? { teamTasks: team, teamTasksNote: '来自官方 Agent Teams 的在跑任务；write_scopes 是 advisory，不参与本插件的门控' }
+        : { teamTasks: [], teamTasksNote: '官方 Agent Teams 服务在场：此刻没有在跑任务' })
     return {
       ok: true,
       data: withWarn(Object.assign({
@@ -459,7 +523,7 @@ export function installStore(ctx: CollabContext): StateStore {
         serverTime: t,
         totalClaims: o.totalClaims,
         holders: o.holders
-      }, other), warn)
+      }, other, teamField), warn)
     }
   }
 
@@ -519,7 +583,7 @@ export function installStore(ctx: CollabContext): StateStore {
   }
 
   return {
-    fs, now, livenessOf, familyIds, descendantIds, cwdOf, load, mutate, holderOf, hname,
+    fs, now, livenessOf, familyIds, descendantIds, teamTasks, cwdOf, load, mutate, holderOf, hname,
     list, overviewOp, status, msgs, reapOp, waitFor
   }
 }

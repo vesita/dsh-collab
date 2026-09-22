@@ -42,18 +42,32 @@ DSH 自带一套实验性的 `Agent Teams`（`dsh-experimental-agent-team*`）�
 谁在动哪块路径）。官方把文件系统锁与跨进程一致划在能力之外，那一层归本插件；派生成员、任务
 依赖与 CAS 归官方，在本插件里重做就是重复建设。
 
-三条**接缝**（已知边界，写在这里免得每次重新论证）：
+**0.11.0 起两者是互补而不是互不知道**：本插件会读官方**在跑任务**的 `write_scopes` 做交叉预警
+（只报不锁），官方不需要知道本插件存在。这是唯一可行的形态 —— 官方没给第三方插件注册钩子的接口，
+所以预警只落在**本插件这一侧**：一次读（进态势摘要与 `overview`/`claim` 返回）、一次写侧提示
+（团队建/改任务时提示与外部 `collab_lock` 声明的重叠）。服务缺席时本插件的一切输出**一字不变**。
+
+三条**接缝**（已知边界；每条都有 0.11.0 的实测证据，原始命令与输出见
+[`docs/agent-teams-interop-evidence.md`](docs/agent-teams-interop-evidence.md)，进展记在
+[`docs/collab-ux-backlog.md`](docs/collab-ux-backlog.md) §2.21）：
 
 1. **家族豁免在团队内不生效**：teammate 是 Lead 的直属子会话，落在下面「会话家族（血缘）」的
-   豁免范围里，双方都看不见对方的 `collab_lock` 声明。团队内部的占用因此由官方任务 DAG 的
-   `write_scopes` 表达 —— 这条分工成立的前提是"树内确实有人在协调占用"。
+   豁免范围里 —— **自动态势注入与写门控**都不把对方当"别人"（实测 teammate 覆盖写了 Lead 持独占
+   声明的文件，而另一个无血缘会话的同样写入被拒绝）。注意一处更精确的说法：显式
+   `collab_lock op=overview` / `op=status` **看得见**对方的声明，只有自动注入与门控豁免；
+   同一层级的两个 teammate 互不为祖先/后代，故彼此可见。团队内部的占用由官方任务 DAG 的
+   `write_scopes` 表达 —— 而实测那只是 advisory，不挡任何写入。
 2. **同名工具会被遮蔽**：`tool-agent-team` 在成员作用域内遮蔽全局的 `send_message` /
    `list_agents` / `interrupt_agent`（`dsh-experimental-tool-agent-team/README.md:99`），
    它的 profile patch 还会禁用 legacy `tool-subagent*`。本仓库委托纪律里"子代理意外终止先
-   `send_message` 唤醒"这条恢复路径在同装 agent-team 后语义改变，启用前要重新验。
-3. **双向不可见**：官方读不到本插件的声明，本插件也读不到团队的 `write_scopes`。把在跑的团队
-   任务写域当占用报出来（交叉预警）是尚未实现的方向，记在
-   [`docs/collab-ux-backlog.md`](docs/collab-ux-backlog.md)。
+   `send_message` 唤醒"这条恢复路径**实测仍然成立**（teammate 转 inactive 后 `send_message` 真的把它
+   唤醒并跑了第二轮），但词表换了：`list_agents` 只列团队成员、状态词是 running / inactive，
+   `wait_agent` 明确不唤醒 inactive 成员。启用 agent-team 时本插件追加一段面向 teammate 的措辞
+   （`TEAM_DISCIPLINE_ADDENDUM`）；未启用时那段纪律一字不变。
+3. **交叉预警是单向、只报不锁的**：`ctx.agentTeams` 在场时，本插件把官方在跑任务的 `write_scopes`
+   当 advisory 占用读进态势摘要与 `overview` / `claim` 返回，并在团队建/改任务的 `tools/pre-execute`
+   上提示与外部 `collab_lock` 声明的重叠。官方那侧仍然读不到本插件；预警**不改变任何门控语义**
+   （写入该拒的照拒、该放的照放）。
 
 ---
 
@@ -102,11 +116,13 @@ DSH 自带一套实验性的 `Agent Teams`（`dsh-experimental-agent-team*`）�
     ├── collab-pure-logic.mjs        # 纯逻辑回归 + hostCode 内联副本漂移守护
     ├── collab-integration.mjs       # Cordis 插件端到端（fake ctx）
     ├── collab-hostcode-parity.mjs   # 动态宿主形态**行为**对拍（路径 + 三态语义 + holder 回收）
-    ├── collab-inline-parity.mjs     # 两形态**同名函数**逐输出对拍（19 个，含集合回归守护）
+    ├── collab-inline-parity.mjs     # 两形态**同名函数**逐输出对拍（25 个，含集合回归守护）
     ├── collab-contract-derivation.mjs # 契约派生守卫（schema ⇄ d.ts ⇄ Python ⇄ Rust ⇄ 真实工具 schema）
     ├── collab-message-provenance.mjs # 规范守卫：严禁冒充用户（AGENTS.md §1）
     ├── collab-digest-stability.mjs  # 态势摘要文本时间稳定性回归（运行时快照去重）
     ├── collab-awareness.mjs         # 多会话态势注入回归
+    ├── collab-awareness-cross-session.mjs # 跨会话家人/陌生人视角回归
+    ├── collab-agent-teams.mjs       # 官方 Agent Teams 交叉预警（服务缺席 ⇒ 输出一字不变）
     ├── collab-access-gate.mjs       # 访问通知（agent.inject 的 notice 载体）与原生写保护（pre-execute）回归
     ├── collab-readers-push.mjs      # 读者反向注册 + 释放推送 + 子代理回退 + 通知载体回归
     ├── collab-e2e.mjs               # 真实 fs + 临时 DSH_HOME 的端到端回归
@@ -481,7 +497,7 @@ claim 删除并强制刷新后双方都回落通用规范。修复前实测 `6 p
 **三道新的守卫**（都进了 `npm test`）：
 
 - `tests/collab-inline-parity.mjs`：从动态形态的 `hostCode` 字符串里用**括号配对扫描**抽出
-  **全部 19 个两形态同名函数**逐输出对拍。此前只有 `clockUtc` / `renderDigest` 两个被比对；
+  **全部 25 个两形态同名函数**逐输出对拍。此前只有 `clockUtc` / `renderDigest` 两个被比对；
   并用「实测同名集合必须**恰好等于**期望集合」做回归守护——任何一侧新增同名函数却忘记接进对拍都会红。
 - `tests/collab-contract-derivation.mjs`：把「schema 是单一事实源」从**声称**变成**可执行**——
   逐字段核对 `$defs` ⇄ `src/types/collab.d.ts` ⇄ `scripts/collab_models.py` ⇄
@@ -691,7 +707,7 @@ npm test                # 依次运行下列全部测试
 node tests/collab-pure-logic.mjs       # 纯逻辑 + hostCode 漂移守护
 node tests/collab-integration.mjs      # Cordis 插件端到端（fake ctx）
 node tests/collab-hostcode-parity.mjs  # 动态宿主形态**行为**对拍
-node tests/collab-inline-parity.mjs    # 两形态**同名函数**逐输出对拍（20 个 + 集合回归守护）
+node tests/collab-inline-parity.mjs    # 两形态**同名函数**逐输出对拍（25 个 + 集合回归守护）
 node tests/collab-contract-derivation.mjs # 契约派生守卫（schema ⇄ d.ts ⇄ Python ⇄ Rust ⇄ 真实工具 schema）
 node tests/collab-message-provenance.mjs # 规范守卫：严禁冒充用户（AGENTS.md §1）
 node tests/collab-digest-stability.mjs # 态势摘要文本时间稳定性

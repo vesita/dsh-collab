@@ -6,7 +6,7 @@
 // 依赖：状态存取面（store）。对外暴露 AwarenessSurface：delegation 复用它注册常驻纪律块
 // （同一个 systemPrompt 服务、同一个总开关）。
 
-import { renderDigest } from './collab-core.js'
+import { renderDigest, teamTaskScopeLine, teamCrossWarnLine } from './collab-core.js'
 import type { Claim } from './collab-core.js'
 import type { AgentLike, CollabContext, PromptContextService } from './contract.js'
 import type { StateStore } from './store.js'
@@ -84,7 +84,19 @@ export function installAwareness(ctx: CollabContext, store: StateStore): Awarene
           const fam = new Set(store.familyIds(init.id ? String(init.id) : null, init))
           const t = store.now()
           const others = (hit ? hit.claims : []).filter(c => !fam.has(c.holderId) && c.expiresAt > t)
-          return others.length ? renderDigest(others) : OPEN_HINT
+          // 0.11.0 交叉预警（只读、advisory、不改锁语义）：
+          //   - teamTasks 返回 null（服务缺席 / 读不到）⇒ 下面的 teamLine 与 xwarn 都是 null，
+          //     本函数输出**一字不变**，与 overview 的 otherProjects 同一降级纪律；
+          //   - 官方 Agent Teams 的在跑任务写域当作"外部占用"报出来（团队内成员同样看得见自己的任务）；
+          //   - 如果这些写域又与**外部会话**的 collab 声明重叠，再补一句反向预警 —— 官方读不到
+          //     本插件的声明，这里是我们能同时看到两边的唯一位置。
+          const team = store.teamTasks(init)
+          const teamLine = teamTaskScopeLine(team)
+          const xwarn = teamCrossWarnLine(team, others)
+          const lines: string[] = [others.length ? renderDigest(others) : OPEN_HINT]
+          if (teamLine) lines.push(teamLine)
+          if (xwarn) lines.push(xwarn)
+          return lines.join('\n')
         } catch (e) {
           return OPEN_HINT
         }

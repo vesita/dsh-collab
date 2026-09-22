@@ -86,6 +86,31 @@
         "suggestedAction": { "type": "string", "enum": ["wait", "negotiate", "switch_path"], "description": "为 AI 提供的下一步协作决策建议" }
       }
     },
+    "TeamScopeTask": {
+      "type": "object",
+      "description": "官方 Agent Teams 任务的只读视图（在跑任务的 advisory 写域；数据由 dsh-experimental-agent-team 拥有，非本插件状态）",
+      "required": ["id", "status", "writeScopes"],
+      "additionalProperties": true,
+      "properties": {
+        "id": { "type": "string" },
+        "subject": { "type": "string" },
+        "status": { "type": "string", "enum": ["pending", "in_progress", "completed", "deleted"] },
+        "ownerName": { "type": "string" },
+        "writeScopes": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "TeamScopeOverlap": {
+      "type": "object",
+      "description": "团队任务写域与 collab_lock 声明的重叠（advisory 交叉预警，不改变任何门控）",
+      "required": ["taskId", "scope", "path"],
+      "additionalProperties": true,
+      "properties": {
+        "taskId": { "type": "string" },
+        "subject": { "type": "string" },
+        "scope": { "type": "string" },
+        "path": { "type": "string" }
+      }
+    },
     "colabLockParams": {
       "title": "collab_lock 工具参数",
       "type": "object",

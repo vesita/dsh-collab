@@ -282,7 +282,10 @@ function show(set) {
 
 // ------------------------------------------- 一、类型字段集：四份产物逐字段相等
 
-const TYPES = ['Claim', 'Message', 'Holder', 'StateDocument', 'ConflictInfo']
+// TeamScopeTask / TeamScopeOverlap 是输出侧 advisory 类型（官方 Agent Teams 写域 vs collab_lock 声明），
+// 与前面五个模型同为 SSOT 派生，故用同一条逐字段判据。required ∪ optional 已等于 SSOT 的
+// properties 全集，属性名集合无需再单独断言。
+const TYPES = ['Claim', 'Message', 'Holder', 'StateDocument', 'ConflictInfo', 'TeamScopeTask', 'TeamScopeOverlap']
 
 for (const T of TYPES) {
   const sd = defs[T]

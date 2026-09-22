@@ -38,6 +38,7 @@ import { createHarness } from './_harness.mjs'
 import path from 'node:path'
 import os from 'node:os'
 import { readFileSync } from 'node:fs'
+import { loadCosmokit } from './_harness.mjs'
 
 const cordis = await import('@deepseek-ai/cordis').catch(() => import('../node_modules/.pnpm/node_modules/@deepseek-ai/cordis/lib/index.js'))
 const { Context } = cordis
@@ -190,20 +191,16 @@ function makeFs(store, versions, opts = {}, calls) {
   }
 }
 
+const { updateVolatile } = await loadCosmokit()
+
 const settle = () => new Promise((r) => setTimeout(r, 20))
 
 /**
- * 把一份普通配置包装成 Loader 交给插件的形态：`.volatile()` 字段是**稳定引用**
- * （`{ get() }`，见 `@deepseek-ai/cosmokit` 的 `Volatile`），不是普通值。
- * 与 `cordis-plugin-loader` 的 `_commitVolatile` 同形：改值 = 更新引用内容 + 发事件。
+ * 交给 `ctx.plugin` 的**普通** Config。cordis 会按插件自己的 `Config` schema 校验它，
+ * 并把 `.volatile()` 字段换成引用 —— 测试不要再手工造 `{ get, set }`（见 tests/_harness.mjs 顶部）。
  */
-function volatileConfig(values) {
-  const refs = {}
-  for (const [key, value] of Object.entries(values)) {
-    const box = { current: value }
-    refs[key] = { get: () => box.current, set: (next) => { box.current = next } }
-  }
-  return refs
+function pluginConfig(values) {
+  return values
 }
 
 /**
@@ -265,7 +262,7 @@ async function makeHarness(opts = {}) {
   }
   const fiber = await ctx.plugin(collabPlugin, opts.devConfig
     ? undefined
-    : volatileConfig(Object.assign({ exposeDelegationDiscipline: true, enforceWriteLock: true }, opts.settings || {})))
+    : pluginConfig(Object.assign({ exposeDelegationDiscipline: true, enforceWriteLock: true }, opts.settings || {})))
   await settle()
 
   const readState = () => JSON.parse(store.get(statePath) || '{}')
@@ -280,7 +277,7 @@ async function makeHarness(opts = {}) {
     const config = fiber.config
     const paths = []
     for (const key of Object.keys(patch)) {
-      config[key].set(patch[key])
+      updateVolatile(config[key], { get: () => patch[key] })
       paths.push([key])
     }
     ctx.emit('loader/volatile-update', paths)

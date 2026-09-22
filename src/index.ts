@@ -35,7 +35,7 @@ export type {
 } from './contract.js'
 export {
   CLIENT_SKILL_ROUTE, DELEGATION_SETTINGS_NAMESPACE, DELEGATION_SETTINGS_SCHEMA,
-  DELEGATION_SETTINGS_ENTRY, DELEGATION_DISCIPLINE_TEXT,
+  DELEGATION_SETTINGS_ENTRY, DELEGATION_DISCIPLINE_TEXT, TEAM_DISCIPLINE_ADDENDUM,
   TOOL_PATH_SPECS, COMMAND_AWARE_TOOL, pathArgsFor,
   collectPathCandidates, accessSignature, sessionIdOf
 } from './spec.js'
@@ -62,10 +62,18 @@ export function apply(ctx: CollabContext, config?: Record<string, unknown> | nul
   installAccess(ctx, store)
   const surface = installAwareness(ctx, store)
   const prefs = installDelegation(ctx, surface, config)
-  installGate(ctx, store, prefs)
+  // gate 额外的第 4 个面是 push（0.11.0 反向交叉预警的 advisory 投递）。
+  // 它**只用于投递提示**：门控判定本身仍只用 store + prefs。
+  installGate(ctx, store, prefs, push)
   installAutoRelease(ctx, store, push, prefs)
   installTools(ctx, store, push)
   installClientRoute(ctx)
 }
 
-export default { name, inject, apply }
+// **默认导出必须带上 `Config`**：Loader 是从插件对象的 `Config` 投影出条目配置的
+// （`cordis/lib/index.js:1347` 的 `resolveConfig(this.runtime, config)`，`runtime` 就是这里的
+// 默认导出对象），插件页的配置表单同样由它驱动。0.10.0 把偏好迁到 profile Config 时漏了这一项，
+// 于是 `Config` 只有具名导出、`fiber.runtime.Config` 是 undefined —— 浏览器半边的卡片注册得好好的，
+// 却整张没有内容可渲染（`dsh-tool-cordis` 的 Config 检视会如实报 `status: 'absent'`）。
+// tests/collab-client-config-page.mjs 的 ⑦ 就是这条的机械守卫。
+export default { name, inject, apply, Config }
