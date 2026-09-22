@@ -1,7 +1,7 @@
 {
   "name": "dsh-collab",
-  "version": "0.11.0",
-  "description": "Multi-agent real-time collaboration & concurrency lock plugin for DSH",
+  "version": "0.11.1",
+  "description": "DSH 插件：多会话协作与路径占用管理 —— 会话之间实时同步占用状态，动手前声明、冲突时协商、完成后释放",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/collab.d.ts",
