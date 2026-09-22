@@ -21,6 +21,40 @@
 > [`docs/dsh-subagent-routing.md`](docs/dsh-subagent-routing.md) —— **那是文档，不是提示词**，
 > 不进 `skills/`、不进运行时纪律文本。
 
+## 与官方 Agent Teams 的分工（定位）
+
+DSH 自带一套实验性的 `Agent Teams`（`dsh-experimental-agent-team*`）：安装后是**关**的，
+安装层把它登记在 `OPTIONAL_BUNDLES` 里，没有任何内置 profile 模板启用它
+（`dsh-app-boot/lib/index.js:347`、`dsh-experimental-agent-team-profile/README.md:105`）。
+两者**同域不同层**：
+
+| | 官方 Agent Teams | 本插件（Collab） |
+| --- | --- | --- |
+| 解决的问题 | **一个会话干不完**：隐式 Lead 派生具名 teammate | **互不相识的会话看不见彼此**：同一 checkout 上的路径占用 |
+| 拓扑 | 树内：Lead → 直属 teammate（`TeamId` = Lead 的 `SessionId`，`dsh-experimental-agent-team/lib/types/types.d.ts:5`） | 树间：平级会话 / 子代理 / 不同 dsh 进程 |
+| 伙伴怎么来 | `spawn_teammate` 现造，`fresh` 或 `fork` | 本来就在那儿：先声明路径，再动手 |
+| 共享什么 | 持久信箱 + 共享任务 DAG（`team_task_*`，revision CAS） | 租约式路径声明（`collab_lock`）+ 留言板（`collab_board`） |
+| 文件冲突 | `write_scopes` 明确是 advisory：*"advisory, not a lock"*（`dsh-experimental-tool-agent-team/lib/index.js:23`） | 路径占用 + 原生写门控，唯一带"这块归谁"语义的一层 |
+| 跨进程 | 不支持：一个进程一个 Team、共享同一个 checkout（`dsh-experimental-agent-team/README.md:202,206`） | 状态按项目 cwd 派生落盘，跨进程共享 |
+| 默认 | 关（experimental，*"carries no stability promise"*） | 常驻（profile 插件条目 `collab`） |
+
+**判据一句话**：官方管**树内**（谁干什么活、活之间的依赖），本插件管**树间**（同一个仓库里
+谁在动哪块路径）。官方把文件系统锁与跨进程一致划在能力之外，那一层归本插件；派生成员、任务
+依赖与 CAS 归官方，在本插件里重做就是重复建设。
+
+三条**接缝**（已知边界，写在这里免得每次重新论证）：
+
+1. **家族豁免在团队内不生效**：teammate 是 Lead 的直属子会话，落在下面「会话家族（血缘）」的
+   豁免范围里，双方都看不见对方的 `collab_lock` 声明。团队内部的占用因此由官方任务 DAG 的
+   `write_scopes` 表达 —— 这条分工成立的前提是"树内确实有人在协调占用"。
+2. **同名工具会被遮蔽**：`tool-agent-team` 在成员作用域内遮蔽全局的 `send_message` /
+   `list_agents` / `interrupt_agent`（`dsh-experimental-tool-agent-team/README.md:99`），
+   它的 profile patch 还会禁用 legacy `tool-subagent*`。本仓库委托纪律里"子代理意外终止先
+   `send_message` 唤醒"这条恢复路径在同装 agent-team 后语义改变，启用前要重新验。
+3. **双向不可见**：官方读不到本插件的声明，本插件也读不到团队的 `write_scopes`。把在跑的团队
+   任务写域当占用报出来（交叉预警）是尚未实现的方向，记在
+   [`docs/collab-ux-backlog.md`](docs/collab-ux-backlog.md)。
+
 ---
 
 ## 目录结构
@@ -228,6 +262,10 @@ agents.currentInitiator()            → 正在装配的那个会话
 | `awareness.ts` | 常驻态势摘要（不把自家子代理报成"其他会话占用"，backlog §2.2） |
 | `access.ts` | 访问通知（不为自家人发通知） |
 | `collab-plugin.host.ts` | 动态形态的内联副本（同上五处，由 parity 测试对拍） |
+
+**边界**：这条豁免的前提是"同一棵树里的子代理与我共享同一写域"。当树里跑的是官方 `Agent Teams`
+的 teammate（长期并行、各有独立任务）时，树内占用归团队任务 DAG 的 `write_scopes` —— 见
+「与官方 Agent Teams 的分工（定位）」。
 
 **三条纪律**：
 

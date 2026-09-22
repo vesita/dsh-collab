@@ -256,6 +256,23 @@
 
 ---
 
+### 2.21 与官方 Agent Teams 的接缝：家族豁免 + 双向不可见【代码依据 + 未验证】
+
+- **场景**：同一棵会话树里跑官方 `Agent Teams` 的 teammate（`spawn_teammate` 造出的直属
+  continuable 子会话，`TeamId` = Lead 的 `SessionId`）时，两边都看不见对方的路径声明。
+- **代码依据（本仓库侧）**：`store.familyIds()` 的口径是"自己 + 祖先链 + 后代"
+  （`src/store.ts:194-195`），teammate 作为直属后代命中豁免 ⇒ `awareness.ts:82-84` 的态势摘要、
+  `access.ts:63-65` 的访问通知、`collab-core.inFamily` 的冲突判据都不把它当"别人"。
+  官方侧的写域只是 advisory（`dsh-experimental-tool-agent-team/lib/index.js:23`），因此树内
+  没有任何强制的占用可见性。
+- **未验证**：teammate 会话是否真的拿到本插件的态势注入（是否装配 `systemPrompt.context`）；
+  以及同族互不可见在真实团队工作流里是否真造成覆盖写。要在装了 agent-team bundle 的部署里实测。
+- **可能的方向**（不改锁语义、不重复官方任务 DAG 的前提）：把官方在跑任务的 `write_scopes`
+  当占用读出来并进态势摘要 / 冲突判据（交叉预警）；反向则是在团队建任务时提示与外部
+  `collab_lock` 声明的重叠。两者都要 `ctx.agentTeams` 在场，本部署当前没有这个服务。
+
+---
+
 ## 3. 噪声与重复
 
 ### 3.1 常驻占用行每轮都在上下文里【一手】

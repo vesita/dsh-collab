@@ -383,9 +383,12 @@ Holder = {
 
 ## 13. 与 DSH `agentTeams` 的关系
 
-- `agentTeams` 已提供进程内团队的消息/任务能力（lead session 支撑），**面向"一个 lead 管多个 teammate"的层级协作**；
-- 本插件面向**平级多会话共享工作区的文件级协调**，两者互补；
-- v2 可选桥接：留言板消息可经 `agentTeams.sendMessage` 转发到团队流（开关控制），避免重复实现消息投递；v1 保持独立、零依赖。
+设计期的结论（v0.2）：`agentTeams` 面向"一个 lead 管多个 teammate"的层级协作，本插件面向平级
+多会话共享工作区的文件级协调，两者互补；v1 独立零依赖，v2 再评估桥接 `sendMessage`。
+
+**现行分工**（官方九工具面、advisory `write_scopes`、官方自己划出的"无文件锁 / 不跨进程"边界，
+以及家族豁免、同名工具遮蔽两处接缝）见 [`../README.md`](../README.md) 的
+「与官方 Agent Teams 的分工（定位）」一节 —— 那是这条事实的**唯一出处**，本文档不再重复。
 
 ---
 
