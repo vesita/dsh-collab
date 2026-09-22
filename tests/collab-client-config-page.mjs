@@ -11,9 +11,11 @@
  *   ③ 命名空间与 Host 半边的条目 id 逐字一致（`collab`）；
  *   ④ 走官方的 store→React 通道：`inject()` 交出 `hooks: { <name>: store }`，
  *      组件里用 `props.use<Name>(selector)` 读——不许自己造订阅；
- *   ⑤ 用官方表单原语（`SettingsForm` / `SettingsValueField` / `SettingsFormModel`），
- *      保存语义由它们承担，不许手搓"每按键即写盘"或自造保存按钮；
- *   ⑥ 四个字段名与 Host 半边 Config schema 逐字一致（编译产物里也要能看见）。
+ *   ⑤ 用官方表单原语（`SettingsForm` / `SettingsValueField` / `Switch` / `SettingsFormModel`），
+ *      保存语义由它们承担，不许手搓"每按键即写盘"或自造保存按钮；三个布尔字段的控件是
+ *      官方 `Switch`（`SettingsValueField` 画的是文本框），数字字段仍走 `SettingsValueField`；
+ *   ⑥ 四个字段名与 Host 半边 Config schema 逐字一致（编译产物里也要能看见）；
+ *   ⑦ 布尔开关的初值/拨动/重置都只暂存文本（`on`/`off`），只读部署里连同数字字段一起禁用。
  *
  * 在 vm 里真实执行 `lib/client.js`（不是读源码猜）：用假槽位注册表接住注册，
  * 用假的 primitives 接住 require，然后逐条断言。
@@ -58,6 +60,26 @@ const fakeStore = () => ({
   dispose() {}
 })
 
+/**
+ * 假的官方 primitives：形状与真的一致到「组件能挂、能点」，`Switch` 是本轮新增的
+ * 布尔控件（`SettingsValueField` 画的是文本框，所以三个布尔字段改挂它）。
+ */
+const primitivesStub = {
+  SettingsForm: function SettingsForm() {},
+  SettingsValueField: function SettingsValueField() {},
+  Switch: function Switch() {},
+  SettingsFormModel: class SettingsFormModel {
+    constructor(scope, specs, secrets) {
+      formModelSpecs = { scope, specs, secrets }
+    }
+    bind() { return fakeStore() }
+    actions() { return { edit() {}, resetField() {}, save() {}, discard() {} } }
+    dispose() {}
+  },
+  settingsNumberField: (field) => ({ field, kind: 'number' }),
+  settingsTextField: (field) => ({ field, kind: 'text' })
+}
+
 function requireShim(id) {
   requiredIds.push(id)
   if (id === 'react') {
@@ -68,22 +90,7 @@ function requireShim(id) {
       useRef: (initial) => ({ current: initial })
     }
   }
-  if (id === '@deepseek-ai/dsh-client-ui-primitives') {
-    return {
-      SettingsForm: function SettingsForm() {},
-      SettingsValueField: function SettingsValueField() {},
-      SettingsFormModel: class SettingsFormModel {
-        constructor(scope, specs, secrets) {
-          formModelSpecs = { scope, specs, secrets }
-        }
-        bind() { return fakeStore() }
-        actions() { return { edit() {}, resetField() {}, save() {}, discard() {} } }
-        dispose() {}
-      },
-      settingsNumberField: (field) => ({ field, kind: 'number' }),
-      settingsTextField: (field) => ({ field, kind: 'text' })
-    }
-  }
+  if (id === '@deepseek-ai/dsh-client-ui-primitives') return primitivesStub
   throw new Error('client half required an unexpected module: ' + id)
 }
 
@@ -203,6 +210,83 @@ ok('宽限期用 settingsNumberField（数字字段）',
   for (const field of expected) {
     ok(`校验结果里保留 ${field}`, !!validated && field in validated, JSON.stringify(validated && Object.keys(validated)))
   }
+}
+
+// ── ⑧ 布尔字段的控件是官方 Switch（不是文本框）───────────────────────────
+// 机械判定：真渲染这棵树，数控件。`SettingsValueField` 画的是 <input type=="text">，
+// 布尔字段挂它等于让用户手打 "on"/"off"；这里钉住「三个布尔=Switch、数字=ValueField」，
+// 以及拨动/重置只暂存文本、只读部署整行禁用这几条语义。
+{
+  const calls = []
+  const state = {
+    shell: { available: true, writable: true, dirty: false, invalid: false, saving: false, failed: false },
+    exposeDelegationDiscipline: { text: 'on', overridden: false, invalid: false },
+    enforceWriteLock: { text: 'on', overridden: true, invalid: false },
+    releaseOnLoopEnd: { text: 'off', overridden: false, invalid: false },
+    loopEndGraceSec: { text: '15', overridden: false, invalid: false }
+  }
+  const collect = (node, type, out = []) => {
+    if (node == null || typeof node !== 'object') return out
+    if (Array.isArray(node)) {
+      for (const child of node) collect(child, type, out)
+      return out
+    }
+    if (node.type === type) out.push(node)
+    collect(node.children, type, out)
+    return out
+  }
+  const render = (visibleState, actions) => registration.component({
+    useCollabForm: (selector) => selector(visibleState),
+    edit: (field, text) => { calls.push(['edit', field, text]) },
+    resetField: (field) => { calls.push(['reset', field]) },
+    save: () => {},
+    discard: () => {},
+    ...actions
+  })
+  const firstText = (node) => (node.children && node.children.length === 1 ? node.children[0] : undefined)
+
+  const view = render(state)
+  const switches = collect(view, primitivesStub.Switch)
+  ok('三个布尔字段渲染成官方 Switch', switches.length === 3, 'switches=' + switches.length)
+  ok('数字字段仍走官方 SettingsValueField',
+    collect(view, primitivesStub.SettingsValueField).length === 1,
+    'valueFields=' + collect(view, primitivesStub.SettingsValueField).length)
+
+  const byLabel = Object.fromEntries(switches.map((node) => [node.props.label, node]))
+  ok('开关初值来自生效中的值（on / on / off）',
+    byLabel['委托与验收纪律'].props.checked === true
+    && byLabel['原生写保护'].props.checked === true
+    && byLabel['循环终止自动释放'].props.checked === false,
+    JSON.stringify(switches.map((node) => [node.props.label, node.props.checked])))
+  ok('开关旁标出两档状态词（一个滑块说不出「开」代表什么）',
+    collect(view, 'span').some((node) => firstText(node) === '不自动释放'),
+    '状态词未渲染')
+
+  byLabel['循环终止自动释放'].props.onChange(true)
+  ok('拨开关只暂存 on/off 文本，不直接写 Host',
+    JSON.stringify(calls) === JSON.stringify([['edit', 'releaseOnLoopEnd', 'on']]), JSON.stringify(calls))
+  byLabel['原生写保护'].props.onChange(false)
+  ok('关闭方向写的是 off',
+    JSON.stringify(calls[1]) === JSON.stringify(['edit', 'enforceWriteLock', 'off']), JSON.stringify(calls))
+
+  const reset = collect(view, 'button').find((node) => firstText(node) === '恢复默认')
+  ok('有覆盖时渲染「恢复默认」', !!reset, '未渲染重置按钮')
+  if (reset) {
+    reset.props.onClick()
+    ok('重置只暂存清空', JSON.stringify(calls[2]) === JSON.stringify(['reset', 'enforceWriteLock']), JSON.stringify(calls))
+  }
+
+  // 负向对照：只读部署里三种控件都不许再拨/再填。
+  calls.length = 0
+  const readonly = render(Object.assign({}, state, {
+    shell: Object.assign({}, state.shell, { writable: false })
+  }))
+  ok('只读部署里三个开关都禁用',
+    collect(readonly, primitivesStub.Switch).every((node) => node.props.disabled === true),
+    '只读时仍可拨动')
+  ok('只读部署里数字字段也禁用',
+    collect(readonly, primitivesStub.SettingsValueField).every((node) => node.props.disabled === true),
+    '只读时仍可输入')
 }
 
 console.log('\n' + (failed === 0 ? 'ALL PASS: ' : 'FAILURES: ') + passed + ' passed, ' + failed + ' failed')

@@ -4,7 +4,7 @@
     /**
      * dsh-collab 的浏览器半边：侧边栏「插件」页里 dsh-collab 那张 bundle 卡上的配置区。
      *
-     * 卡里的「委托与验收纪律」带一个下拉（关闭 / 集群协作）与一个「预览」按钮：
+     * 卡里的「委托与验收纪律」是一个开关（关闭 / 集群协作）与一个「预览」按钮：
      * 预览用 DSH 自己的右侧文档面板打开随包技能正文，**不离开插件页** ——
      * `plugins.bundle.config` 只给 `view` 一个 prop，也拿不到关闭句柄（详见 README）。
      *
@@ -30,12 +30,15 @@
     /**
      * 官方表单原语：本页的**保存 / 放弃 / 暂存**语义全部由它们承担，不自己发明。
      * `SettingsFormModel` 把一个命名空间的暂存编辑投影成组件读的 store；
-     * `SettingsForm` 画保存栏；`SettingsValueField` 画一个带覆盖标记与重置按钮的字段。
+     * `SettingsForm` 画保存栏；`SettingsValueField` 画一个带覆盖标记与重置按钮的字段；
+     * `Switch` 是官方给两态字段的控件（原语里没有布尔字段 helper，`SettingsValueField`
+     * 画的是文本框，所以开关由卡片自己挂）。
      */
     const primitives = require('@deepseek-ai/dsh-client-ui-primitives')
     const SettingsForm = primitives.SettingsForm
     const SettingsValueField = primitives.SettingsValueField
     const SettingsFormModel = primitives.SettingsFormModel
+    const Switch = primitives.Switch
     const settingsNumberField = primitives.settingsNumberField
     const settingsTextField = primitives.settingsTextField
 
@@ -60,13 +63,13 @@
     const SKILL_ROUTE = '/dsh-collab/skill-index'
     /** 侧边栏「插件」页里本插件那张配置卡的键：必须是 bundle 的包名（= package.json 的 name）。 */
     const BUNDLE_KEY = 'dsh-collab'
-    /** 下拉的两档文案。 */
+    /** 「委托与验收纪律」开关的两档状态词。 */
     const OFF_LABEL = '关闭'
     const ON_LABEL = '集群协作'
-    /** 写保护开关的两档文案。 */
+    /** 「原生写保护」开关的两档状态词。 */
     const LOCK_ON_LABEL = '拦截'
     const LOCK_OFF_LABEL = '不拦截'
-    /** 循环终止自动释放的两档文案。 */
+    /** 「循环终止自动释放」开关的两档状态词。 */
     const AUTO_ON_LABEL = '自动释放'
     const AUTO_OFF_LABEL = '不自动释放'
     /**
@@ -186,6 +189,36 @@
       },
       /** 数字后面的单位（"秒"）：只做说明，不可点。 */
       unit: { color: 'var(--dsw-alias-label-tertiary)', fontSize: '12px' },
+      /** 覆盖标记：与 ValueField 里的 Tag 同位，只用文字不上色，免得抢注意力。 */
+      badge: {
+        flex: 'none',
+        color: 'var(--dsw-alias-label-secondary)',
+        fontSize: '12px',
+        lineHeight: 1.5
+      },
+      /** 「恢复默认」：官方字段里的 reset 是同款无边框文字按钮。 */
+      reset: {
+        appearance: 'none',
+        cursor: 'pointer',
+        border: 'none',
+        background: 'none',
+        padding: 0,
+        font: 'inherit',
+        fontSize: '12px',
+        lineHeight: 1.5,
+        color: 'var(--dsw-alias-label-secondary)'
+      },
+      /** 开关旁的两档状态词：一个滑块本身说不出「开」是什么意思。 */
+      state: {
+        flex: 'none',
+        color: 'var(--dsw-alias-label-secondary)',
+        fontSize: '12px',
+        lineHeight: 1.5
+      },
+      /** 字段之间的发丝线（官方 fields.module.css 的 `.field + .field` 同款）。 */
+      hr: { borderTop: '0.5px solid var(--dsw-alias-border-l2)' },
+      /** 预览行：按钮与技能描述同一行，放不下就折行。 */
+      previewRow: { display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' },
       hint: {
         color: 'var(--dsw-alias-label-tertiary)',
         margin: 0,
@@ -238,6 +271,72 @@
         format: (value: any) => (value === false ? 'off' : 'on'),
         parse: (text: string) => ({ kind: 'set', value: text.trim() !== 'off' })
       })
+
+      /**
+       * 一个布尔字段的开关行。
+       *
+       * 表单协议不变：`booleanField` 仍以 "on"/"off" 文本暂存，写回 Host 的仍是真 boolean；
+       * 换掉的只有控件 —— 官方原语没有布尔字段 helper，`SettingsValueField` 画的是文本框，
+       * 所以这里挂官方 `Switch`，并把两态的可读名字放在它旁边（一个滑块本身说不出「开」
+       * 代表什么）。标签用纯文本而不是 `<label for>`：`Switch` 自己带 `label` 无障碍名，
+       * 官方设置页也是这么挂的。
+       *
+       * @param props - 槽位注入的官方表单动作（edit / resetField / save / discard）。
+       * @param state - `useCollabForm` 交给组件的投影：四个字段读数 + `shell`。
+       * @param name - Host Config 里的字段名（与 schema 逐字一致）。
+       * @param label - 字段标题。
+       * @param hint - 字段说明。
+       * @param onText - 打开时的状态词。
+       * @param offText - 关闭时的状态词。
+       */
+      function booleanSwitch(
+        props: any,
+        state: any,
+        name: string,
+        label: string,
+        hint: string,
+        onText: string,
+        offText: string
+      ) {
+        const node = state[name]
+        const locked = !state.shell.writable || state.shell.saving
+        // 与 `booleanField` 的 parse 同一条判据：只有 "off" 是假，其余（含未设置）都是真。
+        const on = node.text !== 'off'
+        return h(
+          'div',
+          { key: name, style: styles.item },
+          h(
+            'div',
+            { style: styles.itemHead },
+            h('span', { style: styles.itemLabel }, label),
+            node.overridden
+              ? h(
+                  'span',
+                  { style: styles.controls },
+                  h('span', { style: styles.badge }, '已覆盖'),
+                  h(
+                    'button',
+                    {
+                      type: 'button',
+                      style: styles.reset,
+                      disabled: locked,
+                      onClick: () => { props.resetField(name) }
+                    },
+                    '恢复默认'
+                  )
+                )
+              : null,
+            h('span', { style: styles.state }, on ? onText : offText),
+            h(Switch, {
+              checked: on,
+              label: label,
+              disabled: locked,
+              onChange: (next: boolean) => { props.edit(name, next ? 'on' : 'off') }
+            })
+          ),
+          h('p', { style: styles.hint }, hint)
+        )
+      }
       const formModel = new SettingsFormModel(scope, [
         booleanField(FIELD),
         booleanField(WRITE_LOCK_FIELD),
@@ -383,6 +482,15 @@
         // 表单未就绪（Host 还没服务这个命名空间）时整块不渲染 —— 官方页面同款：
         // `SettingsForm` 自己在 `available` 为假时画一句「不可用」，所以这里交给它。
         const field = (name: string) => state[name]
+        /**
+         * 字段之间的发丝线。
+         *
+         * 四个字段都是「标题 + 一行说明」的同一种节奏，挨着排会读成一段散文；
+         * 一条分隔线让每一行自成一件事（官方 `fields.module.css` 就是 `.field + .field`
+         * 加同款 0.5px 边框）。顺序上把「循环终止自动释放」与它的宽限期挨着放，
+         * 父子关系靠相邻表达，不再靠读者猜。
+         */
+        const hr = (key: string) => h('div', { key: key, style: styles.hr })
 
         return h(
           SettingsForm,
@@ -392,74 +500,54 @@
             onSave: props.save,
             onDiscard: props.discard
           },
-          h(SettingsValueField, {
-            id: 'plugin-config-collab-discipline',
-            label: '委托与验收纪律',
-            hint: '集群协作：把委托与验收纪律文本注入会话上下文，并注册随包技能；关闭则两者都撤回。',
-            overriddenLabel: '已覆盖',
-            resetLabel: '恢复默认',
-            invalidLabel: '只能是 on 或 off',
-            disabled: !state.shell.writable || state.shell.saving,
-            ...field(FIELD),
-            onEdit: (text: string) => { props.edit(FIELD, text) },
-            onReset: () => { props.resetField(FIELD) }
-          }),
-          skill.status === 'error'
-            ? h('p', { style: styles.failed, role: 'status' }, '无法读取技能信息：' + skill.error)
-            : null,
-          skill.status === 'ready' && skill.skill !== null
-            ? h(
-                'div',
-                { style: styles.previewRow },
-                h('button', {
-                  type: 'button',
-                  style: styles.button,
-                  onClick: () => {
-                    setNotice(null)
-                    preview()
-                  }
-                }, '预览技能正文'),
-                h('span', { style: styles.hint }, skill.skill.description)
-              )
-            : null,
-          h(SettingsValueField, {
-            id: 'plugin-config-collab-write-lock',
-            label: '原生写保护',
-            hint: '拦截：写入/修改他人已声明占用的路径前先走原生审批（本部署没有审批提示时，ask 会变成硬拒绝）；关闭则完全不拦。',
-            overriddenLabel: '已覆盖',
-            resetLabel: '恢复默认',
-            invalidLabel: '只能是 on 或 off',
-            disabled: !state.shell.writable || state.shell.saving,
-            ...field(WRITE_LOCK_FIELD),
-            onEdit: (text: string) => { props.edit(WRITE_LOCK_FIELD, text) },
-            onReset: () => { props.resetField(WRITE_LOCK_FIELD) }
-          }),
-          h(SettingsValueField, {
-            id: 'plugin-config-collab-auto-release',
-            label: '循环终止自动释放',
-            hint: '会话循环停下（空闲超过下面的秒数）后，它持有的声明会被自动释放，让等在后面的会话能接着干；宽限期内被唤醒则取消释放。',
-            overriddenLabel: '已覆盖',
-            resetLabel: '恢复默认',
-            invalidLabel: '只能是 on 或 off',
-            disabled: !state.shell.writable || state.shell.saving,
-            ...field(AUTO_RELEASE_FIELD),
-            onEdit: (text: string) => { props.edit(AUTO_RELEASE_FIELD, text) },
-            onReset: () => { props.resetField(AUTO_RELEASE_FIELD) }
-          }),
-          h(SettingsValueField, {
-            id: 'plugin-config-collab-grace',
-            label: '空闲宽限期（秒）',
-            hint: '夹在 [1, 3600]。0 会把「每个回合之间的停顿」也算成循环终止。',
-            overriddenLabel: '已覆盖',
-            resetLabel: '恢复默认',
-            invalidLabel: '请填一个数字',
-            numeric: true,
-            disabled: !state.shell.writable || state.shell.saving,
-            ...field(AUTO_RELEASE_GRACE_FIELD),
-            onEdit: (text: string) => { props.edit(AUTO_RELEASE_GRACE_FIELD, text) },
-            onReset: () => { props.resetField(AUTO_RELEASE_GRACE_FIELD) }
-          }),
-          notice !== null ? h('p', { style: styles.hint, role: 'status' }, notice) : null
+          h(
+            'div',
+            { style: styles.page },
+            booleanSwitch(props, state, FIELD, '委托与验收纪律',
+              '集群协作：把委托与验收纪律文本注入会话上下文，并注册随包技能；关闭则两者都撤回。',
+              ON_LABEL, OFF_LABEL),
+            skill.status === 'error'
+              ? h('p', { style: styles.failed, role: 'status' }, '无法读取技能信息：' + skill.error)
+              : null,
+            skill.status === 'ready' && skill.skill !== null
+              ? h(
+                  'div',
+                  { style: styles.previewRow },
+                  h('button', {
+                    type: 'button',
+                    style: styles.button,
+                    onClick: () => {
+                      setNotice(null)
+                      preview()
+                    }
+                  }, '预览技能正文'),
+                  h('span', { style: styles.hint }, skill.skill.description)
+                )
+              : null,
+            hr('hr-discipline'),
+            booleanSwitch(props, state, WRITE_LOCK_FIELD, '原生写保护',
+              '拦截：写入/修改他人已声明占用的路径前先走原生审批（本部署没有审批提示时，ask 会变成硬拒绝）；关闭则完全不拦。',
+              LOCK_ON_LABEL, LOCK_OFF_LABEL),
+            hr('hr-lock'),
+            booleanSwitch(props, state, AUTO_RELEASE_FIELD, '循环终止自动释放',
+              '会话循环停下（空闲超过下面的秒数）后，它持有的声明会被自动释放，让等在后面的会话能接着干；宽限期内被唤醒则取消释放。',
+              AUTO_ON_LABEL, AUTO_OFF_LABEL),
+            hr('hr-loop'),
+            h(SettingsValueField, {
+              id: 'plugin-config-collab-grace',
+              label: '空闲宽限期（秒）',
+              hint: '夹在 [1, 3600]。0 会把「每个回合之间的停顿」也算成循环终止。',
+              overriddenLabel: '已覆盖',
+              resetLabel: '恢复默认',
+              invalidLabel: '请填一个数字',
+              numeric: true,
+              disabled: !state.shell.writable || state.shell.saving,
+              ...field(AUTO_RELEASE_GRACE_FIELD),
+              onEdit: (text: string) => { props.edit(AUTO_RELEASE_GRACE_FIELD, text) },
+              onReset: () => { props.resetField(AUTO_RELEASE_GRACE_FIELD) }
+            }),
+            notice !== null ? h('p', { style: styles.hint, role: 'status' }, notice) : null
+          )
         )
       }
 

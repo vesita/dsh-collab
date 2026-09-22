@@ -56,11 +56,11 @@ ${DSH_HOME:-$HOME/.dsh}/collab/projects/<项目名>-<哈希>.json
 
 ### 1.4 委托纪律，以及在哪里关掉它
 
-除态势摘要外，插件还注入一段常驻的**委托与验收纪律**，并随包注册 `subagent-delegation` 技能，默认开启。它是插件的一行配置：侧边栏 **Plugins** → `dsh-collab` 卡片里的下拉选择框（集群协作 / 关闭），对应 Config 字段 `exposeDelegationDiscipline`（布尔，默认 `true`，改动不需要重载插件）。
+除态势摘要外，插件还注入一段常驻的**委托与验收纪律**，并随包注册 `subagent-delegation` 技能，默认开启。它是插件的一行配置：侧边栏 **Plugins** → `dsh-collab` 卡片里的开关（旁边标着当前状态词「集群协作」/「关闭」），对应 Config 字段 `exposeDelegationDiscipline`（布尔，默认 `true`，改动不需要重载插件）。
 
 不选「关闭」时，纪律文本与随包技能都不再注册，**中央注册锁与协作留言板照常可用**。设置是活读的，改完立即生效，无需重启 dsh。完整说明见 README 的「委托纪律偏好与设置卡片」。
 
-同一个标签页上还有「原生写保护」下拉（拦截 / 不拦截，字段 `enforceWriteLock`，默认 `true`，同样活读）：开启时，写 / 改目标路径被**他人未过期的 `exclusive` 声明覆盖**会走原生审批路径拦截（本类部署通常没有审批提示，`ask` 等价于硬拒绝）；`shared` / `read` 声明不产生任何门控。`bash` / `pwsh` 没有目标路径参数，不受该门控保护。详见 README「功能 C」。
+同一个标签页上还有「原生写保护」开关（拦截 / 不拦截，字段 `enforceWriteLock`，默认 `true`，同样活读）：开启时，写 / 改目标路径被**他人未过期的 `exclusive` 声明覆盖**会走原生审批路径拦截（本类部署通常没有审批提示，`ask` 等价于硬拒绝）；`shared` / `read` 声明不产生任何门控。`bash` / `pwsh` 没有目标路径参数，不受该门控保护。详见 README「功能 C」。
 
 ---
 
