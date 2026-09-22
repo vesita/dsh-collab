@@ -138,7 +138,7 @@
 | `timer` 服务（`ctx.timer`，需 `inject`） | timeout / interval | 租约到期扫描 + 惰性过期兜底 |
 | `tools` 服务 / `Tool.listTools` | 现有工具名已确认：`collab_*` 无冲突 | 工具命名 |
 | `systemPrompt` 服务 | `section()` / `context()` / `tools()` | v2 可选：向模型上下文注入实时占用摘要 |
-| Client 插槽 | `sidebar.footer.action`（list, additive）、`shell.overlay`（list）、`tool.call.toolview`（keyed）、`settings.plugins.tab` | 面板落点 |
+| Client 插槽 | 实际落点：`plugins.bundle.config`（keyed，键为组合包包名）—— 侧边栏**插件**页里本组合包那张卡上的配置区 | 面板落点 |
 | `agentTeams` | sendMessage / createTask / waitForChange（lead session log 支撑） | v2 可选桥接 |
 
 ### 5.2 选型决策

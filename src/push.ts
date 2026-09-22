@@ -19,11 +19,11 @@
 //      **绝不回退**到任何会冒充用户的通道。
 //
 // 消息由**真实的** `@deepseek-ai/dsh-llm`（peer + dev 依赖）构造，source 显式非 user：
-//   { kind: 'plugin', plugin: 'dsh-collab', form: 'notice', summary: boundContextSummary(…) }
+//   { kind: 'dsh-collab', form: 'notice', summary: boundContextSummary(…) }
 // 客户端的分流**只看 `source.kind`**，且发生在收件箱分类**之前**
-// （`dsh-client-ui-chat/lib/client.js:6058`）：`kind==='plugin'` + `form:'notice'` + **非空 summary**
+// （`dsh-client-ui-chat/lib/client.js:8757`）：`kind !== 'user'` + `form:'notice'` + **非空 summary**
 // ⇒ 渲染成独立可折叠的 `ContextInjectionRow`，**无论投进哪个收件箱都不是气泡**。
-// `summary` 必须非空，否则会退化成 opaque 行（`client.js:795-800`）；120 字符上限由
+// `summary` 必须非空，否则会退化成 opaque 行（`client.js:825-831`）；120 字符上限由
 // `boundContextSummary` 保证。**不许**手抄构造函数副本（AGENTS.md 明令）。
 //
 // 依赖：状态存取面（store）—— 存活闸门 livenessOf / 状态改写 mutate / 显示名 hname。
@@ -167,15 +167,14 @@ export function installPush(ctx: CollabContext, store: StateStore): PushApi {
   /**
    * 释放通知消息：**显式标注来源的 notice**（AGENTS.md §1 允许且要求的形态）。
    * `form: 'notice'` 必须带非空 `summary`，否则客户端会把它退化成 opaque 行
-   * （`dsh-client-ui-chat/lib/client.js:795-800` 的 `case "notice"` 先算 `noticeSummary`）。
+   * （`dsh-client-ui-chat/lib/client.js:825-831` 的 `case "notice"` 先算 `noticeSummary`）。
    * role / id / 深冻结全部由真实的构造函数补，本仓库不自造。
    */
   function releaseNoticeMessage(parts: { text: string; summary: string }) {
     return createUserMessage({
       content: [{ type: 'text' as const, text: parts.text }],
       source: {
-        kind: 'plugin' as const,
-        plugin: 'dsh-collab',
+        kind: 'dsh-collab' as const,
         form: 'notice' as const,
         summary: parts.summary
       }

@@ -1,17 +1,17 @@
 // src/delegation.ts
-// **委托纪律：偏好在 settings（可选服务），默认开**。技能正文随包走，常驻纪律块是常量。
-// 服务缺失、文件缺失、解析失败一律静默跳过，绝不抛、也绝不阻断工具注册。
+// **委托纪律：偏好是本插件的 Config volatile 字段，默认开**。技能正文随包走，常驻纪律块是常量。
+// 字段缺失、文件缺失、解析失败一律静默跳过，绝不抛、也绝不阻断工具注册。
 //
 // 依赖：运行时上下文注册面（surface，来自 awareness）。
 // 对外暴露偏好读取面：gate 用它做写保护总开关（活读，不是快照）。
 
 import { dirname } from 'node:path'
 import {
-  DELEGATION_SETTINGS_NAMESPACE, DELEGATION_SETTINGS_SCHEMA, DELEGATION_SETTINGS_ENTRY, DELEGATION_DISCIPLINE_TEXT,
+  DELEGATION_SETTINGS_ENTRY, DELEGATION_DISCIPLINE_TEXT,
   LOOP_END_GRACE_SEC_DEFAULT, LOOP_END_GRACE_SEC_MIN, LOOP_END_GRACE_SEC_MAX
 } from './spec.js'
 import { loadBundledSkill } from './skill.js'
-import type { CollabContext, DelegationSettings, SettingsService, SkillsService } from './contract.js'
+import type { CollabContext, DelegationSettings, SkillsService } from './contract.js'
 import type { AwarenessSurface } from './awareness.js'
 
 /** 偏好读取面：installDelegation() 对外暴露的东西（gate 与 auto-release 消费）。 */
@@ -24,15 +24,19 @@ export interface DelegationPrefs {
   loopEndGraceMs(): number
 }
 
-export function installDelegation(ctx: CollabContext, surface: AwarenessSurface): DelegationPrefs {
-  // ---- 委托纪律：偏好在 settings（**可选服务**），默认开 ----
+export function installDelegation(
+  ctx: CollabContext,
+  surface: AwarenessSurface,
+  config?: Record<string, unknown> | null
+): DelegationPrefs {
+  // ---- 委托纪律：偏好是 Config 的 volatile 字段，默认开 ----
   // 技能正文随包走（<pkg>/skills/subagent-delegation/SKILL.md），所以按构建产物的位置解析，
   // 而不是猜用户 ~/.dsh/skills/ 的落点。锁与留言板是产品本体，纪律只是附加项：
-  // 服务缺失、文件缺失、解析失败一律**静默跳过**，绝不抛、也绝不阻断上面的工具注册。
+  // 字段缺失、文件缺失、解析失败一律**静默跳过**，绝不抛、也绝不阻断上面的工具注册。
   //
-  // 关键约束：偏好的值必须**活读**。installSection 会把 setSource 换成返回注册表实时
-  // resolved 值的读取器，用户一改设置 onChange 就触发重新结算 —— 不需要重启进程。
-  // 这里缓存的只是"读取器"，不是值本身。
+  // 关键约束：偏好的值必须**活读**。Loader 改 volatile 字段时是就地更新 Config 引用
+  // （不是重建插件），所以每次读 `ctx.config` 都拿到当前值；`loader/volatile-update`
+  // 到达时重新结算交付物 —— 不需要重启进程。这里缓存的只是"读取器"，不是值本身。
   let readSettings: (() => DelegationSettings) | null = null
   let skillStop: (() => void) | null = null
   let disciplineStop: (() => void) | null = null
@@ -149,25 +153,43 @@ export function installDelegation(ctx: CollabContext, surface: AwarenessSurface)
     } catch (e) {}
   }
 
-  // settings 的接线：可选服务，缺失时保持默认值（开）。
-  // 若此刻 settings 已经可用，则**不**先按默认值落地，等 installSection 把实时读取器交上来
-  // 再由 onChange 结算 —— 否则"偏好为关"时会先注册再撤回，留下一次无谓的瞬时注册。
-  const settingsNow = ctx.get('settings') as SettingsService | undefined
-  const settingsUsable = !!(settingsNow && typeof settingsNow.installSection === 'function')
-  ctx.inject(['settings'], (settingsCtx) => {
+  // 设置的接线（0.1.7）：偏好就是这个插件 Config 上的 volatile 字段，`apply(ctx, config)`
+  // 拿到的是 Loader 解析后的那份 Config。
+  //
+  // 关键：`.volatile()` 字段不是普通值，而是一个**稳定引用**（`{ get() }`，见
+  // `@deepseek-ai/cosmokit` 的 `Volatile` 与 `isVolatile`）。Loader 改一个 volatile 字段时
+  // 并不重载插件 —— 它把新快照提交进同一个引用的内部，再发 `loader/volatile-update`
+  // （`cordis-plugin-loader/lib/index.js` 的 `_commitVolatile`）。所以每次 `get()` 都拿到当前值，
+  // 这里保存的只是"读取器"，不是值本身。官方适配器同款读法：
+  // `dsh-llm-deepseek/lib/index.js:2014` 的 `plainOptions()`。
+  //
+  // 非 volatile 字段是普通值，两种形态都要认；Config 缺席（没有 Loader 的迷你宿主）
+  // 则按 schema 默认值结算，见 DELEGATION_SETTINGS_ENTRY。
+  const readField = (field: keyof DelegationSettings): unknown => {
     try {
-      const settings = settingsCtx.settings
-      if (settings && typeof settings.installSection === 'function') {
-        settings.installSection(ctx, DELEGATION_SETTINGS_NAMESPACE, DELEGATION_SETTINGS_SCHEMA, DELEGATION_SETTINGS_ENTRY, {
-          setSource: (source) => { readSettings = () => source() },
-          onChange: () => { reconcileDelegation() }
-        })
-      }
-    } catch (e) {}
-    // 兜底：installSection 缺席或失败（例如命名空间被占用）时，仍按当时的可读值结算。
-    reconcileDelegation()
+      const raw = config ? config[field] : undefined
+      return raw && typeof (raw as { get?: unknown }).get === 'function'
+        ? (raw as { get(): unknown }).get()
+        : raw
+    } catch (e) {
+      return undefined
+    }
+  }
+
+  /** 布尔开关的读法：缺省、读取异常都按 schema 默认（开）处理。 */
+  const readFlag = (field: keyof DelegationSettings): boolean => readField(field) !== false
+
+  readSettings = () => ({
+    exposeDelegationDiscipline: readFlag('exposeDelegationDiscipline'),
+    enforceWriteLock: readFlag('enforceWriteLock'),
+    releaseOnLoopEnd: readFlag('releaseOnLoopEnd'),
+    loopEndGraceSec: Number(readField('loopEndGraceSec'))
   })
-  if (!settingsUsable) reconcileDelegation()
+
+  // volatile 字段被改：Loader 已把新快照提交进引用，这里只负责按新值结算交付物。
+  ctx.on('loader/volatile-update', () => { reconcileDelegation() })
+
+  reconcileDelegation()
 
   return { enforceWriteLockEnabled, releaseOnLoopEndEnabled, loopEndGraceMs }
 }

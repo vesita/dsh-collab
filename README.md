@@ -146,19 +146,19 @@ agents.currentInitiator()            → 正在装配的那个会话
 
 关闭方式：包形态设置环境变量 `DSH_COLLAB_NO_PROMPT_HINT=1`。受限的动态宿主形态读不到 `process.env`，因此它**始终注入**；需要彻底关闭时请使用包形态。
 
-同一个开关也管住**功能 A 的访问通知**（`plugin: 'dsh-collab'`、`form: 'notice'` 的消息）：它是运行时状态派生出来、再注入进会话的内容，所以 `DSH_COLLAB_NO_PROMPT_HINT=1` 下**不投递**。只关投递 —— 读者反向登记（功能 D）照常发生。这一条由 `tests/collab-access-gate.mjs` 钉住，并配了负向对照（摘掉开关判定 -> 该断言精确变红）。
+同一个开关也管住**功能 A 的访问通知**（`kind: 'dsh-collab'`、`form: 'notice'` 的消息）：它是运行时状态派生出来、再注入进会话的内容，所以 `DSH_COLLAB_NO_PROMPT_HINT=1` 下**不投递**。只关投递 —— 读者反向登记（功能 D）照常发生。这一条由 `tests/collab-access-gate.mjs` 钉住，并配了负向对照（摘掉开关判定 -> 该断言精确变红）。
 
 （受限的**动态宿主形态**不接线 `tools/pre-execute` / `tools/post-execute`，因此它本来就没有访问通知与原生写保护 —— 那是既定环境限制，与这个开关无关。见 `src/collab-plugin.host.ts`。）
 
 ---
 
-## 委托纪律偏好与设置卡片
+## 委托纪律偏好与配置卡
 
 运行时上下文除态势摘要外，还带一段常驻的**委托与验收纪律**；它同时决定随包的 `subagent-delegation` 技能是否注册。两者由包形态的一项设置控制，默认开启：
 
 | 项 | 值 |
 | --- | --- |
-| 设置命名空间 | `dsh-collab` |
+| 配置命名空间（= profile 条目 id） | `collab` |
 | 字段 | `exposeDelegationDiscipline` |
 | 类型 / 默认 | `boolean` / `true` |
 | 字段 | `enforceWriteLock` |
@@ -168,9 +168,9 @@ agents.currentInitiator()            → 正在装配的那个会话
 | 字段 | `loopEndGraceSec` |
 | 类型 / 默认 | `number` / `120`（夹在 `[1, 3600]`；0.9.11 起，此前 15） |
 
-四个字段同属一个命名空间：前两项控制委托纪律与写保护（见上），后两项控制**循环终止自动释放**（见下文「循环终止自动释放」一节）。
+四个字段同属一份配置：前两项控制委托纪律与写保护（见上），后两项控制**循环终止自动释放**（见下文「循环终止自动释放」一节）。
 
-该命名空间经 `ctx.settings.installSection(...)` 注册（schema 由 `@deepseek-ai/schemastery` 描述），因此它出现在设置文档 `${DSH_HOME:-$HOME/.dsh}/settings.yaml` 与设置界面里。值是**活读**的：改完立即生效，无需重启 dsh。命名空间是可选服务，部署里没有 settings 服务时插件按 `true` 行事。
+这份配置就是本插件在 profile 里的 **Config**（0.1.7 起设置由当前 Profile 的插件配置保存，见 `@deepseek-ai/dsh-settings`）：四个字段都声明 `.volatile()`，因此改一个字段**不需要重载插件**——Loader 把新值提交进正在运行的引用，再发 `loader/volatile-update`，插件据此重新结算。值是**活读**的：改完立即生效，无需重启 dsh。迷你宿主没有 Loader 解析配置时，插件按 schema 默认值行事。
 
 开启（默认）时，插件多做两件事：
 
@@ -185,11 +185,13 @@ agents.currentInitiator()            → 正在装配的那个会话
 
 偏好能出现在 UI 里，靠的是插件带的浏览器半边 `lib/client.js`（`package.json` 声明 `dsh.client` 与 `exports["./client"]`）。原因很直接：插件页只**枚举**配置、从不解释它 —— 侧边栏 **Plugins** 页声明了 `plugins.bundle.config` 槽位（keyed，键是 bundle 的包名），由插件自己注册进来：**谁拥有配置，谁自带页面**。
 
-打开侧边栏的 **Plugins**，进 `dsh-collab` 那张 bundle 卡，即可看到三行设置项 —— 「委托与验收纪律」（下拉：关闭 / 集群协作，带一个打开随包技能正文的预览按钮）、「原生写保护」（下拉：拦截 / 不拦截）与「循环终止自动释放」（下拉：自动释放 / 不自动释放 + 宽限期秒数输入框）。控件直接写 Host，改完即保存；三种状态都如实呈现——命名空间尚未就绪时给一行加载占位，本部署没有 Host 半边时整块不渲染，只读部署把控件置灰并说明原因。
+打开侧边栏的 **Plugins**，进 `dsh-collab` 那张组合包卡，即可看到四个字段 —— 「委托与验收纪律」（含一个打开随包技能正文的预览按钮）、「原生写保护」、「循环终止自动释放」与「空闲宽限期（秒）」。页面用官方表单原语画（`SettingsForm` 的保存栏 + `SettingsFormValue` 字段 + `SettingsFormModel` 的暂存）：**改动先暂存，点保存才写 Host**，离开页面即丢弃草稿；被覆盖过的字段带「已覆盖」标记与「恢复默认」按钮。三种状态都如实呈现——Host 还没服务这个命名空间时 `SettingsForm` 自己画一句「不可用」，只读部署把控件置灰并说明原因。
 
 **预览按钮的行为**：点一下**直接**在右侧栏的文档面板打开随包技能正文，没有二次确认，**也不会离开插件页**——插件页照常开着，右侧栏多出一份技能文档。按钮就只是「在右侧栏打开技能文档」，文案与行为一致。
 
 > **本落点拿不到关闭句柄**：`plugins.bundle.config` 只给 `view` 一个 prop（`'summary'` 出标题下的一句话、`'page'` 出表单正文；本槽位实际只被要 `page`），所以页面无法自行关闭或离开。需要关闭能力时改用 `settings.section` 落点——那里是 `renderSlot("settings.section", { close: onClose }, …)`。
+>
+> **配置区出现的条件是条目上有 `config`**：插件页用 `ledger.bundles.has(openPkg.name)` 决定要不要渲染它，而那份账本只收「声明了 volatile 字段的 profile 条目」。所以 profile 的 `cordis.patch.yml` 里必须为 `collab` 写一段 `config`（四个字段的默认值），否则这张卡上没有配置区。
 
 ### 随包发布的委托技能
 
@@ -370,7 +372,7 @@ idle 的 agent 仍在 `agents.list()` 里、仍可唤醒，所以 W7「dispose �
 **现在的行为**：
 
 1. 释放通知的唯一投递面是 `ctx.get('agents').get(sessionId)` 解析到读者**自己的活 agent** 后
-   `agent.inject(createUserMessage({ source: { kind: 'plugin', plugin: 'dsh-collab', form: 'notice',
+   `agent.inject(createUserMessage({ source: { kind: 'dsh-collab', form: 'notice',
    summary: boundContextSummary(…) } }))` —— 来源显式，GUI 里是独立可折叠的 notice 行而非气泡。
    解析不到就**如实跳过**（`skipped.reason = 'agent-not-resolvable'`），**没有任何回退通道**；
    `inject` 是同步契约 ⇒ 不再有 `timeout` 这一态；`prompt-failed` / `not-adjacent` /
@@ -384,7 +386,7 @@ idle 的 agent 仍在 `agents.list()` 里、仍可唤醒，所以 W7「dispose �
 **回归守卫**：
 
 - `tests/collab-readers-push.mjs` 全场景断言旧通道**零调用**，且每条投递的 source 形状为
-  `plugin/notice` + 非空且 ≤120 字符的 summary（负向对照：把 `kind` 改回 `'user'` 即红）；
+  `dsh-collab/notice` + 非空且 ≤120 字符的 summary（负向对照：把 `kind` 改回 `'user'` 即红）；
 - `tests/collab-message-provenance.mjs` 新增机械规则：剥注释后扫 `src/` 与 `lib/`，
   `src/push.ts` 必须经 `agent.inject` + 真身 `createUserMessage`，且**代码里不得再出现**
   `subagents.sendMessage` / `sessionController`（负向对照：分别污染 `src/push.ts` 与 `lib/push.js` 各得一次 RED）；
@@ -471,7 +473,7 @@ claim 删除并强制刷新后双方都回落通用规范。修复前实测 `6 p
 命中且与上一次投递给同一个 agent 的占用集合（`accessSignature`）不同时，经 `agent.inject` **逐事件**
 投递一条**显式标注来源**的 notice 消息：
 `createUserMessage({ content, source })`，其中
-`source = { kind: 'plugin', plugin: 'dsh-collab', form: 'notice', summary: boundContextSummary(...) }`。
+`source = { kind: 'dsh-collab', form: 'notice', summary: boundContextSummary(...) }`。
 客户端按 `source.kind !== 'user'` 把它渲染成 **notice 行、不是用户气泡** —— 来源是明示的，
 冒充不了真人；`summary` 缺失时才会退化成 **opaque** 行，所以它必须非空（≤ 120 字符）。
 工具结果**原样返回**（`post-execute` 返回 `downstream` 本身，不产生 `content` / `value` /
@@ -481,7 +483,8 @@ claim 删除并强制刷新后双方都回落通用规范。修复前实测 `6 p
 
 > **规范**：**严禁冒充用户**（见 `AGENTS.md` §1）—— 消息可以投，来源必须诚实。
 > 构造一律走**真实的** `@deepseek-ai/dsh-llm`：`id` / `role` / 深冻结全部由构造函数补，
-> `source` 显式 `plugin/notice` 且 `form:'notice'` 必须带非空 `summary`。
+> `source` 显式 `dsh-collab/notice`（`kind` 在 `src/contract.ts` 里 augment `MessageSourceMap`
+> 声明，0.1.7 起没有通用的 `plugin` 兜底种类）且 `form:'notice'` 必须带非空 `summary`。
 
 通知文案与态势摘要同源：只用**绝对 UTC 租约窗口**，不含倒计时。
 
@@ -508,7 +511,7 @@ claim 增加可读性维度（`readable`，默认 `true`；缺字段的老状态
 > **已知旁路**：shell 类工具（`bash` / `pwsh`）没有"目标路径"参数，无法在不制造假阳性
 > 的前提下解析其 `command`，因此**不在**写工具表里 —— 通过 shell 写入不受本门控保护。
 
-设置里新增开关 `enforceWriteLock`（`dsh-collab` 命名空间，默认 **`true`**，活读，无需重启）。
+设置里新增开关 `enforceWriteLock`（`collab` 命名空间，默认 **`true`**，活读，无需重启）。
 
 ### 功能 D — 读者反向注册 + 释放推送
 
@@ -537,14 +540,14 @@ ctx.get('agents')          // 进程内的 agents 注册表
   → agents.get(sessionId)  // 解析读者**自己的活 agent**
   → agent.inject(createUserMessage({
       content: [{ type: 'text', text }],
-      source: { kind: 'plugin', plugin: 'dsh-collab', form: 'notice', summary: boundContextSummary(…) }
+      source: { kind: 'dsh-collab', form: 'notice', summary: boundContextSummary(…) }
     }))
 ```
 
 * **来源显式、不冒充用户**：消息由**真实的** `@deepseek-ai/dsh-llm` 的 `createUserMessage`
-  构造，`source` 显式写成 `plugin/notice`（`summary` 非空，经 `boundContextSummary` 截到
+  构造，`source` 显式写成 `dsh-collab/notice`（`summary` 非空，经 `boundContextSummary` 截到
   120 字符）。客户端的分流只看 `source.kind`，且发生在收件箱分类**之前**
-  （`dsh-client-ui-chat/lib/client.js:6058`）：`kind !== 'user'` ⇒ 渲染成**独立可折叠的 notice
+  （`dsh-client-ui-chat/lib/client.js:8757`）：`kind !== 'user'` ⇒ 渲染成**独立可折叠的 notice
   行**，**无论投进哪个收件箱都不是气泡**。
 * **排除释放者自己**；同一 `(claimId, reader)` 只推一次（幂等键不变，仍**先记账再投递**，
   成功/失败都不再重投）；全部 **best-effort**，绝不抛、绝不影响 release 的返回值。

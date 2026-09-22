@@ -14,6 +14,7 @@
 //   client-route.ts 浏览器半边只读 loopback 路由
 
 import { installStore } from './store.js'
+import { DELEGATION_SETTINGS_SCHEMA } from './spec.js'
 import { installPush } from './push.js'
 import { installAccess } from './access.js'
 import { installAwareness } from './awareness.js'
@@ -28,7 +29,7 @@ import type { CollabContext } from './contract.js'
 export type {
   FileRef, CollabFs, PushOutcome, PushChannel, NotifyOutcome,
   SkillInvocationPolicy, SkillResourceBase, SkillRegistration, SkillsService,
-  DelegationSettings, SettingsSectionHooks, SettingsService,
+  DelegationSettings,
   ConnectionService, WebServerService, CollabSkillItem, CollabSkillIndex,
   BundledSkill, ToolExecContext, CollabArgs, ToolResult, ToolDefinition, CollabContext
 } from './contract.js'
@@ -42,8 +43,13 @@ export { buildSkillIndex } from './skill.js'
 
 export const name = 'dsh-collab'
 export const inject = ['fs', 'timer', 'tools']
+/**
+ * 本插件的 Config schema：偏好的唯一保存处（0.1.7 起设置就是 profile 条目上的 Config）。
+ * 字段全部 `.volatile()` —— 改一个字段不需要重载插件（见 src/spec.ts）。
+ */
+export const Config = DELEGATION_SETTINGS_SCHEMA
 
-export function apply(ctx: CollabContext): void {
+export function apply(ctx: CollabContext, config?: Record<string, unknown> | null): void {
   // 顺序即依赖顺序：
   //   store 是唯一的状态入口；push 只依赖 store；
   //   access 只依赖 store（逐事件 agent.inject，不再用上下文面）；
@@ -55,7 +61,7 @@ export function apply(ctx: CollabContext): void {
   const push = installPush(ctx, store)
   installAccess(ctx, store)
   const surface = installAwareness(ctx, store)
-  const prefs = installDelegation(ctx, surface)
+  const prefs = installDelegation(ctx, surface, config)
   installGate(ctx, store, prefs)
   installAutoRelease(ctx, store, push, prefs)
   installTools(ctx, store, push)

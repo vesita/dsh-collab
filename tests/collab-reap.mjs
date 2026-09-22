@@ -7,7 +7,7 @@
 //   4) 自己的声明即便满足其它条件也不回收（提示用 release）；
 //   5) 已过期声明不由 reap 处理（那是 sweep 的活）；
 //   6) paths 限定：只回收相交的；
-//   7) 回收后读者收到通知，来源形状仍是 plugin/notice（复用 notifyReaders 管道）；
+//   7) 回收后读者收到通知，来源形状仍是 dsh-collab/notice（复用 notifyReaders 管道）；
 //   8) 活体检查不可用（agents.list 缺失）⇒ 一个也不收（拿不到名单时"不在名单"没有信息量）。
 //
 // 为什么（不要重新论证）
@@ -267,7 +267,7 @@ console.log('\n# 6. paths 限定：只回收相交的')
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// 7. 回收后读者收到通知：来源形状仍是 plugin/notice
+// 7. 回收后读者收到通知：来源形状仍是 dsh-collab/notice
 // ════════════════════════════════════════════════════════════════════════
 console.log('\n# 7. 回收后读者收到通知（复用 notifyReaders 管道）')
 
@@ -282,8 +282,8 @@ console.log('\n# 7. 回收后读者收到通知（复用 notifyReaders 管道）
     '7.2 读者经 agent.inject 收到 1 条通知', JSON.stringify(b.injects.map((x) => x.sessionId)))
   const msg = b.injects[0] && b.injects[0].message
   const source = msg && msg.source
-  ok(!!source && source.kind === 'plugin' && source.plugin === 'dsh-collab' && source.form === 'notice',
-    '7.3 来源形状仍是 {kind:plugin, plugin:dsh-collab, form:notice}', JSON.stringify(source))
+  ok(!!source && source.kind === 'dsh-collab' && source.form === 'notice',
+    '7.3 来源形状仍是 {kind:dsh-collab, form:notice}', JSON.stringify(source))
   ok(!!source && typeof source.summary === 'string' && source.summary.length > 0 && source.summary.length <= 120,
     '7.4 summary 非空且 ≤120 字符（否则会退化成 opaque 行）', JSON.stringify(source && source.summary))
   const text = String((msg && msg.content && msg.content[0] && msg.content[0].text) || '')

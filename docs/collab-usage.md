@@ -52,7 +52,7 @@ ${DSH_HOME:-$HOME/.dsh}/collab/projects/<项目名>-<哈希>.json
 
 ### 1.4 委托纪律，以及在哪里关掉它
 
-除态势摘要外，插件还注入一段常驻的**委托与验收纪律**，并随包注册 `subagent-delegation` 技能，默认开启。它是包形态的一项设置：**设置 → 插件** 里 `dsh-collab` 标签页上的下拉选择框（集群协作 / 关闭），对应字段 `exposeDelegationDiscipline`（`${DSH_HOME:-$HOME/.dsh}/settings.yaml`，布尔，默认 `true`）。
+除态势摘要外，插件还注入一段常驻的**委托与验收纪律**，并随包注册 `subagent-delegation` 技能，默认开启。它是插件的一行配置：侧边栏 **Plugins** → `dsh-collab` 卡片里的下拉选择框（集群协作 / 关闭），对应 Config 字段 `exposeDelegationDiscipline`（布尔，默认 `true`，改动不需要重载插件）。
 
 不选「关闭」时，纪律文本与随包技能都不再注册，**中央注册锁与协作留言板照常可用**。设置是活读的，改完立即生效，无需重启 dsh。完整说明见 README 的「委托纪律偏好与设置卡片」。
 
@@ -137,7 +137,7 @@ collab_lock op=wait paths=["src/backend/models/"] timeoutMs=15000
   `claim`」；状态文件里另留一条审计留言（`channel` = `agent:<sessionId>`），`collab_board op=read` 可回读。
   0.9.11 起**发给本人的注入通知**按 `holderId` 在 60 秒窗口内合并（审计留言不合并）。
 
-| 设置（命名空间 `dsh-collab`，活读） | 默认 | 说明 |
+| 配置（命名空间 `collab`，活读） | 默认 | 说明 |
 | --- | --- | --- |
 | `releaseOnLoopEnd` | `true` | 关掉则回到旧行为：只由 `release` / 租约到期回收 |
 | `loopEndGraceSec` | `120` | 宽限秒数，夹在 `[1, 3600]`（0.9.11 从 15 调长） |

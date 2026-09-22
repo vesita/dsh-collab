@@ -12,9 +12,9 @@ import { createHarness } from './_harness.mjs'
 // UserStyleBubble 渲染器）。这违反 AGENTS.md §1「严禁冒充用户」。
 // 新投递面只有一个：**进程内解析目标 agent**（`ctx.get('agents').get(sessionId)`），解析到就
 // `agent.inject(msg)`；消息由**真实的** `@deepseek-ai/dsh-llm` 构造，来源显式非 user：
-//   { kind: 'plugin', plugin: 'dsh-collab', form: 'notice', summary: boundContextSummary(…) }
-// 客户端分流**只看 `source.kind`**（`dsh-client-ui-chat/lib/client.js:6058`，发生在收件箱分类之前），
-// `kind:'plugin'` + `form:'notice'` + **非空 summary** ⇒ 独立可折叠的 ContextInjectionRow，不是气泡。
+//   { kind: 'dsh-collab', form: 'notice', summary: boundContextSummary(…) }
+// 客户端分流**只看 `source.kind`**（`dsh-client-ui-chat/lib/client.js:8757`，发生在收件箱分类之前），
+// `kind !== 'user'` + `form:'notice'` + **非空 summary** ⇒ 独立可折叠的 ContextInjectionRow，不是气泡。
 // 解析不到目标 agent 就**如实跳过**（`skipped.reason === 'agent-not-resolvable'`），绝不回退。
 //
 // 覆盖面：
@@ -31,7 +31,7 @@ import { createHarness } from './_harness.mjs'
 //   8) **旧通道彻底删除**：`sessionController.prompt` 与 `subagents.sendMessage` 在整个文件的所有场景里
 //      **零调用**（假服务在场并记录调用，所以"零"是一条非空断言）；旧 reason 取值
 //      （prompt-failed / not-adjacent / subagent-failed）不再出现在任何 notify 里；
-//   9) (a) 投递出去的**每一条**消息来源都显式非 user（kind/plugin/form + 非空 ≤120 字符 summary）；
+//   9) (a) 投递出去的**每一条**消息来源都显式非 user（kind/form + 非空 ≤120 字符 summary）；
 //  10) (b) TOCTOU：判据说活着、投递时解析不到目标 agent -> 投递数 0 且 skipped 带 agent-not-resolvable；
 //  11) (c) **负向对照**（手工执行，见下）：把 source 的 kind 改成 'user'（或恢复 controller.prompt）
 //      ⇒ (a) 必须变红。RED 原文见交付报告。
@@ -89,7 +89,7 @@ const allNotifies = []
  */
 const sourceShapeOk = (msg) => {
   const s = msg && msg.source
-  return !!s && s.kind === 'plugin' && s.plugin === 'dsh-collab' && s.form === 'notice' &&
+  return !!s && s.kind === 'dsh-collab' && s.form === 'notice' &&
     typeof s.summary === 'string' && s.summary.length > 0 && s.summary.length <= 120
 }
 const sourceShapeWhy = (msg) => JSON.stringify(msg && msg.source)
@@ -444,7 +444,7 @@ console.log('# 显式 op=release 之后向活着的 reader 投递（新通道：
   // ---- (a) 来源形状：显式非 user，且 notice 带非空 ≤120 字符 summary ----
   const msg = inj.message
   const source = msg && msg.source
-  ok(sourceShapeOk(msg), '(a) source 是 {kind:plugin, plugin:dsh-collab, form:notice}（客户端据此渲染成 notice 行，不是气泡）', sourceShapeWhy(msg))
+  ok(sourceShapeOk(msg), '(a) source 是 {kind:dsh-collab, form:notice}（客户端据此渲染成 notice 行，不是气泡）', sourceShapeWhy(msg))
   ok(!!source && typeof source.summary === 'string' && source.summary.length > 0 && source.summary.length <= 120,
     '(a) source.summary 是非空字符串且 ≤120 字符（缺它会退化成 opaque 行）', JSON.stringify(source && source.summary))
   ok(!!msg && msg.role === 'user' && Object.isFrozen(msg),
@@ -892,10 +892,10 @@ console.log('# 通知载体：手抄的消息副本已删除，通知经 agent.i
   ok(decision === downstream && decision.kind === 'accept',
     'post-execute **原样返回 downstream 本身**（===，不改工具结果）', JSON.stringify(decision))
 
-  // (c) 通知真的经 agent.inject 投出，且来源显式（kind / plugin / form + 非空 summary）。
+  // (c) 通知真的经 agent.inject 投出，且来源显式（kind / form + 非空 summary）。
   ok(injectLog.length === 1, '命中后 agent.inject 恰好调用一次', 'injects=' + injectLog.length)
   const msg = injectLog[0] && injectLog[0].message
-  ok(sourceShapeOk(msg), "inject 收到的消息 source 是 {kind:'plugin', plugin:'dsh-collab', form:'notice', summary 非空}（(a) 同款判据）", sourceShapeWhy(msg))
+  ok(sourceShapeOk(msg), "inject 收到的消息 source 是 {kind:'dsh-collab', form:'notice', summary 非空}（(a) 同款判据）", sourceShapeWhy(msg))
   ok(!!msg && msg.role === 'user' && Object.isFrozen(msg),
     '消息是冻结的 user 角色（role / id / 深冻结都由构造函数补）',
     JSON.stringify({ role: msg && msg.role, frozen: !!(msg && Object.isFrozen(msg)) }))
@@ -917,7 +917,7 @@ console.log('# (a) 投递出去的**每一条**消息来源都显式非 user')
   ok(deliveries.length > 0, '(a) 本次至少投递过一条（否则下面的"每一条"是空断言）', 'deliveries=' + deliveries.length)
   const bad = deliveries.filter(d => !sourceShapeOk(d.message))
   ok(bad.length === 0,
-    '(a) 每条投递的 source 都是 {kind:plugin, plugin:dsh-collab, form:notice} 且 summary 非空 ≤120',
+    '(a) 每条投递的 source 都是 {kind:dsh-collab, form:notice} 且 summary 非空 ≤120',
     bad.map(d => d.sessionId + ' -> ' + sourceShapeWhy(d.message)).join(' | '))
   const texts = deliveries.map(d => noticeText(d))
   ok(texts.every(t => t.includes('[dsh-collab]')), '(a) 每条投递的正文都带 dsh-collab 前缀（可追溯）', JSON.stringify(texts.slice(0, 2)))

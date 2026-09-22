@@ -73,6 +73,30 @@ function makeFs(store, versions) {
 }
 
 /**
+ * 把一份普通配置包装成 Loader 交给插件的形态：`.volatile()` 字段是**稳定引用**
+ * （`{ get() }`），改值 = 更新引用内容 + 发 `loader/volatile-update`，
+ * 与 `cordis-plugin-loader` 的 `_commitVolatile` 同形，插件**不重载**。
+ */
+function volatileConfig(values) {
+  const refs = {}
+  for (const [key, value] of Object.entries(values)) {
+    const box = { current: value }
+    refs[key] = { get: () => box.current, set: (next) => { box.current = next } }
+  }
+  return refs
+}
+
+/** 按 Loader 的 volatile 通道改一个字段：更新引用内容 + 把路径发给插件。 */
+function volatileWrite(fiber, ctx, patch) {
+  const paths = []
+  for (const key of Object.keys(patch)) {
+    fiber.config[key].set(patch[key])
+    paths.push([key])
+  }
+  ctx.emit('loader/volatile-update', paths)
+}
+
+/**
  * 造一个装着本插件的真实 Cordis Context，外加三样测试专用的观测面：
  *   - `timers`：**手动计时器**。`timeout(ms)` 只登记 {ms, resolve}，由 flush() 统一触发 ——
  *     测试因此不必真的等 15 秒，也不会因为机器慢而假红；
@@ -109,12 +133,9 @@ async function makeHarness(opts = {}) {
   }
   for (const [id, status] of Object.entries(opts.agents || {})) addAgent(id, status)
 
-  let hooks = null
-  let value = Object.assign({ exposeDelegationDiscipline: true, enforceWriteLock: true, releaseOnLoopEnd: true, loopEndGraceSec: 120 }, opts.settings || {})
-
   const ctx = new Context()
   const withAgents = opts.withAgents !== false
-  const services = ['tools', 'timer', 'fs', 'sessions', 'sessionTitle', 'systemPrompt', 'settings']
+  const services = ['tools', 'timer', 'fs', 'sessions', 'sessionTitle', 'systemPrompt']
   if (withAgents) services.push('agents')
   for (const n of services) ctx.provide(n)
   ctx.set('tools', { register: (t) => { tools.push(t); return () => {} } })
@@ -137,11 +158,12 @@ async function makeHarness(opts = {}) {
     })
   }
   ctx.set('systemPrompt', { context: () => () => {} })
-  ctx.set('settings', {
-    installSection: (_owner, _ns, _schema, _entry, hk) => { hooks = hk; hk.setSource(() => value); hk.onChange() }
-  })
 
-  const fiber = await ctx.plugin(collabPlugin)
+  // 0.1.7 起偏好是本插件的 Config：`.volatile()` 字段是稳定引用，由 Loader 就地更新。
+  const fiber = await ctx.plugin(collabPlugin, volatileConfig(Object.assign(
+    { exposeDelegationDiscipline: true, enforceWriteLock: true, releaseOnLoopEnd: true, loopEndGraceSec: 120 },
+    opts.settings || {}
+  )))
   await settle()
 
   /** 触发一次 agent/status（载荷形状照 dsh-agent-loop/lib/index.js:781 的 emit("agent/status", { status })）。 */
@@ -168,7 +190,7 @@ async function makeHarness(opts = {}) {
     addAgent, emitStatus, dispose, flush,
     readState: () => JSON.parse(store.get(statePath) || '{}'),
     peek: (id) => { const a = registry.get(id); return a ? a.status : undefined },
-    set: (patch) => { value = Object.assign({}, value, patch); if (hooks) hooks.onChange() },
+    set: (patch) => { volatileWrite(fiber, ctx, patch) },
     callTool: (name, args, agent) => {
       const t = tools.find((x) => x.name === name)
       if (!t) throw new Error('tool not registered: ' + name)
@@ -186,7 +208,7 @@ const mkClaim = (o) => Object.assign({
 
 const noticeShapeOk = (msg) => {
   const s = msg && msg.source
-  return !!s && s.kind === 'plugin' && s.plugin === 'dsh-collab' && s.form === 'notice' &&
+  return !!s && s.kind === 'dsh-collab' && s.form === 'notice' &&
     typeof s.summary === 'string' && s.summary.length > 0 && s.summary.length <= 120
 }
 const textOf = (msg) => {
@@ -231,7 +253,7 @@ console.log('# 核心路径：idle → 宽限 15s 到点 → 自动释放')
   const toA = hh.deliveries.find((d) => d.sessionId === 'A')
   ok(!!toB, '读者（agent:B）收到"锁已自动释放"的告知', JSON.stringify(hh.deliveries.map((d) => d.sessionId)))
   ok(!!toA, '被释放的会话本人（agent:A）也收到告知（它恢复时才知道自己已不再持锁）', JSON.stringify(hh.deliveries.map((d) => d.sessionId)))
-  ok(hh.deliveries.every((d) => noticeShapeOk(d.message)), '投出去的每一条消息来源都显式非 user（plugin/notice + 非空 summary）',
+  ok(hh.deliveries.every((d) => noticeShapeOk(d.message)), '投出去的每一条消息来源都显式非 user（dsh-collab/notice + 非空 summary）',
     JSON.stringify(hh.deliveries.map((d) => d.message && d.message.source)))
   ok(!textOf(toB && toB.message).includes('已释放 c_44') && textOf(toB && toB.message).includes('自动释放'),
     '读者文案说的是"自动释放"，不是"X 主动释放"', textOf(toB && toB.message))

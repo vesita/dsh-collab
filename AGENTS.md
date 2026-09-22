@@ -24,9 +24,11 @@
     ```js
     createUserMessage({
       content: [{ type: 'text', text }],
-      source: { kind: 'plugin', plugin: 'dsh-collab', form: 'notice', summary: boundContextSummary(...) }
+      source: { kind: 'dsh-collab', form: 'notice', summary: boundContextSummary(...) }
     })
     ```
+    `kind` 是本插件自己的种类，在 `src/contract.ts` 里 augment `MessageSourceMap` 声明
+    （0.1.7 起没有通用的 `plugin` 兜底种类，每个生产者声明自己的 `kind`）。
   - 逐事件投递用 `agent.inject(msg)` —— 契约是 `send(msg, "next-step", wakeup=false)`
     （`dsh-agent/lib/types/runtime-types.d.ts:209`、实现 `dsh-agent-loop/lib/index.js:795`）：
     进入下一步但**不唤醒** driver。这是跨会话通知的**唯一**投递面。
@@ -37,24 +39,24 @@
 ### 为什么
 
 1. **冒充会污染一切按来源判断的东西**。客户端的分流判据只有一条 —— `source.kind !== 'user'`
-   ⇒ 渲染成 context 节点（`dsh-client-ui-chat/lib/client.js:6058`）；`kind === 'user'` 才会成为
+   ⇒ 渲染成 context 节点（`dsh-client-ui-chat/lib/client.js:8757`）；`kind === 'user'` 才会成为
    用户气泡（或在 next-step 收件箱里成为 `steering`）。压缩、去重、审计、"这句到底是谁说的"
    全都按消息来源判断。
-   —— 注意恰恰是**显式标注**的 `plugin/notice` 不冒充用户：它渲染成 **notice 行**。
+   —— 注意恰恰是**显式标注**的 `dsh-collab/notice` 不冒充用户：它渲染成 **notice 行**。
 2. **手抄副本会静默腐烂**。2025-09 之前本仓库有一份 `src/plugin-message.ts` 逐字复刻 dsh-llm；
    DSH 一改消息形状，插件就会**静默**产出宿主不认的结构而看起来"能跑"。该副本已删除，**不许复活**。
    它当年存在的理由（"插件解析不到 `dsh-llm`"）本就不成立：从安装位置 import 是成功的，
    生态里 50 个包都这么用（另有三份副本散落在 `dsh-repeat-tool-reminder`、`dsh-tmux-context`、
    `dsh-client-connection` —— 那是反面教材，不是先例）。
 3. **`form` 必须配齐**：`form: 'notice'` **必须带非空 `summary`**，否则客户端会把它退化成
-   **opaque** 行（`client.js:795-800`）。`summary` 用 `boundContextSummary`（120 字符上限，
+   **opaque** 行（`client.js:825-831`）。`summary` 用 `boundContextSummary`（120 字符上限，
    dsh-llm 导出，生态里 5 个包在用）。DSH 自家也有翻车的：`dsh-tool-cordis` 与 `dsh-tool-skill`
    声明了 `form:'instructions'` 却没给 `changes`，实际渲染成 opaque。
 4. **"收 content"的接口一定会冒充用户（实测）**。`sessionController.prompt` 与
    `subagents.sendMessage` **都只收 `content`、不收 message**，消息由宿主代造并写死
    `source: { kind: 'user', rpcId: 'dsh-collab-…' }` —— 实测转录里就是 `user/message` +
    `kind:'user'`，客户端按 `source.kind` 分流后渲染成**用户气泡**
-   （`dsh-client-ui-chat/lib/client.js:6058`；落进 next-step 收件箱还会升级成 steering 气泡，
+   （`dsh-client-ui-chat/lib/client.js:8757`；落进 next-step 收件箱还会升级成 steering 气泡，
    与真人输入共用同一个渲染器）。证据：本仓库 0.9.6 之前的 `src/push.ts` 注释与实测转录。
    —— 所以"接口收 content ⇒ 来源可控"是错的：**来源由宿主盖章**，插件既改不了也看不见。
    这也是 0.9.6 把这两条通道整体删掉、只留 `agent.inject` + 自造显式来源消息的原因。
@@ -82,8 +84,9 @@
 
 - 禁 `role: 'user'` / `source.kind === 'user'`；
 - 禁自定义 `createUserMessage` / `createMessage` / `freezeMessage` / `boundContextSummary`；
-- 凡有 `createUserMessage(` 的文件，必须同时有 `source:`、`plugin:`、`form:`；
-  `form:'notice'` 还必须带 `summary:`；
+- 凡有 `createUserMessage(` 的文件，必须同时有 `source:`、`kind:`、`form:`；
+  `form:'notice'` 还必须带 `summary:`；且 `src/contract.ts` 必须为这个 `kind` 声明
+  `MessageSourceMap` 条目（0.1.7 起没有通用的 `plugin` 兜底种类）；
 - 必须有 `from '@deepseek-ai/dsh-llm'` 的 import；
 - **不许**用 `sessionController.prompt` / `subagents.sendMessage` 投递通知 —— 这两个接口收
   `content`、来源由宿主写死 `kind:'user'`，**必然冒充用户**；0.9.6 已把这两处调用从

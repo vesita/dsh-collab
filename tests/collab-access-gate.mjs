@@ -9,7 +9,7 @@ import { createHarness } from './_harness.mjs'
 //   2) 真正注册出来的 ctx.on('tools/post-execute') 监听器 + **真实的 agent.inject 投递面**：
 //      **原样返回 downstream**（不产生 content / value / additionalContexts 任何改动），命中即经
 //      `agent.inject` 投递一条**显式标注来源**的 notice 消息
-//      （`source.kind='plugin'` / `plugin='dsh-collab'` / `form='notice'` / 非空 `summary`），
+//      （`source.kind='dsh-collab'` / `form='notice'` / 非空 `summary`），
 //      按 agent 的 accessSignature 去重、block 分支、无路径/无命中/自己的声明/过期一律不投递、
 //      正文与 renderAccessNotice(entries) 逐字一致、agent 没有 inject 时**不投递也不退回自造消息**、
 //      异常安全、卸载后监听器回收且不再 inject。
@@ -193,11 +193,25 @@ function makeFs(store, versions, opts = {}, calls) {
 const settle = () => new Promise((r) => setTimeout(r, 20))
 
 /**
+ * 把一份普通配置包装成 Loader 交给插件的形态：`.volatile()` 字段是**稳定引用**
+ * （`{ get() }`，见 `@deepseek-ai/cosmokit` 的 `Volatile`），不是普通值。
+ * 与 `cordis-plugin-loader` 的 `_commitVolatile` 同形：改值 = 更新引用内容 + 发事件。
+ */
+function volatileConfig(values) {
+  const refs = {}
+  for (const [key, value] of Object.entries(values)) {
+    const box = { current: value }
+    refs[key] = { get: () => box.current, set: (next) => { box.current = next } }
+  }
+  return refs
+}
+
+/**
  * 造一个装着本插件的真实 Cordis Context。
  * @param opts.claims    预置状态文件里的 claims
  * @param opts.readThrows 让 readText 抛错的判据（测异常安全）
- * @param opts.settings  用户设置（缺省 = 两个字段都 true）
- * @param opts.settingsWritable  false 时 installSection 交出一个只读读取器
+ * @param opts.settings  用户设置（缺省 = 两个字段都 true）—— 作为**插件 Config** 交给插件
+ * @param opts.devConfig 不传 Config 时用（模拟没有 Loader 解析配置的形态）
  * @param opts.initiator 当前会话的 agent（agents.currentInitiator 的返回值；缺省 ME）
  *
  * systemPrompt 服务**照常提供**，但只当**探测器**用：新载体（`agent.inject`）根本不碰它。
@@ -218,12 +232,9 @@ async function makeHarness(opts = {}) {
     versions.set(statePath, 1)
   }
 
-  let hooks = null
   let initiator = opts.initiator || ME
-  let value = Object.assign({ exposeDelegationDiscipline: true, enforceWriteLock: true }, opts.settings || {})
   const ctx = new Context()
   const services = ['tools', 'timer', 'fs', 'sessions', 'sessionTitle', 'agents', 'systemPrompt']
-  if (opts.settings !== undefined) services.push('settings')
   if (opts.withController) services.push('sessionController')
   for (const n of services) ctx.provide(n)
 
@@ -245,33 +256,45 @@ async function makeHarness(opts = {}) {
       return () => { if (contexts.get(c.name) === c) contexts.delete(c.name) }
     }
   })
-  if (opts.settings !== undefined) {
-    ctx.set('settings', {
-      installSection: (_owner, _ns, _schema, _entry, h) => {
-        hooks = h
-        h.setSource(() => value)
-        h.onChange()
-      }
-    })
-  }
+  // 0.1.7 起偏好就是本插件的 Config：配置在 fiber 上，改字段走 Loader 的 volatile 通道。
   if (opts.withController) {
     ctx.set('sessionController', {
       prompt: async (request, _signal) => { prompts.push(request); return { accepted: true } },
       list: async () => ({ items: (opts.sessionRows || []).slice() })
     })
   }
-
-  const fiber = await ctx.plugin(collabPlugin)
+  const fiber = await ctx.plugin(collabPlugin, opts.devConfig
+    ? undefined
+    : volatileConfig(Object.assign({ exposeDelegationDiscipline: true, enforceWriteLock: true }, opts.settings || {})))
   await settle()
 
   const readState = () => JSON.parse(store.get(statePath) || '{}')
   const writeState = (doc) => { store.set(statePath, JSON.stringify(doc)); versions.set(statePath, (versions.get(statePath) || 0) + 1) }
 
+  /**
+   * 改一个偏好字段，完全照 Loader 的 volatile 通道做：更新运行中 fiber 的 Config **引用内容**，
+   * 再把被改的字段路径发给插件（`loader/volatile-update`）。**不重载插件** —— 这正是要验证的
+   * "改设置无需重启"。
+   */
+  const writeConfig = (patch) => {
+    const config = fiber.config
+    const paths = []
+    for (const key of Object.keys(patch)) {
+      config[key].set(patch[key])
+      paths.push([key])
+    }
+    ctx.emit('loader/volatile-update', paths)
+  }
+
   return {
     ctx, tools, store, versions, statePath, prompts, readState, writeState, fiber,
     contexts, calls,
-    set(patch) { value = Object.assign({}, value, patch); if (hooks) hooks.onChange() },
-    current: () => value,
+    set(patch) { writeConfig(patch) },
+    current() {
+      const out = {}
+      for (const [key, ref] of Object.entries(fiber.config)) out[key] = ref.get()
+      return out
+    },
     /** 当前会话（agents.currentInitiator()）—— 只影响 awareness 段，与功能 A 的投递面无关。 */
     setInitiator(a) { initiator = a },
     /** 驱动 post-execute 瀑布：返回 { decision, downstream, nextCalls }。 */
@@ -345,8 +368,7 @@ console.log('# A: post-execute 原样返回 downstream，通知经 agent.inject 
   const msg = delivered && delivered.message
 
   // ── 消息是**显式标注来源**的 notice（不冒充真人）──
-  ok(!!msg && !!msg.source && msg.source.kind === 'plugin', "source.kind === 'plugin'（不是 user，不冒充真人）", JSON.stringify(msg && msg.source))
-  ok(!!msg && !!msg.source && msg.source.plugin === 'dsh-collab', "source.plugin === 'dsh-collab'", String(msg && msg.source && msg.source.plugin))
+  ok(!!msg && !!msg.source && msg.source.kind === 'dsh-collab', "source.kind === 'dsh-collab'（不是 user，不冒充真人）", JSON.stringify(msg && msg.source))
   ok(!!msg && !!msg.source && msg.source.form === 'notice', "source.form === 'notice'（客户端据此渲染成 notice 行）", String(msg && msg.source && msg.source.form))
   const summary = msg && msg.source && msg.source.summary
   ok(typeof summary === 'string' && summary.length > 0, 'summary 是非空字符串（notice 缺 summary 会退化成 opaque）', JSON.stringify(summary))
@@ -706,10 +728,10 @@ console.log('# C: settings 门控 enforceWriteLock 关掉后不再拦')
   const backOn = await h.pre(execOf('write', { file_path: 'src/a/1', content: 'x' }))
   ok(backOn.decision.kind === 'ask', '再打开又拦（活读）')
 
-  // settings 服务缺失 -> 按默认（开）处理
-  const h2 = await makeHarness({ claims: [foreign] })
+  // 没有 Loader 解析配置的形态（迷你宿主）-> 按 schema 默认（开）处理
+  const h2 = await makeHarness({ claims: [foreign], devConfig: true })
   const noSvc = await h2.pre(execOf('write', { file_path: 'src/a/1', content: 'x' }))
-  ok(noSvc.decision.kind === 'ask', 'settings 服务缺失时按默认（开）拦截')
+  ok(noSvc.decision.kind === 'ask', '插件没有 Config 时按默认（开）拦截')
 }
 
 console.log('# C: readable 的 claim 入参与兼容映射')

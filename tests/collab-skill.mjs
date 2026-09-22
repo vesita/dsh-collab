@@ -1,23 +1,23 @@
 import { createHarness } from './_harness.mjs'
 
 // collab-skill.mjs
-// 随包发布的 subagent-delegation skill + 委托纪律常驻上下文 + dsh-collab 偏好设置的回归测试。
+// 随包发布的 subagent-delegation skill + 委托纪律常驻上下文 + 偏好设置的回归测试。
 //
 // 机制：
 //   - 包形态在 apply 里按 import.meta.url 定位 ../skills/subagent-delegation/SKILL.md 读一次（结果缓存）；
-//   - skill 与常驻 PromptContext 都**只**在偏好 exposeDelegationDiscipline（settings 命名空间 dsh-collab，
-//     默认 true）为真时注册；
-//   - 偏好的值通过 settings.installSection 的 setSource 回调**活读**（缓存的是读取器，不是值），
-//     所以设置面板里一改，onChange 触发重新结算，无需重启；
-//   - settings 是可选服务：缺失 / installSection 不可用 / 文件缺失 / 解析失败都静默降级；
+//   - skill 与常驻 PromptContext 都**只**在偏好 exposeDelegationDiscipline（默认 true）为真时注册；
+//   - 0.1.7 起偏好就是插件**自己的 Config**：`.volatile()` 字段是稳定引用，Loader 就地更新引用
+//     内容并发 `loader/volatile-update`（插件不重载），所以设置里一改就重新结算；
+//   - Config 的 volatile 字段缺省 / Config 整个缺席（没有 Loader 的迷你宿主）/ 文件缺失 /
+//     解析失败，一律静默降级到 schema 默认值；
 //   - 注册与上下文都走 ctx.effect，卸载插件即撤销。
 //
-// 本测试用假 ctx 捕获 register 入参、PromptContext 与 settings hooks，断言：
+// 本测试用假 ctx 捕获 register 入参、PromptContext，断言：
 //   (a) 随包文件存在且 frontmatter 可解析（name/description/whenToUse 正确）；
 //   (b) 偏好开：skill 恰好注册一次、内容与磁盘逐字一致、resourceBase 指向真实目录；
 //   (c) 偏好开：第二个 PromptContext（dsh-collab/delegation, order 131）注册，文本**常量**且无数字；
 //   (d) 偏好关：skill 与上下文都不注册，collab_lock 照旧注册；
-//   (e) settings 服务缺失：插件照常装载、按默认值（开）注册、不抛；
+//   (e) 没有 Config：插件照常装载、按 schema 默认值（开）注册、不抛；
 //   (f) 偏好在运行时由 true 翻到 false（不重启）：skill 与上下文都被撤回；
 //   (g) 卸载插件：skill 注册与上下文注册的 disposer 都被调用（可逆）。
 //
@@ -34,6 +34,7 @@ const ROOT = path.dirname(new URL(import.meta.url).pathname)
 const SKILL_PATH = path.join(ROOT, '../skills/subagent-delegation/SKILL.md')
 const SKILL_DIR = path.dirname(SKILL_PATH)
 const collabPlugin = (await import(path.join(ROOT, '../lib/index.js'))).default
+const { Config, DELEGATION_SETTINGS_ENTRY } = await import(path.join(ROOT, '../lib/index.js'))
 
 const h = createHarness()
 const { ok } = h
@@ -44,31 +45,35 @@ delete process.env.DSH_COLLAB_NO_PROMPT_HINT
 const settle = () => new Promise((r) => setTimeout(r, 30))
 
 /**
- * 假 settings 服务：只实现 installSection 的对外契约——
- * 交出**实时**读取器 setSource(() => 当前值)，值变化时回调 onChange。
- * 测试用 set() 模拟"用户在设置面板里改动"。
+ * 把一份普通配置包装成 Loader 交给插件的形态：`.volatile()` 字段是**稳定引用**
+ * （`{ get() }`），与 `cordis-plugin-loader` 的 `_commitVolatile` 同形。
  */
-function makeSettings(initial) {
-  let value = Object.assign({}, initial)
-  let hooks = null
-  const installed = []
-  const service = {
-    installSection: (owner, ns, schema, entry, h) => {
-      installed.push({ owner, ns, schema, entry })
-      hooks = h
-      h.setSource(() => value)
-      h.onChange()
-    }
+function makeConfig(initial) {
+  const refs = {}
+  for (const [key, value] of Object.entries(initial)) {
+    const box = { current: value }
+    refs[key] = { get: () => box.current, set: (next) => { box.current = next } }
   }
-  return {
-    service,
-    installed,
-    set(patch) {
-      value = Object.assign({}, value, patch)
-      if (hooks) hooks.onChange() // 真实 installSection 在 scope.watch 里就是这么回调的
-    },
-    current: () => value
+  return refs
+}
+
+/** 按 Loader 的 volatile 通道改字段：更新引用内容 + 把路径发给插件（模拟用户在设置里改）。 */
+function writeConfig(fiber, ctx, patch) {
+  const paths = []
+  for (const key of Object.keys(patch)) {
+    fiber.config[key].set(patch[key])
+    paths.push([key])
   }
+  ctx.emit('loader/volatile-update', paths)
+}
+
+/** 把一份解析后的 Config 摊平成普通值：volatile 字段取 `.get()`（官方 `plainOptions()` 同款）。 */
+function plainConfig(config) {
+  const out = {}
+  for (const [key, value] of Object.entries(config || {})) {
+    out[key] = value && typeof value.get === 'function' ? value.get() : value
+  }
+  return out
 }
 
 /** 统一的假 ctx：记录工具、PromptContext、skills 注册。 */
@@ -79,7 +84,6 @@ function makeCtx(opts = {}) {
   const names = ['tools', 'timer', 'fs']
   if (opts.skills) names.push('skills')
   if (opts.systemPrompt) names.push('systemPrompt')
-  if (opts.settings) names.push('settings')
   for (const n of names) ctx.provide(n)
   ctx.set('tools', { register: (t) => { captured.tools.push(t); return () => {} } })
   ctx.set('timer', { timeout: () => Promise.resolve(), interval: () => () => {} })
@@ -137,9 +141,9 @@ ok(diskBody.length > 1000, 'body after frontmatter is non-trivial', String(diskB
 // ---------------------------------------------------------------------------
 console.log('# (b)(c)(g) preference ON (explicit true): skill + constant discipline context, both reversible')
 {
-  const settings = makeSettings({ exposeDelegationDiscipline: true })
-  const { ctx, captured } = makeCtx({ skills: true, systemPrompt: true, settings })
-  const fiber = await ctx.plugin(collabPlugin)
+  const config = makeConfig({ exposeDelegationDiscipline: true, enforceWriteLock: true, releaseOnLoopEnd: true, loopEndGraceSec: 120 })
+  const { ctx, captured } = makeCtx({ skills: true, systemPrompt: true })
+  const fiber = await ctx.plugin(collabPlugin, config)
   await settle()
 
   const reg = captured.regs[0]
@@ -177,31 +181,29 @@ console.log('# (b)(c)(g) preference ON (explicit true): skill + constant discipl
     ok(!/租约|剩 \d|expires/.test(t1), 'discipline text does not duplicate the awareness digest job', t1)
   }
 
-  const settingsInstall = settings.installed[0]
-  ok(settings.installed.length === 1, 'plugin installs exactly one settings section', 'installs=' + settings.installed.length)
-  ok(!!settingsInstall && settingsInstall.ns === 'dsh-collab', 'settings namespace is dsh-collab', String(settingsInstall && settingsInstall.ns))
-  // 0.8.0 起 schema 有**两个**布尔字段（enforceWriteLock 是功能 C 的门控，默认同样为 true）；
-  // 0.9.10 起追加两个字段描述「循环终止自动释放」（releaseOnLoopEnd 布尔 + loopEndGraceSec 秒数）。
-  // 这里从"逐字比一个 JSON 串"改成"逐字段判 + 字段集合判"，判据没有放松：
-  // 字段集合被钉死成恰好这四个，任何一个默认值没落对都会 FAIL。
-  const schemaDefaults = settingsInstall && settingsInstall.schema ? settingsInstall.schema({}) : null
-  ok(!!schemaDefaults && schemaDefaults.exposeDelegationDiscipline === true,
-    'settings schema defaults exposeDelegationDiscipline to true', JSON.stringify(schemaDefaults))
-  ok(!!schemaDefaults && schemaDefaults.enforceWriteLock === true,
-    'settings schema defaults enforceWriteLock to true (write protection defaults ON)', JSON.stringify(schemaDefaults))
-  ok(!!schemaDefaults && schemaDefaults.releaseOnLoopEnd === true,
-    'settings schema defaults releaseOnLoopEnd to true (循环终止自动释放默认开)', JSON.stringify(schemaDefaults))
-  ok(!!schemaDefaults && schemaDefaults.loopEndGraceSec === 120,
-    'settings schema defaults loopEndGraceSec to 120 (宽限期 120 秒，0.9.11 从 15 调长)', JSON.stringify(schemaDefaults))
-  ok(!!schemaDefaults && Object.keys(schemaDefaults).sort().join(',') === 'enforceWriteLock,exposeDelegationDiscipline,loopEndGraceSec,releaseOnLoopEnd',
-    'settings schema exposes exactly the four known fields', Object.keys(schemaDefaults || {}).join(','))
-  ok(!!settingsInstall && !!settingsInstall.entry && settingsInstall.entry.exposeDelegationDiscipline === true,
-    'composition entry (fallback when settings detach) is true')
-  ok(!!settingsInstall && !!settingsInstall.entry && settingsInstall.entry.enforceWriteLock === true,
+  // 0.1.7 起偏好不再是插件自建的 settings section，而是**插件自己的 Config**：
+  // 断言因此落在 Config 解析出的默认值上（判据没有放松 —— 字段集合仍被钉死成恰好四个，
+  // 任何一个默认值没落对都会 FAIL），以及 Config 缺席时插件仍在、仍注册。
+  //
+  // 注意：`.volatile()` 字段是**引用**（`{ get() }`），所以默认值要经 `plainConfig()` 取出；
+  // 直接 JSON 比对会看到 `{}` 这种被剥掉方法的空壳（那正是"schemastery 把引用序列化没了"）。
+  const parsedDefaults = plainConfig(Config['~standard'].validate({}).value)
+  ok(parsedDefaults.exposeDelegationDiscipline === true,
+    'Config schema defaults exposeDelegationDiscipline to true', JSON.stringify(parsedDefaults))
+  ok(parsedDefaults.enforceWriteLock === true,
+    'Config schema defaults enforceWriteLock to true (write protection defaults ON)', JSON.stringify(parsedDefaults))
+  ok(parsedDefaults.releaseOnLoopEnd === true,
+    'Config schema defaults releaseOnLoopEnd to true (循环终止自动释放默认开)', JSON.stringify(parsedDefaults))
+  ok(parsedDefaults.loopEndGraceSec === 120,
+    'Config schema defaults loopEndGraceSec to 120 (宽限期 120 秒，0.9.11 从 15 调长)', JSON.stringify(parsedDefaults))
+  ok(Object.keys(parsedDefaults).sort().join(',') === 'enforceWriteLock,exposeDelegationDiscipline,loopEndGraceSec,releaseOnLoopEnd',
+    'Config schema exposes exactly the four known fields', Object.keys(parsedDefaults).join(','))
+  ok(DELEGATION_SETTINGS_ENTRY.exposeDelegationDiscipline === true,
+    'composition entry (fallback when Config detach) is true')
+  ok(DELEGATION_SETTINGS_ENTRY.enforceWriteLock === true,
     'composition entry defaults enforceWriteLock to true as well')
-  ok(!!settingsInstall && !!settingsInstall.entry && settingsInstall.entry.releaseOnLoopEnd === true &&
-    settingsInstall.entry.loopEndGraceSec === 120,
-    'composition entry defaults 循环终止自动释放 to ON / 120s', JSON.stringify(settingsInstall && settingsInstall.entry))
+  ok(DELEGATION_SETTINGS_ENTRY.releaseOnLoopEnd === true && DELEGATION_SETTINGS_ENTRY.loopEndGraceSec === 120,
+    'composition entry defaults 循环终止自动释放 to ON / 120s', JSON.stringify(DELEGATION_SETTINGS_ENTRY))
 
   ok(captured.liveRegs === 1, 'exactly one live skill registration before unload', 'live=' + captured.liveRegs)
   ok(captured.contexts.has('dsh-collab/delegation'), 'the discipline context is live before unload')
@@ -216,10 +218,10 @@ console.log('# (b)(c)(g) preference ON (explicit true): skill + constant discipl
 // ---------------------------------------------------------------------------
 console.log('# (d) preference OFF: neither skill nor discipline context is registered; collab_lock remains')
 {
-  const settings = makeSettings({ exposeDelegationDiscipline: false })
-  const { ctx, captured } = makeCtx({ skills: true, systemPrompt: true, settings })
+  const config = makeConfig({ exposeDelegationDiscipline: false, enforceWriteLock: true, releaseOnLoopEnd: true, loopEndGraceSec: 120 })
+  const { ctx, captured } = makeCtx({ skills: true, systemPrompt: true })
   let threw = null
-  try { await ctx.plugin(collabPlugin) } catch (e) { threw = e }
+  try { await ctx.plugin(collabPlugin, config) } catch (e) { threw = e }
   await settle()
 
   ok(threw === null, 'plugin loads with the preference off (no throw)', threw && String(threw.message))
@@ -230,35 +232,34 @@ console.log('# (d) preference OFF: neither skill nor discipline context is regis
 }
 
 // ---------------------------------------------------------------------------
-console.log('# (e) settings service ABSENT: plugin loads, defaults to ON, nothing throws')
+console.log('# (e) Config ABSENT: plugin loads, defaults to ON, nothing throws')
 {
   const { ctx, captured } = makeCtx({ skills: true, systemPrompt: true })
   let threw = null
   try { await ctx.plugin(collabPlugin) } catch (e) { threw = e }
   await settle()
 
-  ok(ctx.get('settings') === undefined, 'fake ctx really exposes no settings service', String(ctx.get('settings')))
-  ok(threw === null, 'plugin loads with settings absent (no throw)', threw && String(threw.message))
-  ok(captured.regs.length === 1, 'settings absent -> default true -> skill registered', 'calls=' + captured.regs.length)
-  ok(captured.contexts.has('dsh-collab/delegation'), 'settings absent -> default true -> discipline context registered')
-  ok(captured.tools.map((t) => t.name).includes('collab_lock'), 'collab_lock is still registered with settings absent')
+  ok(threw === null, 'plugin loads without a Config (no throw)', threw && String(threw.message))
+  ok(captured.regs.length === 1, 'no Config -> schema default true -> skill registered', 'calls=' + captured.regs.length)
+  ok(captured.contexts.has('dsh-collab/delegation'), 'no Config -> schema default true -> discipline context registered')
+  ok(captured.tools.map((t) => t.name).includes('collab_lock'), 'collab_lock is still registered without a Config')
 }
 
 // ---------------------------------------------------------------------------
 console.log('# (f) the flag is read LIVE: flipping true -> false at runtime withdraws both, with no restart')
 {
-  const settings = makeSettings({ exposeDelegationDiscipline: true })
-  const { ctx, captured } = makeCtx({ skills: true, systemPrompt: true, settings })
-  await ctx.plugin(collabPlugin)
+  const config = makeConfig({ exposeDelegationDiscipline: true, enforceWriteLock: true, releaseOnLoopEnd: true, loopEndGraceSec: 120 })
+  const { ctx, captured } = makeCtx({ skills: true, systemPrompt: true })
+  const fiber = await ctx.plugin(collabPlugin, config)
   await settle()
   ok(captured.liveRegs === 1 && captured.contexts.has('dsh-collab/delegation'), 'both exposed while the preference is on')
 
-  settings.set({ exposeDelegationDiscipline: false }) // 模拟用户在设置面板里改
+  writeConfig(fiber, ctx, { exposeDelegationDiscipline: false }) // 模拟用户在设置里改
   await settle()
   ok(captured.skillDisposed === 1 && captured.liveRegs === 0, 'flipping off calls the skill disposer', 'disposed=' + captured.skillDisposed + ' live=' + captured.liveRegs)
   ok(!captured.contexts.has('dsh-collab/delegation'), 'flipping off withdraws the context')
 
-  settings.set({ exposeDelegationDiscipline: true }) // 再翻回来
+  writeConfig(fiber, ctx, { exposeDelegationDiscipline: true }) // 再翻回来
   await settle()
   ok(captured.regs.length === 2 && captured.liveRegs === 1, 'flipping back on re-registers the skill', 'calls=' + captured.regs.length + ' live=' + captured.liveRegs)
   ok(captured.contexts.has('dsh-collab/delegation'), 'flipping back on re-registers the context')
@@ -272,10 +273,8 @@ console.log('# degradation: missing skill file / broken services cannot break pl
   ctx.provide('skills')
   // skills 在、但 register 抛错：附加能力失败不得影响产品工具。
   ctx.set('skills', { register: () => { throw new Error('skill registry exploded') } })
-  const settings = makeSettings({ exposeDelegationDiscipline: true })
-  ctx.provide('settings')
-  ctx.set('settings', settings.service)
-  try { await ctx.plugin(collabPlugin) } catch (e) { threw = e }
+  const config = makeConfig({ exposeDelegationDiscipline: true, enforceWriteLock: true, releaseOnLoopEnd: true, loopEndGraceSec: 120 })
+  try { await ctx.plugin(collabPlugin, config) } catch (e) { threw = e }
   await settle()
   ok(threw === null, 'a throwing skills.register does not break plugin load', threw && String(threw.message))
   ok(captured.tools.map((t) => t.name).includes('collab_lock'), 'collab_lock survives a throwing skills.register')

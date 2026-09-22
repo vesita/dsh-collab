@@ -6,7 +6,25 @@
 // 刻意不叫 types.ts：src/types/ 是 schema 派生产物的目录，同名会造成解析歧义。
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import type { ContextFormed } from '@deepseek-ai/dsh-llm'
 import type { Claim, ConflictInfo, HolderInput, Mode, PublishedClaim, StateDocument } from './collab-core.js'
+
+/**
+ * 本插件自己产出的消息来源。
+ *
+ * 0.1.7 起 `MessageSourceMap` 里**没有**通用的 `plugin` 兜底种类：每个生产者必须在
+ * 自己的模块里声明自己的 `kind`（`dsh-llm/lib/types/message.d.ts` 的 `MessageSourceMap`
+ * 文档明写它是 merge-extensible、且**没有共享的 catch-all `plugin` 种类**）。生态同款写法见
+ * `dsh-time-context`（`'time-context': { kind: 'time-context' } & ContextFormed`）与
+ * `dsh-subagent` 的 `'subagent-settled'`；客户端的 `contextProducer`
+ * （`dsh-client-ui-chat/lib/client.js:6760-6779`）对未知 `kind` 的默认分支就是
+ * `role: 'inject'` + `label = kind`，所以这条来源在界面上标注为 `dsh-collab`。
+ */
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    'dsh-collab': { kind: 'dsh-collab' } & ContextFormed
+  }
+}
 
 /** fs 服务返回的文件引用（displayPath / version 由 DSH fs 服务提供）。 */
 export interface FileRef {
@@ -153,7 +171,7 @@ export interface NotifyOutcome {
   /**
    * 每次成功投递所走的通道，与 `pushed` **等长且同序**。
    * 0.9.6 起**只有一个**取值：'inject' = 进程内解析到读者自己的 agent 后 `agent.inject` 一条
-   * 显式来源（`kind:'plugin'`, `form:'notice'`）的消息。始终存在（无成功投递时为空数组）。
+   * 显式来源（`kind:'dsh-collab'`, `form:'notice'`）的消息。始终存在（无成功投递时为空数组）。
    */
   pushedVia: Array<{ sessionId: string; channel: PushChannel }>
   /** 未能投递的候选读者。既有取值 not-live / already-pushed 的语义不变。 */
@@ -238,18 +256,6 @@ export interface DelegationSettings {
 export interface LoopEndReleaseOutcome {
   readers: NotifyOutcome
   holder: PushOutcome
-}
-
-/** ctx.settings.installSection 的 hooks：setSource 交出**实时**读取器，onChange 在值变化时回调。 */
-export interface SettingsSectionHooks {
-  setSource(source: () => DelegationSettings): void
-  onChange(): void
-  validate?(value: DelegationSettings): void
-}
-
-/** ctx.settings 中本插件实际使用的最小接口；**可选服务**。 */
-export interface SettingsService {
-  installSection(owner: unknown, ns: string, schema: unknown, entry: DelegationSettings, hooks: SettingsSectionHooks): void
 }
 
 /**
@@ -352,6 +358,12 @@ export interface CollabContext {
   fs: CollabFs
   timer: { timeout(ms: number): Promise<void>; interval(callback: () => void, delay: number): () => void }
   tools: { register(tool: ToolDefinition): void }
+  /**
+   * 本插件的 Config（0.1.7 起唯一保存偏好的地方）。
+   * `.volatile()` 字段是稳定引用（`{ get() }`，见 cosmokit 的 `Volatile`）：Loader 改值时
+   * 就地更新引用内容并发 `loader/volatile-update`，插件**不重载**。
+   */
+  config?: Record<string, { get(): unknown } | unknown> | null
   effect(callback: () => void | (() => void), label?: string): void
   get(name: string): any
   /**
@@ -361,7 +373,7 @@ export interface CollabContext {
    */
   on(event: string, handler: (...args: any[]) => any, options?: { global?: boolean; prepend?: boolean }): () => void
   /** cordis 的动态依赖：deps 就绪时在子 fiber 里跑 callback；deferred 直到服务出现。 */
-  inject(deps: string[], callback: (ctx: CollabContext & { settings?: SettingsService; webServer?: WebServerService }) => void): unknown
+  inject(deps: string[], callback: (ctx: CollabContext & { webServer?: WebServerService }) => void): unknown
 }
 
 /** 单个 op 的处理函数签名。 */

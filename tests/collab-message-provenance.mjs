@@ -3,7 +3,7 @@
 //
 // 规范的内核不是"禁止一切消息构造"，而是三条：
 //   ① 不许造出 `source.kind === 'user'` 的消息（那是冒充真人输入）；
-//   ② 不许在没有显式来源（`source` + `plugin` + `form`）的情况下投递消息；
+//   ② 不许在没有显式来源（`source` + 本插件自己的 `kind` + `form`）的情况下投递消息；
 //   ③ 不许在仓库里手抄构造函数副本 —— 必须用真实的 `@deepseek-ai/dsh-llm`；
 //   ④ 不许用「收 content、来源由宿主盖章」的通道投递（`sessionController.prompt` /
 //      `subagents.sendMessage`）—— 实测宿主把来源写死成 `kind: 'user'`，GUI 里就是**用户气泡**。
@@ -148,12 +148,14 @@ for (const dir of SCAN_DIRS) {
 
 check('扫描覆盖了源码与构建产物', totalFiles > 0, 'no files scanned')
 
-// ② 有构造，就必须有显式来源：source + plugin + form。
+// ② 有构造，就必须有显式来源：source + kind + form。
 //    没有 source 的消息无法被追溯；没有 form 的消息在客户端会退化成 opaque 行。
+//    0.1.7 起 `MessageSourceMap` 没有通用的 `plugin` 兜底种类，每个生产者声明自己的
+//    `kind`（本仓库在 `src/contract.ts` 里声明 `'dsh-collab'`），所以规则查的是 `kind`。
 for (const { dir, f, text } of constructors) {
   const who = `${dir}/${f}`
   check(`${who} 构造消息时带 source`, /\bsource\s*:/.test(text), '缺 source —— 无来源的消息无法追溯')
-  check(`${who} source 带 plugin 标签`, /\bplugin\s*:\s*['"]/.test(text), '缺 plugin 标签 —— 来源不可读')
+  check(`${who} source 带 kind 标签`, /\bkind\s*:\s*['"]/.test(text), '缺 kind 标签 —— 来源不可读')
   check(`${who} source 带 form`, /\bform\s*:\s*['"]/.test(text), "缺 form —— 客户端会退化成 opaque 行")
   // notice 必须带 summary，否则 `contextBody` 的 case "notice" 会返回 opaque。
   if (/\bform\s*:\s*['"]notice['"]/.test(text)) {
@@ -168,7 +170,13 @@ for (const { dir, f, text } of constructors) {
 const access = readFileSync(join(ROOT, 'src/access.ts'), 'utf8')
 check('访问通知经 agent.inject 逐事件投递', /\.inject\s*\(/.test(access), 'src/access.ts 里找不到 agent.inject')
 check('访问通知不再注册 systemPrompt 上下文段', !/systemPrompt/.test(access), 'src/access.ts 里仍有 systemPrompt —— 载体又变了')
-check('访问通知的 source 标注为 dsh-collab', /plugin:\s*'dsh-collab'/.test(access), "source.plugin 不是 'dsh-collab'")
+check('访问通知的 source 标注为 dsh-collab', /\bkind\s*:\s*'dsh-collab'/.test(access), "source.kind 不是 'dsh-collab'")
+// 0.1.7 的 `MessageSourceMap` 是 merge-extensible 的，本仓库必须自己声明这个 kind，
+// 否则 `createUserMessage({ source: { kind: 'dsh-collab', … } })` 连编译都过不去。
+const contract = readFileSync(join(ROOT, 'src/contract.ts'), 'utf8')
+check('契约里为 source 声明了 dsh-collab 种类',
+  /interface\s+MessageSourceMap\s*\{[\s\S]{0,400}?'dsh-collab'/.test(contract),
+  'src/contract.ts 里没有 augment MessageSourceMap —— 0.1.7 起没有通用 plugin 兜底')
 
 // 跨会话通知（释放推送）与访问通知同载体：0.9.6 起 src/push.ts 是唯一的投递面，
 // 必须是「自造显式来源消息 + agent.inject」，且代码里不再出现任何宿主代造通道。

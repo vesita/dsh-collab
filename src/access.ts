@@ -2,9 +2,9 @@
 // **功能 A：访问路径相关通知 —— 逐事件投递一条显式标注来源的 notice 消息。**
 //
 // 载体（规范见 AGENTS.md §1「严禁冒充用户」）：
-//   source = { kind: 'plugin', plugin: 'dsh-collab', form: 'notice', summary }
+//   source = { kind: 'dsh-collab', form: 'notice', summary }
 // 客户端的分流判据只有一条 —— `source.kind !== 'user'` ⇒ 渲染成 context 节点
-// （`dsh-client-ui-chat/lib/client.js:6058`），所以这条消息是 **notice 行，不是用户气泡**：
+// （`dsh-client-ui-chat/lib/client.js:8757`），所以这条消息是 **notice 行，不是用户气泡**：
 // 它明确标注了来源，冒充不了用户。这是生态里逐事件通知的标准写法
 // （对照 `dsh-tool-jobs/lib/index.js:208-226`）。
 //
@@ -106,7 +106,7 @@ export function installAccess(ctx: CollabContext, store: StateStore): void {
   /**
    * 访问通知消息：**显式标注来源的 notice**。
    * `form: 'notice'` **必须带非空 `summary`**，否则客户端会把它退化成 opaque 行
-   * （`dsh-client-ui-chat/lib/client.js:795-800` 的 `case "notice"` 先算 `noticeSummary`）。
+   * （`dsh-client-ui-chat/lib/client.js:825-831` 的 `case "notice"` 先算 `noticeSummary`）。
    * 120 字符上限由 `boundContextSummary` 保证 —— 与生态里 5 个包同款用法。
    */
   function accessNoticeMessage(entries: Claim[]) {
@@ -114,8 +114,7 @@ export function installAccess(ctx: CollabContext, store: StateStore): void {
     return createUserMessage({
       content: [{ type: 'text' as const, text: renderAccessNotice(entries) }],
       source: {
-        kind: 'plugin' as const,
-        plugin: 'dsh-collab',
+        kind: 'dsh-collab' as const,
         form: 'notice' as const,
         summary: boundContextSummary('collab 占用 · ' + head + (entries.length > 1 ? ' 等 ' + entries.length + ' 条' : ''))
       }

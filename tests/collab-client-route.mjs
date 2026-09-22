@@ -138,7 +138,7 @@ console.log('# (a)(b)(c)(d)(e)(g)(h) route registration, payload, method fence, 
   let payload = null
   try { payload = JSON.parse(getRes.body) } catch (e) { payload = null }
   ok(payload !== null, 'GET body is valid JSON', String(getRes.body).slice(0, 120))
-  ok(!!payload && payload.namespace === 'dsh-collab', 'payload namespace is dsh-collab', String(payload && payload.namespace))
+  ok(!!payload && payload.namespace === DELEGATION_SETTINGS_NAMESPACE, 'payload namespace is the profile entry id', String(payload && payload.namespace))
   ok(!!payload && payload.namespace === DELEGATION_SETTINGS_NAMESPACE, 'payload namespace matches the exported constant')
   ok(!!payload && Array.isArray(payload.items) && payload.items.length === 1, 'payload carries exactly one item', JSON.stringify(payload && payload.items))
   const item = payload && payload.items ? payload.items[0] : null
@@ -195,7 +195,7 @@ console.log('# (a)(b)(c)(d)(e)(g)(h) route registration, payload, method fence, 
 console.log('# (f) missing skill file degrades to skill:null (no throw, no invented path)')
 {
   const index = buildSkillIndex(null)
-  ok(index.namespace === 'dsh-collab', 'degraded payload keeps the namespace', String(index.namespace))
+  ok(index.namespace === DELEGATION_SETTINGS_NAMESPACE, 'degraded payload keeps the namespace', String(index.namespace))
   ok(Array.isArray(index.items) && index.items.length === 1, 'degraded payload keeps the item', JSON.stringify(index.items))
   ok(index.items[0].field === 'exposeDelegationDiscipline', 'degraded item keeps the field name', String(index.items[0].field))
   ok(index.items[0].skill === null, 'degraded item reports skill:null instead of a guessed path', JSON.stringify(index.items[0].skill))

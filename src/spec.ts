@@ -11,8 +11,14 @@ import type { DelegationSettings } from './contract.js'
 /** 浏览器半边读取「设置项 ↔ 随包 skill」关联的只读 loopback 路由。 */
 export const CLIENT_SKILL_ROUTE = '/dsh-collab/skill-index'
 
-/** 偏好设置命名空间。 */
-export const DELEGATION_SETTINGS_NAMESPACE = 'dsh-collab'
+/**
+ * 偏好设置的命名空间。
+ *
+ * 0.1.7 起设置由**当前 Profile 的插件配置**保存（`@deepseek-ai/dsh-settings`），插件不再
+ * 自建 section：命名空间就是本插件在 profile 里的**条目 id**。用户的 profile patch 里
+ * `id: collab` 就是这个值（见 `cordis.patch.yml`），两者必须逐字一致。
+ */
+export const DELEGATION_SETTINGS_NAMESPACE = 'collab'
 
 /**
  * 循环终止自动释放的宽限期（秒）：循环停下（agent/status → idle）后等这么久，
@@ -31,18 +37,26 @@ export const LOOP_END_GRACE_SEC_DEFAULT: number = 120
 export const LOOP_END_GRACE_SEC_MIN: number = 1
 export const LOOP_END_GRACE_SEC_MAX: number = 3600
 
-/** 设置契约：默认**开启**——目标是让这套工作方式真的发生，开关是用来关掉它的。 */
+/**
+ * 本插件的 Config schema：三个开关 + 宽限期，全部声明 `.volatile()`。
+ *
+ * 0.1.7 起插件设置就是这个 Config 的 volatile 字段（`@deepseek-ai/dsh-settings` 的表单
+ * 只展示 volatile 字段），改一个字段**不需要重载插件**：Loader 把新值写进正在运行的
+ * fiber，再发一次 `loader/volatile-update`，本插件在那里重新结算（见 src/delegation.ts）。
+ *
+ * 默认**开启**——目标是让这套工作方式真的发生，开关是用来关掉它的。
+ */
 export const DELEGATION_SETTINGS_SCHEMA = z.object({
-  exposeDelegationDiscipline: z.boolean().default(true),
+  exposeDelegationDiscipline: z.boolean().default(true).volatile(),
   // 功能 C：写保护默认开。默认值就是"必须拦"，所以它只能被显式关掉。
-  enforceWriteLock: z.boolean().default(true),
+  enforceWriteLock: z.boolean().default(true).volatile(),
   // 循环终止自动释放（0.9.10）：默认开。关掉它对应用户明确要求"锁必须活到我手动释放"。
-  releaseOnLoopEnd: z.boolean().default(true),
+  releaseOnLoopEnd: z.boolean().default(true).volatile(),
   // 宽限期（秒）。夹在 [1, 3600]：0 会把"每个回合之间的停顿"也算成循环终止。
-  loopEndGraceSec: z.number().min(LOOP_END_GRACE_SEC_MIN).max(LOOP_END_GRACE_SEC_MAX).default(LOOP_END_GRACE_SEC_DEFAULT)
+  loopEndGraceSec: z.number().min(LOOP_END_GRACE_SEC_MIN).max(LOOP_END_GRACE_SEC_MAX).default(LOOP_END_GRACE_SEC_DEFAULT).volatile()
 })
 
-/** 组合默认值：settings 服务缺失（或 installSection 不可用）时，它就是生效值。 */
+/** schema 校验后的生效值；Config 的默认值本身由 schema 的 `.default()` 负责。 */
 export const DELEGATION_SETTINGS_ENTRY: DelegationSettings = {
   exposeDelegationDiscipline: true,
   enforceWriteLock: true,
