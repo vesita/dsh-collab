@@ -53,12 +53,8 @@
     const WRITE_LOCK_FIELD = 'enforceWriteLock'
     /** 循环终止自动释放的开关（布尔，默认 **true**；字段名与 Host 半边 schema 逐字一致）。 */
     const AUTO_RELEASE_FIELD = 'releaseOnLoopEnd'
-    /** 上面那条的宽限期秒数（数字，默认 15；Host 半边把它夹在 [1, 3600]）。 */
+    /** 上面那条的宽限期秒数（数字；默认值与上下界都在 Host 半边的 spec.ts，界面只编辑不解释）。 */
     const AUTO_RELEASE_GRACE_FIELD = 'loopEndGraceSec'
-    /** Host 半边 spec.ts 的三个常量，逐字对齐（这里只做前端夹取与回退，权威仍在 Host）。 */
-    const GRACE_MIN = 1
-    const GRACE_MAX = 3600
-    const GRACE_DEFAULT = 15
     /** Host 半边注册的只读技能索引路由。 */
     const SKILL_ROUTE = '/dsh-collab/skill-index'
     /** 侧边栏「插件」页里本插件那张配置卡的键：必须是 bundle 的包名（= package.json 的 name）。 */

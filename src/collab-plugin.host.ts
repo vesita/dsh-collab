@@ -624,30 +624,31 @@ return {
       if (a.op === 'status') return status(a, aId, agent)
       if (a.op === 'wait') return waitFor(a, h, aId, agent)
       if (a.op === 'reap') return mutate(s => reap(s, h, a, liveAgentHolderIds(), now()), aId, agent)
-      return { ok: false, error: 'bad-request', message: 'unknown op: ' + String(a.op) }
+      return { ok: false, error: 'bad-request', message: '未知操作：' + String(a.op) }
     })
     const board = exec((a, h, name, aId, agent) => {
       if (a.op === 'post') return mutate(s => post(s, h, name, a), aId, agent)
       if (a.op === 'read') return msgs(a, aId, agent)
-      return { ok: false, error: 'bad-request', message: 'unknown op: ' + String(a.op) }
+      return { ok: false, error: 'bad-request', message: '未知操作：' + String(a.op) }
     })
     const render = (args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }]
     const lockTool = harness.defineTool({
       name: 'collab_lock',
-      description: '多智能体协作中央注册锁：开工前声明占用项目文件夹（目录以 / 结尾，如 src/backend/），查询他人占用，减少共同开发冲突。规范：动手改代码前先 claim；开工前和定期 list/overview；冲突时先 wait 等待或用 board 留言协商；完成即 release；长任务 heartbeat 续租；被强杀的会话会留下僵尸声明，默认 dry-run 的 op=reap 可显式回收（先看候选，再 confirm:true）。会话循环结束（空闲超过宽限期，默认 15 秒）后，你的声明会被自动释放：恢复工作前请重新 claim。',
+      description: '多智能体协作中央注册锁：开工前声明占用项目文件夹（目录以 / 结尾，如 src/backend/），查询他人占用，减少共同开发冲突。规范：动手改代码前先 claim；开工前和定期 list/overview；冲突时先 wait 或用 board 协商；完成即 release；长任务 heartbeat 续租；被强杀的会话会留下僵尸声明，op=reap 可回收（默认只列候选，confirm:true 才真删）。会话循环结束、空闲超过宽限期（默认 120 秒，随 collab 设置变）后你的声明会被自动释放：恢复工作前重新 claim。',
       parameters: {
         type: 'object',
         additionalProperties: true,
         properties: {
           op: { type: 'string', enum: ['claim', 'release', 'list', 'overview', 'status', 'heartbeat', 'wait', 'reap'], description: 'claim 声明 / release 释放 / list 全部 / overview 占用全景 / status 查路径 / heartbeat 续租 / wait 等待路径释放 / reap 显式回收僵尸声明（默认 dry-run）' },
-          paths: { type: 'array', items: { type: 'string' }, description: '项目相对路径' },
+          paths: { type: 'array', items: { type: 'string' }, description: '项目相对路径；claim、status、wait 用；目录以 / 结尾表示整棵子树' },
           claimId: { type: 'string', description: 'claim id，release/heartbeat 用' },
           mode: { type: 'string', enum: ['exclusive', 'shared', 'read'], description: 'exclusive 独占（默认）；shared 声明共用但被独占挡住；read 只读观测，不排他也不被挡' },
+          readable: { type: 'boolean', description: 'claim 用：他人是否可读这些路径，默认 true；false 表示他人读取也要先协商（写入对非持有者始终要协商）' },
           ttlSec: { type: 'number', description: '租约秒数（5-86400），默认 1800' },
           timeoutMs: { type: 'number', description: 'wait 用，最多等待毫秒，默认 30000' },
           confirm: { type: 'boolean', description: 'reap 用：默认 false = dry-run，只列候选、绝不改状态；显式 true 才真正删除僵尸声明' },
           olderThanSec: { type: 'number', description: 'reap 用：age 门槛（秒），声明创建至今必须严格大于它才算候选，默认 600' },
-          note: { type: 'string', description: '占用说明' }
+          note: { type: 'string', description: '占用说明，显示在 list/overview 里' }
         },
         required: ['op']
       },
@@ -661,7 +662,7 @@ return {
         type: 'object',
         additionalProperties: true,
         properties: {
-          op: { type: 'string', enum: ['post', 'read'] },
+          op: { type: 'string', enum: ['post', 'read'], description: 'post 发消息 / read 增量读取' },
           channel: { type: 'string', description: '频道，默认 general' },
           body: { type: 'string', description: 'post 用，消息正文' },
           mentions: { type: 'array', items: { type: 'string' }, description: '被 @ 的 holderId' },
@@ -881,7 +882,7 @@ return {
     // @deepseek-ai/dsh-llm，构造不出「显式来源的 notice」，而 AGENTS.md §1 禁止退回任何会冒充
     // 用户的通道，所以本形态只做状态变更（释放 + 留言板留痕）。包形态才发读者/本人两条告知。
     // 宽限期**常量 120 秒**（0.9.11 起；包形态的 loopEndGraceSec 默认值也是它）：
-    // 动态形态读不到 settings 服务。15 秒会把"派完子代理、等它跑几分钟"误判成循环终止。
+    // 动态形态读不到 settings 服务，所以这里写死常量；旧的十几秒会把"派完子代理、等它跑几分钟"误判成循环终止。
     // tests/collab-hostcode-parity.mjs 会真实触发这条接线，断言"未过期声明在宽限期到点后被释放"。
     const LOOP_END_GRACE_SEC = 120
     const armedIdle = new Map()

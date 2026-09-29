@@ -8,7 +8,7 @@ import { createHarness, skippedOrRejected, loadCosmokit } from './_harness.mjs'
 //       <deploy>/@deepseek-ai/cordis
 //       <deploy>/@deepseek-ai/dsh-skill
 //   - 部署 node_modules 的根用 `DSH_DEPLOY_NODE_MODULES` 指定；
-//     未设置时退回到本机默认路径（/usr/lib/node_modules/@deepseek-ai/dsh/node_modules）。
+//     未设置时退回到本机默认路径（/usr/lib/deepseek-harness/node_modules，dsh 0.2.0-rc.1 的私有前缀）。
 //   - 插件从**本仓库自己的构建产物**加载（默认 ../lib/index.js，可用
 //     `DSH_COLLAB_PLUGIN_ENTRY` 覆盖，便于对打包产物做同样一遍验证）。
 //   - 找不到部署或构建产物时**默认按失败退出（exit 1）**——"没跑"不伪装成"通过"。
@@ -35,7 +35,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 
 const ROOT = path.dirname(new URL(import.meta.url).pathname)
-const DEFAULT_DEPLOY = '/usr/lib/node_modules/@deepseek-ai/dsh/node_modules'
+const DEFAULT_DEPLOY = '/usr/lib/deepseek-harness/node_modules'
 const DEPLOY = process.env.DSH_DEPLOY_NODE_MODULES || DEFAULT_DEPLOY
 const PLUGIN_ENTRY = process.env.DSH_COLLAB_PLUGIN_ENTRY || path.join(ROOT, '../lib/index.js')
 

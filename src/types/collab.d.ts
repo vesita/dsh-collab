@@ -30,7 +30,7 @@ export interface Claim {
    *   1) 租约到期 `expiresAt`（sweep，唯一无条件的回收路径）；
    *   2) 持有者显式 `op=release`；
    *   3) **循环终止自动释放**（0.9.10，`releaseOnLoopEnd`）：`agent/status` → `idle` 且空闲超过
-   *      宽限期（默认 15 秒，可在 settings 关掉）—— 触发者不是 dispose，而是"循环停了、
+   *      宽限期（默认两分钟，可在 settings 关掉）—— 触发者不是 dispose，而是"循环停了、
    *      但 agent 还加载着"这一刻，见 src/auto-release.ts。恢复工作前必须重新 claim。
    * 0.8.3 起 sweep() 不再按 liveness 清理 —— `agents.get()` 对休眠但可唤回的会话
    * 返回 undefined，按它清理会把只是空闲的读者删掉，静默丢掉释放通知。

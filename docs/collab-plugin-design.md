@@ -257,7 +257,7 @@ Holder = {
 - **租约扫描**：状态文件每次读/写前惰性 `sweep()`（`expiresAt > now` 才算占用），没有后台定时器；
   租约上限 24h，是**最后的兜底**；
 - **三条回收路径**（见 README 0.9.10）：租约到期、持有者 `op=release`、**循环终止自动释放**
-  （`agent/status` → `idle` 且空闲超过宽限期，默认 15 秒；期内恢复 `running` 即取消，到点须仍解析到
+  （`agent/status` → `idle` 且空闲超过宽限期，默认两分钟；期内恢复 `running` 即取消，到点须仍解析到
   该 agent 且状态为 `idle` —— 已 dispose 的一律不放）；
 - **`agent/disposed` 不释放未过期声明**（W7）：只摘掉该 holder 的 `readers` 登记 + 回收它已过期的声明；
 - **`op=reap`**（0.9.8）：`agents.list()` 分不清"休眠可唤回"与"真死"，故默认 dry-run、只由显式 `confirm` 触发；

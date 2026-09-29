@@ -177,6 +177,10 @@ console.log('# (b)(c)(g) preference ON (explicit true): skill + constant discipl
     ok(!/[0-9]/.test(t1), 'discipline text contains no digits that could drift', t1)
     ok(t1.includes('[dsh-collab]'), 'discipline text carries the [dsh-collab] marker', t1)
     ok(/子代理/.test(t1) && /验收/.test(t1) && /原始输出/.test(t1), 'discipline text states the delegation + acceptance + raw-evidence rules', t1)
+    // 指名换模型是**被明确要求**的行为：它必须留在常驻文本里，且必须点名真实存在的接口
+    // （`provider` / `model` 参数与 `list_subagent_models` 工具），否则模型只会看到一句空话。
+    ok(t1.includes('provider / model') && t1.includes('list_subagent_models'),
+      'discipline text tells the model to name a different subagent model (provider / model + list_subagent_models)', t1)
     ok(!/租约|剩 \d|expires/.test(t1), 'discipline text does not duplicate the awareness digest job', t1)
   }
 

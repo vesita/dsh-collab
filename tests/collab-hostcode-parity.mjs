@@ -94,6 +94,19 @@ try {
     ? lock.parameters.properties.mode.enum : null
   ok(Array.isArray(modeEnum) && MODES.every((m) => modeEnum.includes(m)),
     'dynamic-form schema advertises every valid mode (incl. read)', JSON.stringify(modeEnum))
+  // 同类漂移的另一半：参数**集合**也必须与契约 JSON Schema 逐字一致。上面那条只看 mode 的枚举值，
+  // 查不出"少了一个参数" —— 而动态形态先前正好缺 `readable`（包形态能收、动态形态静默拒收），
+  // 这条差异此前没有任何检查。期望值从 SSOT 读，不在这里再抄一份。
+  const schema = JSON.parse(readFileSync(path.join(ROOT, '../src/schema/collab.schema.json'), 'utf8'))
+  const keysOf = (t) => (t && t.parameters && t.parameters.properties ? Object.keys(t.parameters.properties).sort() : [])
+  const lockKeys = keysOf(lock)
+  const lockContractKeys = Object.keys(schema.$defs.colabLockParams.properties).sort()
+  ok(JSON.stringify(lockKeys) === JSON.stringify(lockContractKeys),
+    'dynamic-form collab_lock advertises exactly the contract parameter set', JSON.stringify({ lockKeys, lockContractKeys }))
+  const boardKeys = keysOf(tools.find((t) => t.name === 'collab_board'))
+  const boardContractKeys = Object.keys(schema.$defs.colabBoardParams.properties).sort()
+  ok(JSON.stringify(boardKeys) === JSON.stringify(boardContractKeys),
+    'dynamic-form collab_board advertises exactly the contract parameter set', JSON.stringify({ boardKeys, boardContractKeys }))
 } catch (e) {
   ok(false, 'hostCode must load without throwing', String((e && e.stack) || e))
 }

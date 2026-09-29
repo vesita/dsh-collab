@@ -20,7 +20,7 @@ export interface DelegationPrefs {
   enforceWriteLockEnabled(): boolean
   /** 循环终止自动释放总开关，**活读**；默认 true（见 src/auto-release.ts）。 */
   releaseOnLoopEndEnabled(): boolean
-  /** 循环终止自动释放的宽限毫秒数，**活读**；默认 15 秒，夹在 spec 的上下界内。 */
+  /** 循环终止自动释放的宽限毫秒数，**活读**；默认两分钟（spec 的 LOOP_END_GRACE_SEC_DEFAULT），夹在 spec 的上下界内。 */
   loopEndGraceMs(): number
 }
 
@@ -79,7 +79,7 @@ export function installDelegation(
   }
 
   /**
-   * 宽限毫秒数，**活读**。非有限数 / 越界一律回落到默认 15 秒：
+   * 宽限毫秒数，**活读**。非有限数 / 越界一律回落到默认两分钟（= LOOP_END_GRACE_SEC_DEFAULT）：
    * 这条值决定"多久之后自动放锁"，绝不接受 NaN（会让计时器立即触发）或 0 之类的坏输入。
    */
   const loopEndGraceMs = (): number => {

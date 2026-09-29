@@ -1,6 +1,6 @@
 {
   "name": "dsh-collab",
-  "version": "0.11.2",
+  "version": "0.11.4",
   "description": "DSH 插件：多会话协作与路径占用管理 —— 会话之间实时同步占用状态，动手前声明、冲突时协商、完成后释放",
   "type": "module",
   "main": "lib/index.js",
@@ -41,14 +41,14 @@
     "lint": "tsc --noEmit"
   },
   "dependencies": {
-    "@deepseek-ai/schemastery": "^3.18.3"
+    "@deepseek-ai/schemastery": "~3.18.4"
   },
   "peerDependencies": {
-    "@deepseek-ai/dsh-llm": "^0.1.7-alpha.1",
-    "@deepseek-ai/dsh-tools": "^0.1.7-alpha.1"
+    "@deepseek-ai/dsh-llm": "^0.2.0-rc.1",
+    "@deepseek-ai/dsh-tools": "^0.2.0-rc.1"
   },
   "devDependencies": {
-    "@deepseek-ai/dsh-llm": "0.1.7-alpha.1",
+    "@deepseek-ai/dsh-llm": "0.2.0-rc.2",
     "@types/node": "^22.20.1",
     "typescript": "^5.9.3"
   },
