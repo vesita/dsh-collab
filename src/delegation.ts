@@ -7,7 +7,7 @@
 
 import { dirname } from 'node:path'
 import {
-  DELEGATION_SETTINGS_ENTRY, DELEGATION_DISCIPLINE_TEXT, TEAM_DISCIPLINE_ADDENDUM,
+  DELEGATION_SETTINGS_ENTRY, DELEGATION_DISCIPLINE_TEXT,
   LOOP_END_GRACE_SEC_DEFAULT, LOOP_END_GRACE_SEC_MIN, LOOP_END_GRACE_SEC_MAX
 } from './spec.js'
 import { loadBundledSkill } from './skill.js'
@@ -138,11 +138,11 @@ export function installDelegation(
               name: 'dsh-collab/delegation',
               order: 131,
               // 常量：每次装配返回同一个串，快照去重才能生效。
-              // 官方 Agent Teams 在场时追加一段（同样是不含数字的常量），否则**一字不变** ——
-              // "服务缺席时输出不变"是本插件对官方插件的定位契约（README「分工（定位）」）。
-              text: () => ctx.get('agentTeams')
-                ? DELEGATION_DISCIPLINE_TEXT + '\n' + TEAM_DISCIPLINE_ADDENDUM
-                : DELEGATION_DISCIPLINE_TEXT
+              // 官方 Agent Teams 是否在场**都不追加任何文本** —— teammate 工具语义由官方
+              // `team:policy` 段自己给出（`dsh-experimental-tool-agent-team/lib/index.js:21-27`），
+              // 本插件重讲一遍就是重复建设。纪律块里只留官方不覆盖的：委托判据、验收、
+              // 并发约束，以及"被唤醒的子代理不知道自己已经丢锁"这条 collab 事实。
+              text: () => DELEGATION_DISCIPLINE_TEXT
             })
             let live = true
             disciplineStop = () => { if (!live) return; live = false; disciplineStop = null; off() }

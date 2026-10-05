@@ -291,9 +291,10 @@
      required inactive teammate before waiting again."}}`。唤醒后 teammate 会话 `turn/start` 从 1 → 3，
      并按第二条消息里的指令写了两个文件 ⇒ **恢复路径有效**。
      真正变的是"主体"：legacy `tool-subagent*` 被 agent-team bundle 在部署层禁用，`list_agents` 不再
-     列出它们（Web profile 的 preset 里仍有 legacy 控件，只是被同名团队工具**遮蔽**）。因此 0.11.0 在
-     `ctx.agentTeams` 在场时给委托纪律追加一段面向 teammate 的措辞（`TEAM_DISCIPLINE_ADDENDUM`），
-     未启用时那段纪律一字不变。
+     列出它们（Web profile 的 preset 里仍有 legacy 控件，只是被同名团队工具**遮蔽**）。0.11.0 曾据此在
+     `ctx.agentTeams` 在场时给委托纪律追加一段面向 teammate 的措辞（`TEAM_DISCIPLINE_ADDENDUM`）；
+     **0.12.0 已删除** —— 那些语义官方 `team:policy` 段
+     （`dsh-experimental-tool-agent-team/lib/index.js:21-27`）自己会讲，现在服务在场/缺席的纪律文本逐字节相同。
   4. **`write_scopes` 实测纯 advisory，没有任何人按它写**。`team_task_create write_scopes=["inside/"]`
      → `writeScopes:["inside"]`；`team_task_update action=claim` → `status:"in_progress"`、
      `writeScopeWarnings:[]`；被唤醒的 teammate 同时写 `outside/proof.txt`（**在声明写域之外**）与
@@ -362,6 +363,47 @@
   并重载插件；运行中的进程仍加载着旧的 0.10.1 模块。
 - **未验证**：重装后在浏览器里那张卡片真的渲染出四个字段（本次只验证到 Host 侧
   `default.Config` 存在、schema 接受本部署的值、且卡片注册面未变）。
+
+---
+
+### 2.23 持有者异常退场时的锁滞留：逐条边界与处置（0.12.0）
+
+- **场景（用户提出）**：子代理突然空回复、网络中断（回合以 `error` 结束）、会话意外结束
+  这三种情况下，它持有的声明会怎样？
+- **审计方式**：只读代码审计 + `tests/collab-auto-release.mjs` 的假计时器/假注册表复现
+  （不是读代码猜的；`file:line` 见下）。
+- **逐条现状（0.12.0 之前）**：
+  1. **子代理正常转 `idle`**：它自己的自动释放会在宽限后放掉它的声明；父会话不被它挡
+     （家族豁免，`collab-core.ts:747,947`、`gate.ts:64`）。**已覆盖**。
+  2. **子代理回合以 `error` / 空收尾结束、随后转 `idle`**：同上，走第 1 条。**已覆盖**。
+  3. **子代理状态**停在** `running`**（回合结束了但状态没落地，或驱动卡在网络上不再推进）：
+     父会话的第 4 道闸门（`auto-release.ts:172-186`）**无限重新武装**，父锁被一个已经不在干活的
+     后代永久扣住。**这是 0.12.0 修的洞**：延期上限 10 轮宽限期（默认约 20 分钟），到顶照常释放；
+     会话恢复 `running` 时预算清零（`auto-release.ts` 的 `CHILD_DEFER_MAX_ROUNDS` / `deferrals`，
+     动态形态同源 `collab-plugin.host.ts`）。测试：`tests/collab-auto-release.mjs` §14。
+  4. **会话被 `dispose`**：只回收**已过期**声明并摘 readers（`collab-core.ts:587-600`），未过期的
+     保留 —— W7 的取舍（`collab-core.ts:808-818`），**未改**。
+  5. **进程被杀**：既没有 `agent/status` 也没有 `agent/disposed`，**没有任何代码路径**能看到它；
+     声明只能等租约到期（下次写 op 的 `sweep`，`collab-core.ts:266-268`）或显式
+     `op=reap confirm:true`。**未改**，原因见下。
+- **为什么不动 4 和 5**：判据只能来自 `agents.list()`，而它**只含本进程此刻加载着的 agent**
+  （`store.ts:120-135`）—— 跨进程活着的会话同样不在里面。把它接进自动回收会**误杀**跨进程持有者
+  （被回收的一方恢复后仍以为自己持锁，两边同时写，见 `collab-core.ts:808-818` 的 W7 论证）。
+  要安全自动化，必须先有一条**跨进程的活性见证**（按项目落盘的进程心跳），那是独立一块工作。
+- **6. 子代理会话退场后，它的未过期声明会挡住**父会话**（本次现场实测）**：家族豁免靠
+  `agents.list()` 现算血缘（`store.ts:182-211`），而子代理一旦 `dispose` 就离开注册表 ⇒ 父算不出
+  它是自家人 ⇒ 它这条**未过期**声明在父会话眼里是"陌生人的锁"，写门控直接 `ask`（本部署=拒）。
+  现场：本次会话派出的子代理持声明 `c_75`（`dsh-collab/docs/dsh-subagent-routing.md`，
+  `ttlSec 1800`）后结束，父会话随后编辑同一文件被拒（`the user rejected tool "edit"`）；
+  `op=status` 里两条 exclusive 并列而 `op=claim` 的家族判据已不含 `c_75`；
+  `op=reap olderThanSec=0 confirm=true` 把它回收，`reasons` 原文为
+  `["unexpired","agent-holder","not-self","holder-not-in-agents-list","age-over-threshold","paths-intersect"]`、
+  `ageSec 428`、`remainingSec 1372` —— 也就是说：**若不手工 reap，父会话要被自己子代理的锁挡到租约到期**。
+  注意它没走"循环终止自动释放"：子代理直接退场（没有可用的 `agent/status → idle` 窗口）。
+  **未改**：正解是让血缘**随声明落盘**（claim 记下持有时刻的祖先链），或给跨进程活性见证；
+  两者都是契约级改动（schema SSOT + 四份派生物 + 两形态），不在本次范围内。
+- **仍未验证**：`subagent/end` 事件能否作为"后代已结束"的精确信号（它带子会话 id，
+  `dsh-subagent/lib/types/types.d.ts:93-111`）；若可用，第 3 条可以做到秒级而不是 20 分钟。
 
 ---
 

@@ -17,7 +17,7 @@
 
 > 面向使用者的完整规范见 [`docs/collab-usage.md`](docs/collab-usage.md)。
 >
-> 子代理路由（默认继承父会话 vs 用原生 preset 固定成配置路由）的机制与实测证据见
+> 子代理路由（默认继承父会话 vs 调用时显式点名）的机制与实测证据见
 > [`docs/dsh-subagent-routing.md`](docs/dsh-subagent-routing.md) —— **那是文档，不是提示词**，
 > 不进 `skills/`、不进运行时纪律文本。
 
@@ -25,7 +25,7 @@
 
 DSH 自带一套实验性的 `Agent Teams`（`dsh-experimental-agent-team*`）：安装后是**关**的，
 安装层把它登记在 `OPTIONAL_BUNDLES` 里，没有任何内置 profile 模板启用它
-（`dsh-app-boot/lib/index.js:347`、`dsh-experimental-agent-team-profile/README.md:105`）。
+（`dsh-app-boot/lib/index.js:557`、`dsh-experimental-agent-team-profile/README.md:104`）。
 两者**同域不同层**：
 
 | | 官方 Agent Teams | 本插件（Collab） |
@@ -35,7 +35,7 @@ DSH 自带一套实验性的 `Agent Teams`（`dsh-experimental-agent-team*`）�
 | 伙伴怎么来 | `spawn_teammate` 现造，`fresh` 或 `fork` | 本来就在那儿：先声明路径，再动手 |
 | 共享什么 | 持久信箱 + 共享任务 DAG（`team_task_*`，revision CAS） | 租约式路径声明（`collab_lock`）+ 留言板（`collab_board`） |
 | 文件冲突 | `write_scopes` 明确是 advisory：*"advisory, not a lock"*（`dsh-experimental-tool-agent-team/lib/index.js:23`） | 路径占用 + 原生写门控，唯一带"这块归谁"语义的一层 |
-| 跨进程 | 不支持：一个进程一个 Team、共享同一个 checkout（`dsh-experimental-agent-team/README.md:202,206`） | 状态按项目 cwd 派生落盘，跨进程共享 |
+| 跨进程 | 不支持：一个进程一个 Team、共享同一个 checkout（`dsh-experimental-agent-team/README.md:205,209`） | 状态按项目 cwd 派生落盘，跨进程共享 |
 | 默认 | 关（experimental，*"carries no stability promise"*） | 常驻（profile 插件条目 `collab`） |
 
 **判据一句话**：官方管**树内**（谁干什么活、活之间的依赖），本插件管**树间**（同一个仓库里
@@ -58,16 +58,28 @@ DSH 自带一套实验性的 `Agent Teams`（`dsh-experimental-agent-team*`）�
    同一层级的两个 teammate 互不为祖先/后代，故彼此可见。团队内部的占用由官方任务 DAG 的
    `write_scopes` 表达 —— 而实测那只是 advisory，不挡任何写入。
 2. **同名工具会被遮蔽**：`tool-agent-team` 在成员作用域内遮蔽全局的 `send_message` /
-   `list_agents` / `interrupt_agent`（`dsh-experimental-tool-agent-team/README.md:99`），
-   它的 profile patch 还会禁用 legacy `tool-subagent*`。本仓库委托纪律里"子代理意外终止先
-   `send_message` 唤醒"这条恢复路径**实测仍然成立**（teammate 转 inactive 后 `send_message` 真的把它
-   唤醒并跑了第二轮），但词表换了：`list_agents` 只列团队成员、状态词是 running / inactive，
-   `wait_agent` 明确不唤醒 inactive 成员。启用 agent-team 时本插件追加一段面向 teammate 的措辞
-   （`TEAM_DISCIPLINE_ADDENDUM`）；未启用时那段纪律一字不变。
+   `list_agents` / `interrupt_agent`（`dsh-experimental-tool-agent-team/README.md:99`）；agent-team
+   profile 补丁里那四行 `disabled` 管的是组合层的 legacy 条目，**preset 自带的同名行不受它管辖** ——
+   本部署实测工具目录里 `subagent` 仍在。团队成员的派生 / 转向 / 等待语义由官方 `team:policy` 段
+   自己写明（`dsh-experimental-tool-agent-team/lib/index.js:21-27`：`inactive` 只表示没有回合在
+   执行、`wait_agent` 不唤醒、先 `list_agents` 再 `send_message`），本插件不再复述。
 3. **交叉预警是单向、只报不锁的**：`ctx.agentTeams` 在场时，本插件把官方在跑任务的 `write_scopes`
    当 advisory 占用读进态势摘要与 `overview` / `claim` 返回，并在团队建/改任务的 `tools/pre-execute`
    上提示与外部 `collab_lock` 声明的重叠。官方那侧仍然读不到本插件；预警**不改变任何门控语义**
    （写入该拒的照拒、该放的照放）。
+
+### 官方覆盖的，本插件不做（0.12.0 逐条核对）
+
+判据是官方 packages 的实现与 README 自述，不是印象：
+
+| 能力 | 官方 Agent Teams | 本插件的取舍 |
+| --- | --- | --- |
+| 成员派生 / 名册 / 转向 / 等待 / 打断 | `spawn_teammate`、`list_agents`、`send_message`、`wait_agent`、`interrupt_agent` | 不重做，也不重讲怎么用 —— 官方 `team:policy` 段已逐条写明（0.12.0 删掉了重复的那段追加文本） |
+| 任务依赖 / 认领 / CAS | `team_task_*`（`revision` CAS、`blocked_by`、owner） | 不重做；只读在跑任务的 `write_scopes` 做交叉预警 |
+| 写协调纪律 | `team:policy`：写域互斥但 advisory、"not a lock"、Lead 复核最终 diff | 不复述；只补官方明说不做的那一层 |
+| 文件系统级锁 / 跨进程 | 明说没有（`dsh-experimental-agent-team/README.md:205,209`） | **互补面**：租约式路径声明 + 原生写门控，状态按项目 cwd 派生、跨进程共享 |
+| 自动释放 owner | 明说没有（同文件 `:208`） | **互补面**：循环终止自动释放 + `op=reap` 回收僵尸声明 |
+| 对非团队成员会话的可见性 | 不给非成员注入任何 prompt，只有浏览器投影 | **互补面**：态势注入进**每一个**同项目会话的运行时上下文 |
 
 ---
 
@@ -80,7 +92,7 @@ DSH 自带一套实验性的 `Agent Teams`（`dsh-experimental-agent-team*`）�
 ├── docs/
 │   ├── collab-plugin-design.md   # 完整设计文档（18 节 + 决策记录 + M1-M3 实现纪要）
 │   ├── collab-usage.md           # 面向任意会话的使用指南
-│   ├── dsh-subagent-routing.md   # DSH 子代理路由：默认继承 vs 原生 preset 固定（机制 + 实测索引；非提示词）
+│   ├── dsh-subagent-routing.md   # DSH 子代理路由：继承、点名与验证（机制 + 实测索引；非提示词）
 │   └── collab-ux-backlog.md      # 使用不便清单与优化方向（含实测使用统计）
 ├── scripts/
 │   ├── collab_models.py          # Python dataclass 模型定义（Schema 派生）
@@ -95,7 +107,7 @@ DSH 自带一套实验性的 `Agent Teams`（`dsh-experimental-agent-team*`）�
 │   ├── tools.ts                  # collab_lock / collab_board 注册（消费 store + push）
 │   ├── access.ts                 # 功能 A：访问通知（逐事件经 agent.inject 投递 form:'notice' 的显式来源消息）+ 读者反向注册（tools/post-execute）
 │   ├── gate.ts                   # 功能 C：写/读的原生审批门控（tools/pre-execute）
-│   ├── auto-release.ts           # 循环终止自动释放（agent/status → idle，宽限 120 秒 + 有子代理在跑不放；tools.ts 之外的第二条回收路径）
+│   ├── auto-release.ts           # 循环终止自动释放（agent/status → idle，宽限 120 秒 + 有子代理在跑不放，延期上限 10 轮；tools.ts 之外的第二条回收路径）
 │   ├── push.ts                   # 功能 D：释放推送（唯一通道 agent.inject + 显式来源 form:'notice'）+ agent/disposed 生命周期
 │   ├── awareness.ts              # 协作态势注入（运行时上下文 order 130）
 │   ├── delegation.ts             # 委托纪律：settings 偏好 + 随包 skill + 常驻纪律块（order 131）
@@ -247,7 +259,7 @@ agents.currentInitiator()            → 正在装配的那个会话
 
 `skills/subagent-delegation/SKILL.md` 随包发布。偏好开启时，插件把它注册进宿主技能注册表（`ctx.skills.register`），标注 `source: 'bundled'`、`provider: 'dsh-collab'`，技能目录里因此能看到它、来源也可辨。注册随 effect disposer 撤回，**可逆**：插件卸载或偏好关闭，该技能随之消失。
 
-技能正文的 §10.4 与常驻纪律文本（`DELEGATION_DISCIPLINE_TEXT`）同时写明一条恢复路径：**子代理意外终止（回合以 `error` / 空收尾结束、久等之后不再是 `running`）时先唤醒它、别急着重派**。唤醒靠 `send_message`（对 `idle` / `ready` 的子代理会**开启一个回合**，且是**同一个会话**，所以它保留着上下文与已完成的工作，比重派便宜），而 `collab_board` 那条通道**唤不醒任何人** —— `agent.inject` 的契约是 `send(msg, 'next-step', wakeup=false)`，只挂进收件箱、不起 driver。两处都提醒：被唤醒的子代理**不知道自己已经丢锁**（循环一停，声明就被自动释放），要让它先 `collab_lock op=claim` 再动手；同一处最多试一两次，之后自己写。
+技能正文的 §10.4 与常驻纪律文本（`DELEGATION_DISCIPLINE_TEXT`）同时写明一条恢复路径：**子代理意外终止（回合以 `error` / 空收尾结束）时先看它还在不在，别急着重派** —— 唤醒走那个能给已停下的它发消息的工具，而 `collab_board` 那条通道**唤不醒任何人**（`agent.inject` 的契约是 `send(msg, 'next-step', wakeup=false)`，只挂进收件箱、不起 driver）。派生 / 转向 / 等待的语义以**你当时的工具目录**为准：启用官方 Agent Teams 时由官方 `team:policy` 段给出（`dsh-experimental-tool-agent-team/lib/index.js:21-27`），本插件不再复述。两处都提醒：被唤醒的子代理**不知道自己已经丢锁**（循环一停，声明就被自动释放），要让它先 `collab_lock op=claim` 再动手；同一处最多试一两次，之后自己写。
 
 插件的**动态宿主形态**（`hostCode` 字符串）刻意不注册该技能：受限动态环境没有包目录、也没有 `import`，无法定位 `<pkg>/skills/subagent-delegation/SKILL.md`。这是环境限制，不是遗漏。
 
@@ -293,8 +305,8 @@ agents.currentInitiator()            → 正在装配的那个会话
 3. **带环保护与深度上限**（16 层）——血缘字段来自会话头，不能假设它良构。
 
 **与自动释放的次序**：家族豁免必须**先**落地。它是"父独占、子代理写不了"的正解，而自动释放
-只是那个死锁的临时出口；先放宽宽限期（或加第四道闸门）会把死锁还回来。理由记在
-「循环终止自动释放」一节。
+只是那个死锁的临时出口；次序反了就会把死锁还回来（第四道闸门自 0.12.0 起有延期上限，那只是把
+"永远不放"收窄成"最多约二十分钟"，不改变这个次序）。理由记在「循环终止自动释放」一节。
 
 **测试**：`tests/collab-pure-logic.mjs`（正负对照：自家人放行 / 无血缘第三方仍 conflict /
 血缘缺省仍 conflict / 父写子占的路径放行 / holders 表不出现 `family`）、
@@ -320,6 +332,11 @@ idle 的 agent 仍在 `agents.list()` 里、仍可唤醒，所以 W7「dispose �
 「会话家族（血缘）」一节）：子代理在跑说明锁还在被用，它只是不在我的循环里。放的时候
 只释放该 holder **未过期**的声明。
 
+**第四道闸门的延期有上限（0.12.0）**：`running` 只是一个状态字段 —— 回合以 `error` / 空收尾
+结束后它可能没落地，或者驱动卡在网络上不再推进，父会话已经 idle 却被"永远在跑的后代"无限期
+扣住。所以最多延期 **10 轮宽限期**（默认 120s × 10 = 20 分钟），到顶照常释放；会话恢复
+`running` 时延期预算清零。
+
 **释放后两条告知**（都经 `agent.inject` 的显式来源 notice）：等待者收到「锁已自动释放」（不是
 "X 已释放"，释放者不是持有者）；被释放的会话本人收到「你的声明已被自动释放，恢复工作前重新
 `claim`」—— 后者是安全阀，否则它恢复后仍以为自己持锁。同时在状态文件里留一条审计留言
@@ -339,7 +356,8 @@ idle 的 agent 仍在 `agents.list()` 里、仍可唤醒，所以 W7「dispose �
 
 **边界**：只覆盖"循环停了、agent 还加载着"的持有者。**已 dispose** 的持有者不在此列 ——
 它收不到告知（注入面对未加载会话不可达），恢复后必然会以为自己还持锁，所以交给租约到期与
-`op=reap`。
+`op=reap`。**被杀的进程**同理：既没有 `agent/status` 也没有 `agent/disposed`，本功能看不到它，
+它的声明只能等租约到期或 `op=reap`。
 
 **设置**：`releaseOnLoopEnd`（默认 `true`）、`loopEndGraceSec`（0.9.11 起默认 `120`，夹在 `[1, 3600]`），
 **活读**——武装后到点前关掉也照样拦住。**取舍**：宽限期排不掉"等真人回复"这种停顿，超过宽限期

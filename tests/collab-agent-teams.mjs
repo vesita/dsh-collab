@@ -18,7 +18,7 @@ import { createHarness } from './_harness.mjs'
 //   5) 反向预警（tools/pre-execute 上的 `team_task_create`）：外部会话的 collab 声明
 //      与团队 write_scopes 重叠时经 `agent.inject` 投一条显式来源的 notice，
 //      **永不阻断**（每个分支都断言 next() 恰好一次）。
-//   6) 启用团队时的委托纪律追加段（order 131）。
+//   6) 启用团队**不**改变委托纪律（order 131 文本恒等于纯常量，不再追加任何段）。
 //
 // 假 ctx 的形态照 tests/collab-awareness.mjs（捕获 systemPrompt.context + 驱动 text()）
 // 与 tests/collab-access-gate.mjs（假 fs/工具注册表、tools/pre-execute 瀑布、agent.inject 记录器）。
@@ -47,7 +47,7 @@ const { projectStateFile } = await import(path.join(ROOT, '../lib/paths.js'))
 const collabPlugin = (await import(path.join(ROOT, '../lib/index.js'))).default
 
 const { teamTaskScopeLine, teamScopeOverlaps, teamCrossWarnLine } = core
-const { DELEGATION_DISCIPLINE_TEXT, TEAM_DISCIPLINE_ADDENDUM } = spec
+const { DELEGATION_DISCIPLINE_TEXT } = spec
 
 const h = createHarness()
 const { ok } = h
@@ -504,29 +504,26 @@ console.log('# 5. 反向预警：外部声明 × 团队写域重叠时 inject �
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// 6. 委托纪律追加段（order 131）
+// 6. 官方 Agent Teams 在场与否都不改委托纪律（order 131）
 // ════════════════════════════════════════════════════════════════════════
-console.log('# 6. 服务在场 -> order-131 文本 = 纯常量 + "\\n" + TEAM_DISCIPLINE_ADDENDUM')
+console.log('# 6. 服务在场/缺席 -> order-131 文本都 === 纯常量')
 {
   const present = await makeHarness({ teamsPresent: true, service: serviceWith([]) })
   ok(!!present.discipline, '服务在场：delegation PromptContext 注册')
   ok(!!present.discipline && present.discipline.order === 131, 'order === 131', String(present.discipline && present.discipline.order))
   const withTeam = present.discipline ? present.discipline.text() : null
-  ok(withTeam === DELEGATION_DISCIPLINE_TEXT + '\n' + TEAM_DISCIPLINE_ADDENDUM,
-    '服务在场：文本 === DELEGATION_DISCIPLINE_TEXT + "\\n" + TEAM_DISCIPLINE_ADDENDUM',
+  ok(withTeam === DELEGATION_DISCIPLINE_TEXT,
+    '服务在场：文本 === DELEGATION_DISCIPLINE_TEXT（不再追加任何段）',
     JSON.stringify(withTeam && withTeam.slice(-70)))
-  ok(typeof withTeam === 'string' && withTeam.length > DELEGATION_DISCIPLINE_TEXT.length,
-    '追加段确实让文本变长（上一条不是恒真）', 'len=' + (withTeam ? withTeam.length : 'n/a'))
-  ok(!/[0-9]/.test(TEAM_DISCIPLINE_ADDENDUM),
-    'TEAM_DISCIPLINE_ADDENDUM 不含阿拉伯数字（tests/collab-skill.mjs 的守护）', TEAM_DISCIPLINE_ADDENDUM)
-  ok(TEAM_DISCIPLINE_ADDENDUM.includes('Agent Teams') && TEAM_DISCIPLINE_ADDENDUM.includes('send_message'),
-    '追加段讲的是官方 Agent Teams 的唤醒路径', TEAM_DISCIPLINE_ADDENDUM)
+  ok(typeof withTeam === 'string' && !withTeam.includes('send_message') && !withTeam.includes('TEAM_DISCIPLINE'),
+    'teammate 工具语义不再由本插件重讲（官方 team:policy 段已覆盖）',
+    JSON.stringify(withTeam && withTeam.slice(-70)))
 
-  // 负向对照：服务缺席时文本回到纯常量（逐字节），两串必须不同。
+  // 负向对照：服务缺席时同一段文本逐字节相同 —— "在场"不再是差异源。
   const absent = await makeHarness({})
   const plain = absent.discipline ? absent.discipline.text() : null
   ok(plain === DELEGATION_DISCIPLINE_TEXT, '服务缺席：文本 === DELEGATION_DISCIPLINE_TEXT', JSON.stringify(plain && plain.slice(-40)))
-  ok(plain !== withTeam, '两串不同（正例断言不是恒真）')
+  ok(plain === withTeam, '两种情形逐字节相同（服务在场不再追加文本）')
 }
 
 h.finish()

@@ -3,6 +3,10 @@
 > 这份文件是**一次性取证记录**：原始命令 + 原始输出片段 → 结论 → 由此改了什么。
 > 事实的家不在这里：定位事实在 `README.md`「与官方 Agent Teams 的分工（定位）」，
 > 使用摩擦与结论在 `docs/collab-ux-backlog.md` §2.21。本文件只证明那两处说的是实测过的。
+>
+> **0.12.0 之后已过时的条目**：本仓库不再追加 `TEAM_DISCIPLINE_ADDENDUM`（§3 末句与 §5 表格里的
+> 那一行）—— teammate 的派生/转向/等待语义由官方 `team:policy` 段自己写明
+> （`dsh-experimental-tool-agent-team/lib/index.js:21-27`）。其余取证内容不受影响。
 
 - DSH：`0.1.7-alpha.1`（`dsh --version`）
 - 官方包：`@deepseek-ai/dsh-experimental-agent-team{,-profile}`、
@@ -121,6 +125,7 @@ teammate 会话的日志：`turn/start count = 3`（spawn 一轮 + 两次唤醒�
 失效的是**旧主体与旧词表**：legacy `tool-subagent*` 在部署层被禁用，`list_agents` 只列团队成员、
 状态是 `running|inactive`（不是 `idle|ready`），且 `wait_agent` 明确不唤醒。
 ⇒ 启用 agent-team 时委托纪律追加 `TEAM_DISCIPLINE_ADDENDUM`；未启用时一字不变。
+（**已过时**，见文首注：0.12.0 删除了该追加段，服务在场/缺席文本逐字节相同。）
 
 ## 4. `write_scopes` 与实际改动对得上吗？——**对不上，纯 advisory，没人按它写**
 

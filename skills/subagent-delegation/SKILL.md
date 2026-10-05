@@ -65,7 +65,7 @@ whenToUse: 非平凡任务开头先判该不该委托（默认要）；探索/�
 
 子代理不写 `provider`/`model` 就**继承你正在用的那一个**（`configured?.provider ?? parentOptions.provider`，`dsh-tool-subagent/lib/model-selection.js`）。选择面分两处，**开关只管前者**：
 
-- **`subagent` / `subagent_fork`（受 Host 开关管辖）**：Host 设置 `subagent-model-selection-settings` 的 `enabled` 为真且 `allowedModels` 非空时，委派工具会多出 `provider` / `model` / `reasoning_effort` 三个参数，并注册 `list_subagent_models` 列出**允许的路由**。两参数必须成对给；路由不在允许列表内会被**拒绝**（`child LLM route "…" is not allowed for this Session`）—— 先 `list_subagent_models` 查、再填，**不要编路由**。
+- **`subagent` / `subagent_fork`（受 Host 开关管辖）**：Host 设置 `subagent-model-selection-settings` 的 `enabled` 为真且 `allowedModels` 非空时，委派工具会多出 `provider` / `model` / `reasoning_effort` 三个参数，并注册 `list_subagent_models` 列出**允许的路由**。两参数必须成对给；路由不在允许列表内会被**拒绝**（`child LLM route "…" is not allowed for this Session`）—— 先 `list_subagent_models` 查、再填，**不要编路由**。官方团队成员工具**没有**路由参数（`spawn_teammate` 只收 name/description/prompt/context），换不了成员模型。
 - **`workflow` 的 `agent(prompt, opts)`（与开关无关）**：`opts.provider` / `opts.model` 一直是每个子代理的独立覆盖，`meta.phases[]` 也能按阶段声明。
 
 **默认动作：委派时挑一个与自己不同的模型。** 理由不是省钱而是**独立性**——同模型同提示的复核会犯同类错（本节第一段），换模型才换掉先验。分工：机械改造/批量替换给便宜快模型；独立复核、对抗性验证给**另一个家族**的模型；需要本会话上下文的判断留在主会话，别外包。
@@ -74,8 +74,11 @@ whenToUse: 非平凡任务开头先判该不该委托（默认要）；探索/�
 
 ## 7. 工具与并发
 
-- **`subagent`（首选、默认）**：任务自包含、不需本对话上下文；规格与背景照 §3 写进 prompt。**默认继承你的模型，委派时指名换一个**（§6.1：`provider` / `model`，先 `list_subagent_models` 查允许路由）。**严禁**让它跑 client 平台 Inspect（§10.1）。
-- `subagent_fork` **不推荐**（继承整段转录、易误认为主 AI）；`workflow` 仅**用户明确要求**大规模扇出时用；`ralph` **仅当人类明确要求**。
+**先看你自己的工具目录**：派生 / 转向 / 等待的语义随部署而变，本技能不复述它们。
+
+- **有 `spawn_teammate`（官方 Agent Teams）**：派生成员、`send_message` 转向或唤醒、`list_agents` 看状态、`wait_agent` 等待、`team_task_*` 共享任务 —— 这些**官方 `team:policy` 段已逐条写明**（含「inactive 只表示没有回合在执行」「`wait_agent` 不唤醒，先 `list_agents` 再 `send_message`」），照它做；本技能只补它不管的：规格（§3）、验收（§5）、并发（§10.2）。
+- **只有 `subagent` / `subagent_fork`**：`subagent` 是首选、默认（任务自包含、不需本对话上下文；规格与背景照 §3 写进 prompt）。**默认继承你的模型，委派时指名换一个**（§6.1：`provider` / `model`，先 `list_subagent_models` 查允许路由）。**严禁**让它跑 client 平台 Inspect（§10.1）。`subagent_fork` **不推荐**（继承整段转录、易误认为主 AI）。
+- `workflow` 仅**用户明确要求**大规模扇出时用；`ralph` **仅当人类明确要求**。
 
 > `workflow`/`ralph` 是**前台**工具：运行期间父会话收到新消息会中断整轮（`cancelled`）；长跑编排优先后台委派或拆小。
 
@@ -96,7 +99,7 @@ whenToUse: 非平凡任务开头先判该不该委托（默认要）；探索/�
 |---|---|
 | **让子代理查客户端 Inspect** | §10.1 永久挂起；主 AI 预查后写进背景 |
 | **只信收尾消息（静默空收尾）** | §10.3 会记成 `completed`；开文件验产物 |
-| **子代理意外终止（error/空收尾）就重派** | §10.4：先 `list_agents` 看它还在不在，在就 `send_message` 唤醒接着做（它保留上下文） |
+| **子代理意外终止（error/空收尾）就重派** | §10.4：先看它还在不在（官方成员用 `list_agents`），在就发消息唤醒接着做（它保留上下文） |
 | **往 `collab_board` @ 一个已经停下的子代理等它动** | §10.4：`agent.inject` **不唤醒 driver**；要它动只能 `send_message` |
 | **同仓库多个 `npm run build`** | 只许一个；其余 `tsc --noEmit`（§10.2） |
 | **子代理静默继承你的模型** | §6.1：委派时指名 `provider`/`model`，先 `list_subagent_models` 查允许路由 |
@@ -128,18 +131,19 @@ whenToUse: 非平凡任务开头先判该不该委托（默认要）；探索/�
 
 收尾消息**不能**当交付证据；反复失败的重活主 AI 自己写更快。
 
-### 10.4 子代理意外终止：**先唤醒它接着做**，别急着重派
+### 10.4 子代理/成员意外终止：**先看它还在不在**，别急着重派
 
 **怎么判定它意外终止了**：`turn/end` 是 `error` / `terminated` / `UNKNOWN`；或收尾是空的
-（`content: []`、`outputTokens: 0`）却记成 `completed`；或久等之后 `list_agents` 里它已不再是
-`running`。
+（`content: []`、`outputTokens: 0`）却记成 `completed`；或久等之后它已不再处于运行态。
 
 **为什么先唤醒**：被唤醒的是**同一个会话**，它保留着整段上下文和已经做完的那部分工作；
 重派则是从零重建上下文（更贵），而且很可能撞上同一处坑。判据是"它还在不在"，不是"它失败过"：
 
-1. `list_agents` 看它还在不在 —— `idle` 和 `ready` 都**还能被唤起**（`ready` = 只在存储里、
-   可续，**不是终结**）；只有它整个消失，才直接谈重派。
-2. 对它 `send_message`（只对**直接子代理**有效；名字随部署可能不同 —— 就是那个能给**已在跑或已停下**的子代理发消息的工具）。内容要三件事：**说明你看到它中断了**、
+1. **先看它在不在**：官方成员看 `list_agents` —— `inactive` 只表示**当前没有回合在执行**，
+   还能被 `send_message` 唤起；legacy 子代理的 `idle` / `ready` 同样还能被唤起
+   （`ready` = 只在存储里、可续，**不是终结**）。只有它整个消失，才直接谈重派。
+2. **对它发一条消息**（官方成员 `send_message` 按 `target` 名字；legacy 子代理用那个能给
+   **已在跑或已停下**的子代理发消息的工具）。内容要三件事：**说明你看到它中断了**、
    **要它先自报进度**、**给出继续点与验收口径**。例：
 
    > 你上一个回合以 `error` 结束，没有交出报告。请：① 先用三五句话说明你已经改了哪些文件、
@@ -153,10 +157,10 @@ whenToUse: 非平凡任务开头先判该不该委托（默认要）；探索/�
 
 - **唤醒有代价**，被唤醒的回合是一次完整模型步 ⇒ **最多试 1–2 次**；两次都还是空收尾/再中断，
   就换人重派或自己写（§10.3 末句）。
-- **只能唤醒 depth-1**：孙子代理由它的父代理去唤醒，你这边只能 `interrupt`。
+- **只能唤醒直接下属**：孙子代理由它的父代理去唤醒；官方团队是扁平 roster（只有 Lead 建直属
+  teammate，无嵌套），不存在更深一层。
 - **留言板/`agent.inject` 唤醒不了任何人**：那条通道的契约是 `send(msg, next-step, wakeup=false)`
-  —— 只把消息挂进收件箱、**不唤醒 driver**。想让它动起来只有 `send_message` 这一条路；
-  往 `collab_board` 里 @ 一个已经停下的子代理是白费。
+  —— 只把消息挂进收件箱、**不唤醒 driver**；往 `collab_board` 里 @ 一个已经停下的子代理是白费。
 - **别把唤醒当重派用**：不要重发一遍同样的规格 —— 那等于重派却更贵。它保留着上下文，
   所以指令是"接着做 + 先自报进度"。
 

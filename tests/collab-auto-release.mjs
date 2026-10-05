@@ -26,6 +26,8 @@
 //  11) 卸载后不再释放（effect disposer 关闸）；
 //  12) 装机时已经 idle 的会话补一次武装（插件热重载 / 晚装载不至于漏掉那一轮）；
 //  13) 源码级：auto-release 绝不调用 followup/steer/sessionController（不唤醒、不冒充用户）。
+//  14) 第四道闸门的**有界延期**（0.12.0）：后代卡在 running 时最多延期 10 轮，到顶照常释放；
+//      会话恢复 running 后预算清零；后代退场 / 判据抛错 / 没有 list 都按"没人在跑"释放。
 //
 // 运行：node tests/collab-auto-release.mjs
 
@@ -555,6 +557,119 @@ console.log('# 降噪：同一 holder 反复释放，注入通知合并，审计
   ok(hh.readState().messages.length === 2, '审计留言**一条都没合并**（取证账目完整）',
     JSON.stringify(hh.readState().messages.length))
   await hh.fiber.dispose()
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// 14. 第四道闸门的有界延期（0.12.0）：后代卡在 running 不再无限扣住父锁
+// ════════════════════════════════════════════════════════════════════════
+console.log('# 有界延期：最多 10 轮，到顶照常释放')
+{
+  const hh = await makeHarness({
+    claims: [mkClaim({ claimId: 'c_stuck', holderId: 'agent:P', paths: ['src/deploy/'] })]
+  })
+  hh.addAgent('P', 'running')
+  hh.addAgent('C', 'running', 'P') // 子代理状态永远停在 running（回合 error / 空收尾后没落地）
+  hh.emitStatus('P', 'idle')
+  await settle()
+  ok(hh.timers.length === 1, 'idle 武装了第一轮', String(hh.timers.length))
+
+  // 前 10 轮：每轮都被"后代在 running"挡回、重新武装，声明仍在。
+  let deferred = 0
+  for (let round = 1; round <= 10; round++) {
+    await hh.flush()
+    if (hh.readState().claims.length === 1 && hh.timers.length === 1) deferred++
+  }
+  ok(deferred === 10, '前 10 轮都被挡回并重新武装（计数：' + deferred + '/10）', JSON.stringify(hh.timers.map((t) => t.ms)))
+  ok(hh.readState().claims.length === 1, '10 轮之内父锁仍在（延期不是立刻放弃）', JSON.stringify(hh.readState().claims.length))
+
+  // 第 11 轮：刷新（预算已到顶）→ 照常释放。
+  await hh.flush()
+  ok(hh.readState().claims.length === 0, '延期到顶：后代仍显示 running，父锁照常释放',
+    JSON.stringify(hh.readState().claims.map((c) => c.claimId)))
+  ok(hh.timers.length === 0, '释放后不再武装', String(hh.timers.length))
+  await hh.fiber.dispose()
+}
+
+console.log('# 有界延期：会话恢复 running 后预算清零（下一次延期从头算）')
+{
+  const hh = await makeHarness({
+    claims: [mkClaim({ claimId: 'c_reset', holderId: 'agent:P2', paths: ['src/deploy/'] })]
+  })
+  hh.addAgent('P2', 'running')
+  hh.addAgent('C2', 'running', 'P2')
+  hh.emitStatus('P2', 'idle')
+  await settle()
+  for (let round = 1; round <= 10; round++) await hh.flush()
+  ok(hh.readState().claims.length === 1, '前置：恰好 10 轮延期后仍未释放', JSON.stringify(hh.readState().claims.length))
+
+  // 会话回来干了一轮活 → running 事件把武装与**延期预算**一起清零。
+  const stale = hh.timers.length // 上一轮延期留下的计时器仍在数组里（代次已作废）
+  hh.emitStatus('P2', 'running')
+  hh.emitStatus('P2', 'idle')
+  await settle()
+  ok(hh.timers.length === stale + 1, '重新武装（旧代次的计时器留在数组里，但是新的这一轮在生效）',
+    stale + ' -> ' + hh.timers.length)
+  await hh.flush()
+  ok(hh.readState().claims.length === 1, '预算清零：新一轮延期从头算，不立刻释放',
+    JSON.stringify(hh.readState().claims.map((c) => c.claimId)))
+  await hh.fiber.dispose()
+}
+
+console.log('# 边界：后代从注册表消失 / 判据抛错 / 没有 list —— 都按"没人在跑"释放')
+{
+  // (a) 后代被 dispose（从 agents.list 里消失）
+  const a = await makeHarness({
+    claims: [mkClaim({ claimId: 'c_gone', holderId: 'agent:P3', paths: ['src/deploy/'] })]
+  })
+  a.addAgent('P3', 'running')
+  a.addAgent('C3', 'running', 'P3')
+  a.emitStatus('P3', 'idle')
+  await settle()
+  await a.flush()
+  ok(a.readState().claims.length === 1, '(a) 前置：后代在 running 时被挡回', JSON.stringify(a.readState().claims.length))
+  a.dispose('C3') // 真退场：先从注册表摘掉，再发 agent/disposed
+  ok(a.timers.length === 1, '(a) 前置：新武装已排上', String(a.timers.length))
+  await a.flush()
+  ok(a.readState().claims.length === 0, '(a) 后代退场后父锁正常释放', JSON.stringify(a.readState().claims.map((c) => c.claimId)))
+  await a.fiber.dispose()
+
+  // (b) 某个后代的 get() 抛错（注册表抖动）⇒ 按"没人在跑"处理，照常释放
+  const b = await makeHarness({
+    claims: [mkClaim({ claimId: 'c_throw', holderId: 'agent:P4', paths: ['src/deploy/'] })]
+  })
+  b.addAgent('P4', 'running')
+  b.addAgent('C4', 'running', 'P4')
+  b.ctx.set('agents', {
+    currentInitiator: () => undefined,
+    list: () => [...b.registry.values()],
+    get: (id) => {
+      if (id === 'C4') throw new Error('registry jitter')
+      return b.registry.get(id)
+    }
+  })
+  b.emitStatus('P4', 'idle')
+  await settle()
+  await b.flush()
+  ok(b.readState().claims.length === 0, '(b) 后代判据抛错 ⇒ 当成没人在跑，照常释放',
+    JSON.stringify(b.readState().claims.map((c) => c.claimId)))
+  await b.fiber.dispose()
+
+  // (c) agents 服务没有 list（拿不到后代名单）⇒ 同上
+  const c = await makeHarness({
+    claims: [mkClaim({ claimId: 'c_nolist', holderId: 'agent:P5', paths: ['src/deploy/'] })]
+  })
+  c.addAgent('P5', 'running')
+  c.addAgent('C5', 'running', 'P5')
+  c.ctx.set('agents', {
+    currentInitiator: () => undefined,
+    get: (id) => c.registry.get(id)
+  })
+  c.emitStatus('P5', 'idle')
+  await settle()
+  await c.flush()
+  ok(c.readState().claims.length === 0, '(c) agents.list 缺失 ⇒ 拿不到后代，照常释放',
+    JSON.stringify(c.readState().claims.map((x) => x.claimId)))
+  await c.fiber.dispose()
 }
 
 h.finish()

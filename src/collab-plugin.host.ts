@@ -885,10 +885,14 @@ return {
     // 动态形态读不到 settings 服务，所以这里写死常量；旧的十几秒会把"派完子代理、等它跑几分钟"误判成循环终止。
     // tests/collab-hostcode-parity.mjs 会真实触发这条接线，断言"未过期声明在宽限期到点后被释放"。
     const LOOP_END_GRACE_SEC = 120
+    // 第 4 道闸门的**有界延期**（0.12.0，与包形态同源）：最多延期这么多轮宽限期，到顶照常释放。
+    // 理由见 src/auto-release.ts 文件头第 4 条（running 可能只是没落地的陈旧状态）。
+    const CHILD_DEFER_MAX_ROUNDS = 10
     const armedIdle = new Map()
+    const idleDeferrals = new Map()
     let idleGen = 0
     let idleClosed = false
-    ctx.effect(() => () => { idleClosed = true; armedIdle.clear() })
+    ctx.effect(() => () => { idleClosed = true; armedIdle.clear(); idleDeferrals.clear() })
     const agentStatusOf = (a) => (a && typeof a.status === 'string' ? a.status : '')
     function fireIdleRelease(id, gen) {
       try {
@@ -913,8 +917,16 @@ return {
             try { child = svc.get(did) } catch (e) { continue }
             if (child && agentStatusOf(child) === 'running') { childRunning = true; break }
           }
-          if (childRunning) { armIdleRelease(id); return }
+          if (childRunning) {
+            const rounds = idleDeferrals.get(id) || 0
+            if (rounds < CHILD_DEFER_MAX_ROUNDS) {
+              idleDeferrals.set(id, rounds + 1)
+              armIdleRelease(id)
+              return
+            }
+          }
         }
+        idleDeferrals.delete(id)
         const holderId = 'agent:' + id
         const name = hname({ holderId: holderId, sessionId: id, agent: cur })
         mutate(s => releaseOnLoopEnd(s, holderId, name, now(), LOOP_END_GRACE_SEC), id, cur).catch(() => {})
@@ -933,14 +945,14 @@ return {
         if (!id) return
         const status = payload && typeof payload.status === 'string' ? payload.status : agentStatusOf(agent)
         if (status === 'idle') armIdleRelease(id)
-        else if (status === 'running') armedIdle.delete(id)
+        else if (status === 'running') { armedIdle.delete(id); idleDeferrals.delete(id) }
       } catch (e) {}
     }, { global: true })
     // 退场 ⇒ 取消武装（到点也不会释放：fireIdleRelease 的第 3 条闸门）。**只取消，不释放**。
     ctx.on('agent/disposed', (payload) => {
       try {
         const agent = payload && payload.agent
-        if (agent && agent.id) armedIdle.delete(String(agent.id))
+        if (agent && agent.id) { armedIdle.delete(String(agent.id)); idleDeferrals.delete(String(agent.id)) }
       } catch (e) {}
     }, { global: true })
     // 装机时已经 idle 的会话补一次武装（插件晚于 agent 装载 / 热重载时，那一轮 idle 事件收不到）。

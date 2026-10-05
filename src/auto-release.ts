@@ -18,12 +18,16 @@
 //   并在到点时**复核它没有变回 running**，两个条件都不满足就不动。宽限期排除的是
 //   "两个回合之间的正常停顿"（模型思考 / 工具往返之间的空隙）。
 //
-// 四道闸门（缺一不可，方向都是"少放而不是多放"）：
+// 四道闸门（前三道方向都是"少放而不是多放"；第四道自带延期上限，见下）：
 //   1. `prefs.releaseOnLoopEndEnabled()` —— 用户可以整个关掉；宽限期内改设置也照样拦住；
 //   2. 宽限期计时 + **代次**（generation）：期间任何一次状态变化都让这次武装作废；
 //   3. 到点复核**必须**解析到那个 agent 且它的 `status === 'idle'`。
 //   4. **没有自家的子代理在 running**（0.9.11）—— 子代理在跑说明锁还在被用，
-//      它只是不在我的循环里；不放，重新武装。
+//      它只是不在我的循环里；不放，重新武装。**延期有上限**（0.12.0）：
+//      `running` 只是一个状态字段，回合以 error / 空收尾结束后它可能没落地，
+//      或者驱动卡在网络上不再推进 —— 此时父会话已经 idle，锁却被"永远在跑的后代"无限期扣住。
+//      最多延期 CHILD_DEFER_MAX_ROUNDS 轮宽限期（默认 120s × 10 = 20 分钟），到顶照常释放。
+//      计数在会话恢复 running（disarm）时清零：那是"它又干活了"，不是同一次延期。
 // 第 3 条是**合取**，不是"running 才撤回"：服务缺失 / `get()` 抛错 / 解析不到（已 disposed）/
 // 状态不是 idle，**一律不放**。后两种尤其重要：
 //   - 解析不到 = 会话已离开注册表（dispose）。W7 的结论（退场的会话常常恢复并继续干活）在这里
@@ -39,6 +43,8 @@
 //
 // 已知边界（如实记）：本功能只覆盖"循环停了、agent 还加载着"这一种持有者。**已 dispose 的**
 // 持有者不在覆盖范围内（理由见第 3 条），它的声明仍只能靠租约到期或 `op=reap` 回收。
+// **被杀掉的进程**（没有 agent/status 事件、也没有 agent/disposed）同理：没有任何代码路径能看到
+// 它，声明只能等租约到期或 `op=reap`。
 //
 // 依赖：状态存取面（store）、推送面（push）、偏好读取面（prefs，来自 delegation）。
 // 接线在 src/index.ts；动态宿主形态在 src/collab-plugin.host.ts 内联了一份**只释放不投递**
@@ -49,6 +55,12 @@ import type { AgentLike, AgentsLookupService, CollabContext } from './contract.j
 import type { StateStore } from './store.js'
 import type { PushApi } from './push.js'
 import type { DelegationPrefs } from './delegation.js'
+
+/**
+ * 第 4 道闸门最多延期几轮宽限期（0.12.0）。用**倍数**而不是绝对秒数，
+ * 这样它随用户的 `loopEndGraceSec` 一起缩放（默认 120s × 10 = 20 分钟）。
+ */
+const CHILD_DEFER_MAX_ROUNDS = 10
 
 /** installAutoRelease() 对外暴露的东西：目前只有给测试用的诊断（武装中的 agent 数）。 */
 export interface AutoReleaseApi {
@@ -81,9 +93,15 @@ export function installAutoRelease(
   // （`ctx.timer.timeout` 的契约只返回 Promise，没有 cancel 面）。
   const armed = new Map<string, number>()
   let seq = 0
+  /**
+   * 第 4 道闸门的延期计数（0.12.0）：agentId -> 已经因"后代在 running"延期了几轮。
+   * 到顶（CHILD_DEFER_MAX_ROUNDS）就照常释放 —— 见文件头第 4 条的边界说明。
+   * 会话恢复 running（disarm）时清零。
+   */
+  const deferrals = new Map<string, number>()
   // 插件卸载后不许再改状态：ctx.effect 的 disposer 把闸门关上。
   let closed = false
-  ctx.effect(() => () => { closed = true; armed.clear() })
+  ctx.effect(() => () => { closed = true; armed.clear(); deferrals.clear() })
 
   const statusOf = (agent: unknown): string => {
     const s = agent && typeof (agent as { status?: unknown }).status === 'string' ? String((agent as { status: string }).status) : ''
@@ -101,9 +119,10 @@ export function installAutoRelease(
     void ctx.timer.timeout(graceMs).then(() => fire(agentId, gen, graceMs)).catch(() => {})
   }
 
-  /** 会话恢复（running）：作废这次武装。只删 map —— 过期回调会因代次不符而自我作废。 */
+  /** 会话恢复（running）：作废这次武装，并清零延期预算。只删 map —— 过期回调会因代次不符而自我作废。 */
   function disarm(agentId: string): void {
     armed.delete(agentId)
+    deferrals.delete(agentId)
   }
 
   /**
@@ -158,8 +177,18 @@ export function installAutoRelease(
           try { child = svc.get(did) } catch (e) { continue }
           if (child && statusOf(child) === 'running') { childRunning = true; break }
         }
-        if (childRunning) { arm(agentId); return }
+        if (childRunning) {
+          // 有界延期（0.12.0）：到顶就往下走（释放），不再无限重新武装。
+          const rounds = deferrals.get(agentId) || 0
+          if (rounds < CHILD_DEFER_MAX_ROUNDS) {
+            deferrals.set(agentId, rounds + 1)
+            arm(agentId)
+            return
+          }
+        }
       }
+      // 封锁解除（或延期到顶）：预算清零，再走释放。
+      deferrals.delete(agentId)
       const holderId = 'agent:' + agentId
       const graceSec = Math.max(1, Math.round(graceMs / 1000))
       const name = store.hname({ holderId, sessionId: agentId, agent: current })
