@@ -242,10 +242,11 @@ if (!hostCode || typeof hostCode !== 'string') {
 }
 
 // ---------------------------------------------------------------- 期望集合
-// 25 个"逐输出对拍"的同名函数。
+// 28 个"逐输出对拍"的同名函数（0.12.2 加 holderHandle / holderLabel / holderRosterNote）。
 const EXPECTED_PARITY = [
   'claim', 'cleanName', 'clockUtc', 'dropHolder', 'expire', 'hashProjectKey', 'heartbeat',
-  'holder', 'holderFresh', 'holderView', 'inFamily', 'init', 'modeLabel', 'norm', 'ov', 'post', 'reap',
+  'holder', 'holderFresh', 'holderHandle', 'holderLabel', 'holderRosterNote', 'holderView',
+  'inFamily', 'init', 'modeLabel', 'norm', 'ov', 'post', 'reap',
   'release', 'releaseOnLoopEnd', 'renderDigest', 'seg', 'sweep',
   // 0.11.0 官方 Agent Teams 交叉预警的三个同名纯函数（两形态逐输出对拍）。
   'teamCrossWarnLine', 'teamScopeOverlaps', 'teamTaskScopeLine'
@@ -277,6 +278,9 @@ tryExtract('ov', { seg: host.seg })
 tryExtract('norm')
 tryExtract('hashProjectKey')
 tryExtract('cleanName')
+tryExtract('holderHandle')
+tryExtract('holderLabel', { holderHandle: host.holderHandle })
+tryExtract('holderRosterNote')
 tryExtract('init')
 tryExtract('inFamily')
 tryExtract('holderFresh')
@@ -285,7 +289,7 @@ tryExtract('expire', { sweep: host.sweep })
 tryExtract('holderView', { holderFresh: host.holderFresh })
 tryExtract('clockUtc')
 tryExtract('modeLabel', { MODE_LABELS: hostModeLabels })
-tryExtract('renderDigest', { clockUtc: host.clockUtc, modeLabel: host.modeLabel })
+tryExtract('renderDigest', { clockUtc: host.clockUtc, modeLabel: host.modeLabel, holderLabel: host.holderLabel })
 tryExtract('holder', { now: fixedNow })
 tryExtract('hostReaders')
 tryExtract('pub', { hostReaders: host.hostReaders })
@@ -301,7 +305,7 @@ tryExtract('dropHolder', { pub: host.pub, hostReaders: host.hostReaders })
 // 宿主内联的 author 写字面量 'system:dsh-collab'，core 侧用导出的 AUTO_RELEASE_AUTHOR —— 两者是否
 // 一致由下面的语料**逐输出**守护（消息对象里带 author 字段，对拍即校验）。宽限期同理：宿主是
 // 接线层传进来的常量 15，core 不自己判断，所以语料里显式传不同 graceSec 值。
-tryExtract('releaseOnLoopEnd', { pub: host.pub })
+tryExtract('releaseOnLoopEnd', { pub: host.pub, holderLabel: host.holderLabel })
 tryExtract('heartbeat', { now: fixedNow })
 tryExtract('post', { now: fixedNow, holder: host.holder })
 let overviewLoad = async () => ({ state: null, target: { path: '/fake/collab/state.json' }, stateDir: '/tmp', warn: null })
@@ -312,7 +316,7 @@ tryExtract('otherProjects', { fs: { processPath: (t) => (t && t.path) || String(
 // 不是 core 导出，只作为 overview 抽取的依赖注入（这里给一个"服务缺席"的桩 ⇒ 返回 null）。
 tryExtract('teamTaskScopeLine')
 tryExtract('teamScopeOverlaps', { norm: host.norm, ov: host.ov })
-tryExtract('teamCrossWarnLine', { norm: host.norm, ov: host.ov })
+tryExtract('teamCrossWarnLine', { norm: host.norm, ov: host.ov, holderLabel: host.holderLabel })
 tryExtract('teamTasks', { ctx: { get: () => undefined } })
 tryExtract('overview', {
   load: (id) => overviewLoad(id),
@@ -537,11 +541,60 @@ group('renderDigest', '占用摘要文本：逐字节等价 + 顺序无关')
   ok(host.renderDigest([c3, c1, c2]) === host.renderDigest([c1, c2, c3]), 'host 形态顺序无关')
   ok(coreFns.renderDigest([c3, c1, c2]) === coreFns.renderDigest([c1, c2, c3]), 'core 形态顺序无关')
   const sample = coreFns.renderDigest([c1, c2])
-  ok(sample.includes('One（独占）占用 src/one/，租约 30 分（01-02 03:04Z–01-02 03:34Z）'),
+  ok(sample.includes('One#one（独占）占用 src/one/，租约 30 分（01-02 03:04Z–01-02 03:34Z）'),
     'core 渲染出文档化的绝对 UTC 窗口文案（证明比的是真实文本）', sample)
-  ok(sample.includes('Two（共享）占用 src/two/'), 'core 渲染 shared → 共享', sample)
+  ok(sample.includes('Two#two（共享）占用 src/two/'), 'core 渲染 shared → 共享', sample)
   const readOnly = coreFns.renderDigest([c3])
-  ok(readOnly.includes('Three（只读）占用 src/three/'), 'core 渲染 read → 只读', readOnly)
+  ok(readOnly.includes('Three#three（只读）占用 src/three/'), 'core 渲染 read → 只读', readOnly)
+}
+// ---------------------------------------------------------------- 名单短句柄（0.12.2）
+// 目的只有一个：会话标题会重名（实测一个名字占 10 份），holderId 不随标题变。
+// 三个 group 分别以函数名命名，以接入下面的「语料完整性守护」。
+const HB_U1 = 'agent:9c57bc11-b86b-4dc7-b98a-fe0f13b54fc8'
+const HB_U2 = 'agent:session-4942839c-7ca8-4d85-a689-902d3fb38236'
+const HB_U3 = 'agent:ff240262-aa4d-41b9-aa82-247f2c20ceb3'
+const HB_NAME = '你是 DTSeek 的实验子代理。工'
+
+group('holderHandle', '会话 id → 稳定短句柄（前 8 字符，session- 前缀剥掉）')
+{
+  const cases = [['uuid', HB_U1], ['session- 前缀', HB_U2], ['human', 'human:console'], ['缺 id', undefined], ['非字符串', 123]]
+  for (const [label, id] of cases) {
+    cmp('holderHandle · ' + label, run(host.holderHandle, [id]), run(coreFns.holderHandle, [id]))
+  }
+  ok(coreFns.holderHandle(HB_U1) === '9c57bc11', 'uuid 取前 8 字符', coreFns.holderHandle(HB_U1))
+  ok(coreFns.holderHandle(HB_U2) === '4942839c',
+    'session- 前缀必须剥掉（否则句柄恒为 "session-"，等于没有）', coreFns.holderHandle(HB_U2))
+  ok(coreFns.holderHandle('human:console') === '', 'human 没有会话 id → 空串（渲染侧据此不附句柄）')
+}
+
+group('holderLabel', '名字#句柄：重名会话可区分；缺名 / human 不附句柄')
+{
+  const cases = [
+    ['uuid', HB_U1, HB_NAME], ['同名另一会话', HB_U3, HB_NAME], ['human', 'human:console', 'Console'],
+    ['缺 holderName', 'agent:anon-12345678', undefined], ['空 holderName', HB_U1, ''], ['缺 holderId', undefined, 'No Id']
+  ]
+  for (const [label, id, n] of cases) {
+    cmp('holderLabel · ' + label, run(host.holderLabel, [id, n]), run(coreFns.holderLabel, [id, n]))
+  }
+  ok(coreFns.holderLabel(HB_U1, HB_NAME) === HB_NAME + '#9c57bc11', '渲染成 名字#句柄', coreFns.holderLabel(HB_U1, HB_NAME))
+  ok(coreFns.holderLabel(HB_U1, HB_NAME) !== coreFns.holderLabel(HB_U3, HB_NAME),
+    '同名不同会话 → 标签可区分（本改动的唯一目的）')
+  ok(coreFns.holderLabel('human:console', 'Console') === 'Console', 'human:console 不附句柄')
+  ok(coreFns.holderLabel('agent:anon-12345678', undefined) === 'agent:anon-12345678',
+    '缺名字时 holderId 本身就是唯一标识 → 不重复附句柄')
+  ok(coreFns.renderDigest([mkClaimRec({ claimId: 'c_h', holderId: HB_U1, holderName: HB_NAME, paths: ['src/h/'] })])
+    .includes(HB_NAME + '#9c57bc11（独占）占用 src/h/'), '占用摘要里名字带句柄')
+}
+
+group('holderRosterNote', '有 stale 条目才说明「名册不是锁」，否则 null')
+{
+  for (const n of [0, 1, 32, undefined, -1]) {
+    cmp('holderRosterNote · ' + String(n), run(host.holderRosterNote, [n]), run(coreFns.holderRosterNote, [n]))
+  }
+  ok(coreFns.holderRosterNote(0) === null && coreFns.holderRosterNote(undefined) === null,
+    '没有 stale 条目 → null（list 一个字段都不加）')
+  ok((coreFns.holderRosterNote(32) || '').includes('不是锁'), '有 stale 条目 → 点名「名册不是锁」')
+  ok((coreFns.holderRosterNote(1) || '').includes('1 条 stale'), '条数写进说明', coreFns.holderRosterNote(1))
 }
 // ---------------------------------------------------------------- 官方 Agent Teams 交叉预警（0.11.0）
 // 三个同名纯函数：两形态必须逐输出等价。语料同时覆盖"服务缺席"的 null 态与"有任务"的渲染态。
@@ -613,6 +666,11 @@ group('teamCrossWarnLine', '反向交叉预警文本：两形态逐输出等价�
   }
   const sample = coreFns.teamCrossWarnLine([task()], [claimRec()])
   ok(typeof sample === 'string' && sample.indexOf('advisory') >= 0, '文案显式声明 advisory（不冒充门控）', sample)
+  // 字面量锚点：两形态**同时**退化时上面的 cmp 必然失明（对拍只比"两侧相同"），
+  // 只有写死期望文本的断言能抓住"一起错"——本组存在的第二个理由。
+  const warned = coreFns.teamCrossWarnLine([task()], [claimRec({ holderId: 'agent:9c57bc11-x', holderName: '同名' })])
+  ok(warned.includes('与「同名#9c57bc11」的声明'),
+    '同一段注入里的交叉预警行也带稳定句柄（不是只有摘要带）', warned)
 }
 
 // ---------------------------------------------------------------- holderFresh
@@ -1140,7 +1198,7 @@ group('corpus', '每个同名函数的语料条数下限（防止语料被悄悄
     const n = g ? g.pass + g.fail : 0
     ok(n >= 4, 'corpus · ' + name + ' 至少 4 条断言', 'actual=' + n)
   }
-  ok(EXPECTED_PARITY.length === 25, '逐输出对拍的同名函数恰好 25 个', String(EXPECTED_PARITY.length))
+  ok(EXPECTED_PARITY.length === 28, '逐输出对拍的同名函数恰好 28 个', String(EXPECTED_PARITY.length))
 }
 
 // ---------------------------------------------------------------- 汇总

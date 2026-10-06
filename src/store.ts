@@ -8,7 +8,7 @@
 
 import {
   init, sweep, publish, overview, related, filterMessages, blockers, holderView,
-  expire, cleanName, norm, projectStorageFileName, reap
+  expire, cleanName, norm, projectStorageFileName, reap, holderRosterNote
 } from './collab-core.js'
 import type { Claim, HolderInput, OpResult, PublishedClaim, StateDocument } from './collab-core.js'
 import type { TeamScopeTask } from './collab-core.js'
@@ -391,20 +391,22 @@ export function installStore(ctx: CollabContext): StateStore {
     // 而 stale 用的是 1h 预警阈值（见 HOLDER_STALE_WARN_MS），因此在产品路径上依然是可达信号。
     const ex = expire(state, t)
     const hv = holderView(state, t)
-    return {
-      ok: true,
-      data: withWarn({
-        seq: state.seq,
-        serverTime: t,
-        statePath: fs.processPath(target),
-        stateDir,
-        schemaVersion: state.schemaVersion,
-        holders: hv.holders,
-        staleHolders: hv.staleHolders,
-        claims: state.claims.map(pub),
-        expiredCount: ex
-      }, warn)
+    // holdersNote 只在**有 stale 条目**时出现：名册被读成"过期锁"的实测现场才有这句话，
+    // 干净项目一个字都不加（与 otherProjects / teamTasks 同一降级纪律）。
+    const rosterNote = holderRosterNote(hv.staleHolders)
+    const data: Record<string, unknown> = {
+      seq: state.seq,
+      serverTime: t,
+      statePath: fs.processPath(target),
+      stateDir,
+      schemaVersion: state.schemaVersion,
+      holders: hv.holders,
+      staleHolders: hv.staleHolders,
+      claims: state.claims.map(pub),
+      expiredCount: ex
     }
+    if (rosterNote) data.holdersNote = rosterNote
+    return { ok: true, data: withWarn(data, warn) }
   }
 
   /**

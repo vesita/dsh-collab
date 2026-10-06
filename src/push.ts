@@ -30,7 +30,7 @@
 // 对外只暴露 notifyReaders：tools.ts 在 release 后调用它，agent/disposed 钩子也在本模块内。
 
 import { boundContextSummary, createUserMessage } from '@deepseek-ai/dsh-llm'
-import { readersOf, dropHolder, modeLabel } from './collab-core.js'
+import { readersOf, dropHolder, modeLabel, holderLabel } from './collab-core.js'
 import type { PublishedClaim } from './collab-core.js'
 import { sessionIdOf, LOOP_END_GRACE_SEC_DEFAULT } from './spec.js'
 import type {
@@ -130,7 +130,7 @@ export function installPush(ctx: CollabContext, store: StateStore): PushApi {
     const paths = Array.isArray(c.paths) ? c.paths : []
     const shown = paths.slice(0, 3).join(' ') + (paths.length > 3 ? ' 等 ' + paths.length + ' 条' : '')
     if (action === 'reap') {
-      const holder = c.holderName || c.holderId
+      const holder = holderLabel(c.holderId, c.holderName)
       const text = '[dsh-collab] 会话 ' + releaserName + ' 回收了 ' + holder + ' 的僵尸声明 ' + shown +
         '（' + modeLabel(c.mode) + '）。你此前被登记为它的读者，这些路径不再由该会话占用。'
       const summary = boundContextSummary('collab 锁已回收 · ' + shown)

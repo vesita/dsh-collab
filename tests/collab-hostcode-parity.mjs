@@ -131,6 +131,8 @@ console.log('# state dir (regression: literal ~ and cwd-relative)')
   ok(!spStr.startsWith(process.cwd() + path.sep), 'statePath is not anchored to the process cwd', String(sp))
   const expectedDir = path.join(FAKE_HOME, 'collab', 'projects')
   ok(spStr.startsWith(expectedDir + path.sep), 'statePath honours settings.prepareDocument() dirname', String(sp))
+  // 负向对照：刚建的空状态没有任何 stale 条目 ⇒ 名册说明**不许出现**（降级纪律，与 teamTasks 同源）
+  ok(!('holdersNote' in r.data), 'no stale holder -> list adds no holdersNote', JSON.stringify(r.data.holdersNote))
   if (r && r.data && 'stateDir' in r.data) {
     ok(r.data.stateDir === expectedDir, 'stateDir equals <dshHome>/collab/projects', String(r.data.stateDir))
   } else {
@@ -213,6 +215,9 @@ console.log('# stale holder pruning (regression: live pkg-9 kept 37h-old holders
   const sv = (vis.data.holders || []).find((h) => h.holderId === 'agent:STALE-VISIBLE')
   ok(!!sv && sv.stale === true, 'holder idle 2h is reported with stale=true', JSON.stringify(sv))
   ok(vis.data.staleHolders >= 1, 'staleHolders counts it', String(vis.data.staleHolders))
+  // 名册被读成"过期锁"的实测现场（32 条 stale）：有 stale 条目就必须说明 holders 不是锁
+  ok(typeof vis.data.holdersNote === 'string' && vis.data.holdersNote.includes('不是锁'),
+    'stale holder present -> list explains that holders is a roster, not locks', JSON.stringify(vis.data.holdersNote))
   // 而静默 30h 的则已被回收（上面的 GHOST 断言）；两者并存正是分级的意义。
 }
 
@@ -265,7 +270,7 @@ console.log('# degraded path when settings.prepareDocument() is unavailable')
 // 不同的快照文本 —— 而 DSH 正是按文本逐字节比较来做快照去重的。
 console.log('# awareness digest: hostCode inline vs collab-core (byte-for-byte)')
 {
-  const { renderDigest, clockUtc, modeLabel } = await import(new URL('../lib/collab-core.js', import.meta.url))
+  const { renderDigest, clockUtc, modeLabel, holderHandle, holderLabel } = await import(new URL('../lib/collab-core.js', import.meta.url))
 
   // 从 hostCode 源码里抽出真实函数体（不是复制品），注入它依赖的同源函数后执行。
   const extract = (fnName, scope = {}) => {
@@ -282,7 +287,14 @@ console.log('# awareness digest: hostCode inline vs collab-core (byte-for-byte)'
   const hostModeLabels = labelsDecl ? new Function('return {' + labelsDecl[1] + '}')() : {}
   const hostModeLabel = extract('modeLabel', { MODE_LABELS: hostModeLabels })
   const hostClockUtc = extract('clockUtc')
-  const hostRenderDigest = extract('renderDigest', { clockUtc: hostClockUtc, modeLabel: hostModeLabel })
+  // 名单短句柄也是同名内联副本：先抽出宿主那两个，再注入给 renderDigest（它依赖 holderLabel）。
+  const hostHolderHandle = extract('holderHandle')
+  const hostHolderLabel = extract('holderLabel', { holderHandle: hostHolderHandle })
+  const hostRenderDigest = extract('renderDigest', { clockUtc: hostClockUtc, modeLabel: hostModeLabel, holderLabel: hostHolderLabel })
+  ok(['agent:one', 'agent:session-4942839c-x', 'human:console'].every((id) =>
+    hostHolderHandle(id) === holderHandle(id) && hostHolderLabel(id, 'Same') === holderLabel(id, 'Same')),
+    'hostCode holderHandle/holderLabel === collab-core（两形态同形，human 不附句柄）',
+    JSON.stringify(['agent:one', 'agent:session-4942839c-x', 'human:console'].map((id) => [hostHolderLabel(id, 'Same'), holderLabel(id, 'Same')])))
   ok(['exclusive', 'shared', 'read'].every((m) => hostModeLabel(m) === modeLabel(m)),
     'hostCode modeLabel === collab-core modeLabel for all three modes',
     JSON.stringify(['exclusive', 'shared', 'read'].map((m) => [hostModeLabel(m), modeLabel(m)])))
@@ -322,7 +334,7 @@ console.log('# awareness digest: hostCode inline vs collab-core (byte-for-byte)'
   ok(renderDigest([c3, c1, c2]) === renderDigest([c1, c2, c3]), 'collab-core digest is order-independent')
   // 具体文案断言：确认两侧比较的是**真实输出**，而不是两个空串/同一退化物
   const sample = renderDigest([c1, c2])
-  ok(sample.includes('One（独占）占用 src/one/，租约 30 分（01-02 03:04Z–01-02 03:34Z）'),
+  ok(sample.includes('One#one（独占）占用 src/one/，租约 30 分（01-02 03:04Z–01-02 03:34Z）'),
     'core digest renders the documented absolute-window format', sample)
   ok(hostRenderDigest([c1, c2]) === sample, 'hostCode digest equals that exact literal too', hostRenderDigest([c1, c2]))
 }

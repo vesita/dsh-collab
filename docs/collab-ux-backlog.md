@@ -81,10 +81,17 @@
   **注意**：这条依赖"标题取自首个 prompt"这个 DSH 实现细节，本次 2 个样本走的都是**机械字节前缀兜底**
   （与 `fallbackMaxBytes: 40` 吻合，n=2，属推断）——LLM 标题若成功则是"对同一段做摘要"，
   两种分支下结论一致，但都不该被当作稳定契约。
-- **优化方向（仍然要做）**：不要依赖标题。①渲染时附一个**稳定短句柄**（`sessionId` 前 8 位）——
-  数据本来就在状态文件里，只是没渲染；②让 `claim` 接受显式 `owner` 标签，由会话自己命名；
+- **优化方向**：不要依赖标题。①**已实现（0.12.2）**：渲染时在名字后附**稳定短句柄** ——
+  `holderLabel()` = `名字#句柄`，句柄是 `holderId` 去掉 `agent:` 与 `session-` 前缀后的前 8 字符；
+  凡是把 holder 名字渲染给人/模型的地方都换成它：占用摘要（`renderDigest`）、访问通知
+  （`renderAccessNotice`）、`gateReason`、同一段注入里的交叉预警行（`teamCrossWarnLine`，
+  它是 `systemPrompt.context` 的第 4 行）、团队写域重叠预警（`gate.ts`）、`reap` 读者通知
+  （`push.ts`）、循环结束留痕正文（`releaseOnLoopEnd`）；`human:console` 没有会话 id 就不附。
+  实测本机 35 个 holder 只有 14 种名字（一个名字占 10 份）、
+  句柄 0 碰撞（2026-10-06 复算；8 字符是短标识，不是身份保证）
+  ⇒ 同名会话从此可区分；②让 `claim` 接受显式 `owner` 标签，由会话自己命名（**未做**）；
   ③可选：用**上下文注入**给每个会话一行自我标识（插件已有两条 `systemPrompt.context`，
-  加第三条成本很低），让对端可被 `agent:<holderId>` 频道寻址。
+  加第三条成本很低），让对端可被 `agent:<holderId>` 频道寻址（**未做**）。
 
 ### 2.4 `read` / `shared` 声明零门控，但契约读起来像有保护【实测】
 
@@ -404,6 +411,21 @@
   两者都是契约级改动（schema SSOT + 四份派生物 + 两形态），不在本次范围内。
 - **仍未验证**：`subagent/end` 事件能否作为"后代已结束"的精确信号（它带子会话 id，
   `dsh-subagent/lib/types/types.d.ts:93-111`）；若可用，第 3 条可以做到秒级而不是 20 分钟。
+
+### 2.24 `list` 的 holders 被读成「过期锁」（0.12.2 已缓解）
+
+- **一手**：使用者看着 `collab_lock op=list` 的返回问「是不是在罗列过期锁」。该次实测：
+  `claims` 1 条（未过期）、`expiredCount` 0，而 `holders` 34 条、其中 32 条 `stale: true`
+  —— 名册被当成了锁。
+- **事实**：`holders` 是**会话名册**（谁在这个项目上出现过），锁在 `claims`；stale（无未过期
+  声明且静默 >1h）与"过期声明"不是同一对象，`sweep()` 只按 `expiresAt` 清 `claims`。
+  逐行核对两形态：`list`/`overview`/`status`/`reap`/`wait` 都**不**返回已过期声明。
+- **处置（0.12.2）**：`holderRosterNote()` —— **有 stale 条目时**才附一句「holders 是会话名册，
+  不是锁（锁在 claims）…静默超过 24 小时后由下一次 sweep 回收」，没有 stale 则一个字段都不加
+  （与 `otherProjects` / `teamTasks` 同一降级纪律）。负向对照在
+  `tests/collab-hostcode-parity.mjs`：空状态 list 断言 `!('holdersNote' in data)`。
+- **仍未做**：名册照旧逐条返回（`STALE-VISIBLE` 那条测试明确要求 stale holder 可见），
+  所以那条返回的量级没变 —— 变的是它不再能被读成锁。
 
 ---
 

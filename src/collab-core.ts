@@ -346,6 +346,36 @@ export function modeLabel(mode: Mode | string): string {
   return MODE_LABELS[mode as Mode] || String(mode)
 }
 
+// 稳定短句柄：从 holderId 取一段**不随会话标题变化**的短标识（会话 id 前 8 字符）。
+// 为什么需要它：holderName 来自会话标题，而子代理会话的标题就是父 AI 那条 prompt 的开头。
+// 实测（2026-10-06 复算，本机 my 项目文件）：35 个 holder 只有 14 种名字，其中一个名字占 10 份
+// —— 名单认不出人（docs/collab-ux-backlog.md §2.3）。句柄来自 holderId，不随标题变。
+// 8 字符是**短标识、不是身份保证**：它把该语料的重名全部分开（0 碰撞），
+// 但两个不同 id 理论上仍可能撞上前 8 字符。
+// 非 `agent:` 前缀，或前缀剥掉后为空（如 `agent:session-`）⇒ 返回空串，渲染侧据此不附句柄。
+export function holderHandle(holderId?: string): string {
+  const id = typeof holderId === 'string' ? holderId : ''
+  if (id.slice(0, 6) !== 'agent:') return ''
+  return id.slice(6).replace(/^session-/, '').slice(0, 8)
+}
+
+// 名单里的一项显示成 `名字#句柄`（名字缺失时 holderId 本身就是唯一标识，不再重复附句柄）。
+export function holderLabel(holderId?: string, holderName?: string): string {
+  if (typeof holderName !== 'string' || !holderName) return holderId || ''
+  const handle = holderHandle(holderId)
+  return handle ? holderName + '#' + handle : holderName
+}
+
+// `list` 的 holders 字段是**会话名册**（谁在这个项目上出现过），不是锁 —— 锁在 `claims`。
+// 实测有人把名册里 32 条 stale 读成"32 把过期锁"，所以只要有 stale 条目就说明一句；
+// 没有 stale 时返回 null，调用方**一个字段都不加**（与 otherProjects / teamTasks 同一降级纪律）。
+export function holderRosterNote(staleHolders?: number): string | null {
+  const n = Number(staleHolders)
+  if (!Number.isFinite(n) || n <= 0) return null
+  return 'holders 是会话名册，不是锁（锁在 claims）：其中 ' + n +
+    ' 条 stale = 该 holder 已无未过期声明且静默超过 1 小时；静默超过 24 小时后由下一次 sweep 回收。'
+}
+
 // claims = 他人的、未过期的声明。最多列 3 条、每条最多 2 个路径，其余折叠成计数，
 // 因为这一行会在每一个模型步都被注入，长度必须有界。
 export function renderDigest(claims: Claim[]): string {
@@ -356,7 +386,7 @@ export function renderDigest(claims: Claim[]): string {
     const mins = Math.max(1, Math.round((c.ttlSec || 0) / 60))
     const paths = c.paths.slice(0, 2).join(' ') + (c.paths.length > 2 ? ' 等 ' + c.paths.length + ' 条' : '')
     const start = clockUtc(typeof c.createdAt === 'number' ? c.createdAt : c.expiresAt - (c.ttlSec || 0) * 1000)
-    return (c.holderName || c.holderId) + '（' + modeLabel(c.mode) + '）占用 ' + paths +
+    return holderLabel(c.holderId, c.holderName) + '（' + modeLabel(c.mode) + '）占用 ' + paths +
       '，租约 ' + mins + ' 分（' + start + '–' + clockUtc(c.expiresAt) + '）'
   })
   const more = ordered.length > 3 ? '；另有 ' + (ordered.length - 3) + ' 条' : ''
@@ -467,7 +497,9 @@ export function teamCrossWarnLine(tasks: TeamScopeTask[] | null | undefined, cla
           if (np && ov(ns, np)) { hit = p; break }
         }
         if (hit === null) continue
-        const holder = c.holderName || c.holderId || ''
+        // 同一段注入文本里的第 4 行（摘要 + 团队写域行 + 交叉预警行一起进 systemPrompt.context）：
+        // 它也必须用 holderLabel，否则同一段文本里一半带句柄、一半是裸标题残段。
+        const holder = holderLabel(c.holderId, c.holderName)
         const key = t.id + '\u0000' + ns + '\u0000' + hit + '\u0000' + holder
         if (seen.has(key)) continue
         seen.add(key)
@@ -644,7 +676,7 @@ export function releaseOnLoopEnd(state: StateDocument, holderId: string, holderN
   const uniq: string[] = []
   for (const c of released) for (const p of c.paths) if (!uniq.includes(p)) uniq.push(p)
   const shown = uniq.slice(0, 3).join(' ') + (uniq.length > 3 ? ' 等 ' + uniq.length + ' 条' : '')
-  const who = holderName || holderId
+  const who = holderLabel(holderId, holderName)
   const m: Message = {
     msgId: 'm_' + (++state.seq),
     seq: state.seq,
@@ -686,7 +718,7 @@ export function renderAccessNotice(claims: Claim[]): string {
     // 「不可读」是句假话，读根本不会被拦。而 OPEN_HINT 恰好推荐"只读调研用 mode=read"，
     // 一个只读声明却被通知写成「不可读」，误导概率最高。
     const readableTag = c.mode === 'exclusive' ? '，' + (isReadable(c) ? '可读' : '不可读') : ''
-    return (c.holderName || c.holderId) + '（' + modeLabel(c.mode) + readableTag + '）占用 ' + paths +
+    return holderLabel(c.holderId, c.holderName) + '（' + modeLabel(c.mode) + readableTag + '）占用 ' + paths +
       '，租约 ' + mins + ' 分（' + start + '–' + clockUtc(c.expiresAt) + '）'
   })
   const more = ordered.length > 2 ? '；另有 ' + (ordered.length - 2) + ' 条' : ''

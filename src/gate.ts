@@ -5,7 +5,7 @@
 // prefs.enforceWriteLockEnabled() 每次调用都重新结算，用户在设置里一改即可生效。
 // 门控自身故障一律放行（插件的问题不该锁死整个工具面）。
 
-import { claimsCovering, relToProject, isReadable, clockUtc, modeLabel, inFamily } from './collab-core.js'
+import { claimsCovering, relToProject, isReadable, clockUtc, modeLabel, inFamily, holderLabel } from './collab-core.js'
 import type { Claim } from './collab-core.js'
 import { pathArgsFor } from './spec.js'
 import type { AgentLike, CollabContext } from './contract.js'
@@ -31,7 +31,7 @@ export function installGate(ctx: CollabContext, store: StateStore, prefs: GatePr
   /** 把命中渲染成 ask 的理由（含持有者、路径、**绝对 UTC** 租约窗口）。 */
   function gateReason(c: Claim, target: string, kind: 'write' | 'read'): string {
     const start = clockUtc(typeof c.createdAt === 'number' ? c.createdAt : c.expiresAt - (c.ttlSec || 0) * 1000)
-    const who = c.holderName || c.holderId
+    const who = holderLabel(c.holderId, c.holderName)
     const what = kind === 'write' ? '写入' : '读取（对方已声明不可读）'
     return '[dsh-collab] ' + target + ' 由 ' + who + ' 占用（' + modeLabel(c.mode) + '）：非持有者' + what +
       '需要先协商。租约 ' + start + '–' + clockUtc(c.expiresAt) + '。先 collab_lock op=wait 或 collab_board 协商，或改用其他路径。'
@@ -135,7 +135,7 @@ export function installGate(ctx: CollabContext, store: StateStore, prefs: GatePr
     if (!hits.length) return
     hits.sort((a, b) => a.claim.claimId.localeCompare(b.claim.claimId))
     const parts = hits.slice(0, 2).map(hh => {
-      const who = hh.claim.holderName || hh.claim.holderId
+      const who = holderLabel(hh.claim.holderId, hh.claim.holderName)
       return '写域 ' + hh.target + ' 已被外部会话「' + who + '」以 ' + modeLabel(hh.claim.mode) + ' 声明占用'
     })
     const more = hits.length > 2 ? '；另有 ' + (hits.length - 2) + ' 条' : ''

@@ -199,8 +199,10 @@ agents.currentInitiator()            → 正在装配的那个会话
 渲染结果形如：
 
 ```
-[dsh-collab] 同项目其他会话当前占用：Other Session（独占）占用 src/backend/，租约 30 分（09-13 06:35Z–09-13 07:05Z）。改动这些路径前请先执行 collab_lock op=wait 或用 collab_board 协商。
+[dsh-collab] 同项目其他会话当前占用：Other Session#a1b2c3d4（独占）占用 src/backend/，租约 30 分（09-13 06:35Z–09-13 07:05Z）。改动这些路径前请先执行 collab_lock op=wait 或用 collab_board 协商。
 ```
+
+名字后的 `#a1b2c3d4` 是 `holderId` 的稳定短句柄（会话 id 去掉 `session-` 前缀后的前 8 字符）：显示名来自会话标题，子代理会话的标题就是父 AI 那条 prompt 的开头，实测会重名（一个名字占 10 份），句柄不会。
 
 租约刻意用**绝对 UTC 起止时刻**表示，而不是「还剩几分钟」的倒计时：DSH 只在运行时上下文的文本逐字节变化时才提交新快照，时间无关的摘要因此不会因为过了几分钟而被重复注入。
 
@@ -757,7 +759,7 @@ cargo test --manifest-path crates/collab-cli/Cargo.toml
 | 过期声明回收 | 租约到期 | 过期声明随每次读取失效，不再阻塞他人 |
 | **僵尸声明显式回收** | **仅 `op=reap` + `confirm:true`** | **绝不自动**：dry-run 默认、判据见「僵尸声明的显式回收」一节；被强杀的会话留下的未到期声明由调用方显式确认后回收 |
 | 留言保留 | 最近 `MAX_MESSAGES = 2000` 条 | 超出部分从最旧的开始丢弃，写入时回报 `swept.droppedMessages`（`swept` 是**条件字段**：仅当本次 `droppedMessages > 0` 或 `prunedHolders > 0` 时才出现在返回里，且不含 readers 相关字段） |
-| 陈旧 holder 回收 | 无活跃声明且 `HOLDER_TTL_MS = 24h` 未出现 | 回收由 `sweep()` 执行；`list` 另用 `holderView()` 给出 `ageSec` / `active` / `stale` 与 `staleHolders` |
+| 陈旧 holder 回收 | 无活跃声明且 `HOLDER_TTL_MS = 24h` 未出现 | 回收由 `sweep()` 执行；`list` 另用 `holderView()` 给出 `ageSec` / `active` / `stale` 与 `staleHolders`，并在有 stale 条目时附 `holdersNote` 说明「`holders` 是名册不是锁」 |
 | holder 废弃预警 | 无活跃声明且静默 `HOLDER_STALE_WARN_MS = 1h` | `stale` 走这条更短的阈值，因此它是"看起来已废弃"的先行信号，在 `list` 上始终可达 |
 | 损坏状态自愈 | JSON 解析失败 | 备份为 `<state>.corrupt-<ts>` 后重置为空状态，并以 `warning` 上报 |
 

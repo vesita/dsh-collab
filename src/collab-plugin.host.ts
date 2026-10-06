@@ -472,7 +472,7 @@ return {
       const uniq = []
       for (const c of released) for (const p of c.paths) if (!uniq.includes(p)) uniq.push(p)
       const shown = uniq.slice(0, 3).join(' ') + (uniq.length > 3 ? ' 等 ' + uniq.length + ' 条' : '')
-      const who = holderName || holderId
+      const who = holderLabel(holderId, holderName)
       const m = {
         msgId: 'm_' + (++s.seq),
         seq: s.seq,
@@ -506,7 +506,12 @@ return {
       const { state, target, stateDir, warn } = await load(agentId); const t = now()
       // 先 sweep 再取视图：>24h 的废弃 holder 不再出现；stale 用 1h 预警阈值，依然可达。
       const ex = expire(state, t); const hv = holderView(state, t)
-      return { ok: true, data: withWarn({ seq: state.seq, serverTime: t, statePath: fs.processPath(target), stateDir: stateDir, schemaVersion: state.schemaVersion, holders: hv.holders, staleHolders: hv.staleHolders, claims: state.claims.map(pub), expiredCount: ex }, warn) }
+      // holdersNote 只在有 stale 条目时出现（与包形态 store.ts 的 list 同形同文案）：
+      // 名册被读成"过期锁"的实测现场才有这句话，干净项目一个字都不加。
+      const rosterNote = holderRosterNote(hv.staleHolders)
+      const data = { seq: state.seq, serverTime: t, statePath: fs.processPath(target), stateDir: stateDir, schemaVersion: state.schemaVersion, holders: hv.holders, staleHolders: hv.staleHolders, claims: state.claims.map(pub), expiredCount: ex }
+      if (rosterNote) data.holdersNote = rosterNote
+      return { ok: true, data: withWarn(data, warn) }
     }
     // 跨项目观测（0.9.11，与包形态 store.otherProjects 同源）：把**别的项目**的占用摘要
     // 附在 overview 的返回里。只读、失败降级、不编造；宿主 fs 没有 listDir 时只报当前项目。
@@ -709,6 +714,24 @@ return {
       const p = (n) => String(n).padStart(2, '0')
       return p(d.getUTCMonth() + 1) + '-' + p(d.getUTCDate()) + ' ' + p(d.getUTCHours()) + ':' + p(d.getUTCMinutes()) + 'Z'
     }
+    // 与 collab-core 的 holderHandle / holderLabel / holderRosterNote **同名同形**（见 src/collab-core.ts
+    // 的注释：名字来自会话标题，子代理会话的标题是父 AI 那条 prompt 的开头，实测一个名字占 10 份）。
+    function holderHandle(holderId) {
+      const id = typeof holderId === 'string' ? holderId : ''
+      if (id.slice(0, 6) !== 'agent:') return ''
+      return id.slice(6).replace(/^session-/, '').slice(0, 8)
+    }
+    function holderLabel(holderId, holderName) {
+      if (typeof holderName !== 'string' || !holderName) return holderId || ''
+      const handle = holderHandle(holderId)
+      return handle ? holderName + '#' + handle : holderName
+    }
+    function holderRosterNote(staleHolders) {
+      const n = Number(staleHolders)
+      if (!Number.isFinite(n) || n <= 0) return null
+      return 'holders 是会话名册，不是锁（锁在 claims）：其中 ' + n +
+        ' 条 stale = 该 holder 已无未过期声明且静默超过 1 小时；静默超过 24 小时后由下一次 sweep 回收。'
+    }
     function renderDigest(others) {
       // 显式排序只为确定性：状态文件里的插入顺序不该让同一组占用渲染出不同文本。
       const ordered = others.slice().sort((a, b) => (a.expiresAt - b.expiresAt) || String(a.holderId).localeCompare(String(b.holderId)))
@@ -716,7 +739,7 @@ return {
         const mins = Math.max(1, Math.round((c.ttlSec || 0) / 60))
         const paths = c.paths.slice(0, 2).join(' ') + (c.paths.length > 2 ? ' 等 ' + c.paths.length + ' 条' : '')
         const start = clockUtc(typeof c.createdAt === 'number' ? c.createdAt : c.expiresAt - (c.ttlSec || 0) * 1000)
-        return (c.holderName || c.holderId) + '（' + modeLabel(c.mode) + '）占用 ' + paths + '，租约 ' + mins + ' 分（' + start + '–' + clockUtc(c.expiresAt) + '）'
+        return holderLabel(c.holderId, c.holderName) + '（' + modeLabel(c.mode) + '）占用 ' + paths + '，租约 ' + mins + ' 分（' + start + '–' + clockUtc(c.expiresAt) + '）'
       })
       const more = ordered.length > 3 ? '；另有 ' + (ordered.length - 3) + ' 条' : ''
       return '[dsh-collab] 同项目其他会话当前占用：' + parts.join('；') + more + '。改动这些路径前请先执行 collab_lock op=wait 或用 collab_board 协商。'
@@ -777,7 +800,7 @@ return {
             let hit = null
             for (const p of c.paths) { const np = norm(p); if (np && ov(ns, np)) { hit = p; break } }
             if (hit === null) continue
-            const holder = c.holderName || c.holderId || ''
+            const holder = holderLabel(c.holderId, c.holderName)
             const key = t.id + '\\u0000' + ns + '\\u0000' + hit + '\\u0000' + holder
             if (seen.has(key)) continue
             seen.add(key)
