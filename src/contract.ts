@@ -344,7 +344,6 @@ export interface CollabArgs {
   note?: string
   channel?: string
   body?: string
-  mentions?: string[]
   replyTo?: string
   since?: number
   limit?: number

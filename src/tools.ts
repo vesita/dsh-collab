@@ -159,17 +159,16 @@ export function installTools(ctx: CollabContext, store: StateStore, push: PushAp
 
   const boardTool: ToolDefinition = {
     name: 'collab_board',
-    description: '多智能体协作留言板：向协作域发消息（频道 general / path:<路径> / agent:<holderId>）或增量读取消息，用于协商、交接、同步进展。',
+    description: '跨会话协作留言板：post 往共享状态文件留痕 / read 增量读取。用于同一仓库上互不相识的会话之间交接进度与协商。**不投递、不唤醒任何会话**（没有 mentions 参数）：对方只在它自己 read 时才看得到；要让某个已停下的会话动起来，用它自己的消息工具（以你当时的工具目录为准）。read 两种模式：不给 since（或 0）读**最新** limit 条（追平用）；给 since>0 从该游标**往后**读 limit 条（增量用，旧→新）——按返回的 nextSince 继续调、直到 hasMore=false 才算读完。',
     parameters: {
       type: 'object',
       properties: {
         op: { type: 'string', enum: ['post', 'read'], description: 'post 发消息 / read 增量读取' },
-        channel: { type: 'string', description: '频道，默认 general' },
+        channel: { type: 'string', description: '频道，默认 general；**精确匹配**的自由字符串（写什么就得按什么读，path: 频道与 claim 用同一套相对路径写法），未命中时返回会列出既有频道' },
         body: { type: 'string', description: 'post 用，消息正文' },
-        mentions: { type: 'array', items: { type: 'string' }, description: '被 @ 的 holderId' },
         replyTo: { type: 'string', description: '回复的 msgId' },
-        since: { type: 'number', description: 'read 用，只返回 seq 大于此值的消息' },
-        limit: { type: 'number', description: 'read 用，最多条数，默认 50' }
+        since: { type: 'number', description: 'read 用：省略或 0 = 读最新 limit 条（tail）；>0 = 从该 seq 往后读 limit 条（forward，旧→新）。返回的 nextSince 是下一次的游标' },
+        limit: { type: 'number', description: 'read 用，最多条数，默认 50，上限 200' }
       },
       additionalProperties: true,
       required: ['op']

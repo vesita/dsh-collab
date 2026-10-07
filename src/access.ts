@@ -30,9 +30,10 @@ import type { StateStore } from './store.js'
  *
  * 为什么**只**跳 `collab_lock`、不跳 `collab_board`：
  *   - 实测误报只出现在 `collab_lock`（见 `tools/post-execute` 里的缺陷说明）；
- *   - `collab_board` 的 `mentions` 这类字符串数组里出现路径，是既有测试**故意**守护的性质
- *     （`tests/collab-access-gate.mjs` 的「mentions 字符串数组里的路径也参与候选提取」用例），
- *     即候选提取与工具无关；board 没有实测误报，不该顺手改掉那条性质。
+ *   - `collab_board` 的参数里**没有**"被访问的路径"：`channel` 是频道名、`body` 是自由文本
+ *     （0.13.0 起连 `mentions` 都移除了），提取不到候选 ⇒ 自然不通知，不需要靠跳过集合兜。
+ *     候选提取本身与工具无关（字符串数组同样参与，见 `tests/collab-access-gate.mjs`），
+ *     所以这条性质改在普通工具的数组参数上守护。
  */
 const OCCUPANCY_TOOLS: ReadonlySet<string> = new Set(['collab_lock'])
 

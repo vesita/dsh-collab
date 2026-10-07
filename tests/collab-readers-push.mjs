@@ -659,13 +659,12 @@ console.log('# agent/disposed（W7）：不释放未过期声明 + 从所有 rea
     await sleep(25)
   }
   const doc = h.readState()
-  ok(doc.claims.some(c => c.claimId === 'c_alive'), 'disposed 的 holder 的**未过期**声明仍然在（dispose 不是释放信号）', JSON.stringify(doc.claims.map(c => c.claimId)))
-  const own = doc.claims.find(c => c.claimId === 'c_alive')
-  ok(own && JSON.stringify(own.readers) === '["agent:me"]', '未过期声明连同它自己的 readers 原样保留', JSON.stringify(own && own.readers))
+  // 0.13.0：句柄结束 = 自动删除 —— 它的未过期声明也释放了（旧 W7 语义已被推翻）。
+  ok(!doc.claims.some(c => c.claimId === 'c_alive'), 'disposed 的 holder 的**未过期**声明也被释放（句柄结束 = 自动删除）', JSON.stringify(doc.claims.map(c => c.claimId)))
   const remain = doc.claims.find(c => c.claimId === 'c_other')
   ok(remain && !remain.readers.includes('agent:dead'), 'disposed 的 holder 从其他 claim 的 readers 里被摘掉', JSON.stringify(remain && remain.readers))
   ok(remain && remain.readers.includes('agent:me'), '其他读者不受影响', JSON.stringify(remain && remain.readers))
-  ok(h.injects.length === 0, '没有发生释放事件 ⇒ 不产生"锁已释放"通知（旧行为在这里说谎）', JSON.stringify(h.injects.length))
+  ok(h.injects.some((x) => x.sessionId === 'me'), '发生了释放事件 ⇒ 读者（agent:me）收到"锁已释放"通知', JSON.stringify(h.injects.map((x) => x.sessionId)))
   // 新通道不需要"释放者的活 Agent 当 sender"这一约束在 release 路径上仍然成立；
   // 这里只能断言 disposed 路径**一条都没碰**旧通道。
   ok(h.prompts.length === 0 && h.sends.length === 0, 'disposed 路径也不碰旧通道', JSON.stringify({ prompts: h.prompts.length, sends: h.sends.length }))

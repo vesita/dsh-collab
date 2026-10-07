@@ -30,7 +30,7 @@
 // 对外只暴露 notifyReaders：tools.ts 在 release 后调用它，agent/disposed 钩子也在本模块内。
 
 import { boundContextSummary, createUserMessage } from '@deepseek-ai/dsh-llm'
-import { readersOf, dropHolder, modeLabel, holderLabel } from './collab-core.js'
+import { readersOf, dropHolder, releaseOnLoopEnd, modeLabel, holderLabel } from './collab-core.js'
 import type { PublishedClaim } from './collab-core.js'
 import { sessionIdOf, LOOP_END_GRACE_SEC_DEFAULT } from './spec.js'
 import type {
@@ -402,16 +402,25 @@ export function installPush(ctx: CollabContext, store: StateStore): PushApi {
       const agent = payload && payload.agent
       if (!agent || !agent.id) return
       const h = 'agent:' + String(agent.id)
-      // 功能 D：会话退出时把它从**所有** claim 的 readers 里摘掉（否则会向一个已经死掉的会话推送）。
-      // W7 起**不再释放它的声明**：声明生命周期只由租约 expiresAt 决定，dispose 不是释放信号
-      // （dispose 后的会话常常恢复并继续干活，提前删声明会让别人看到"路径空闲"）。
-      // 因此 data.released 正常为空 ⇒ 这条路径正常情况下不产生"锁已释放"通知（那才是实话）。
+      // **句柄结束 ⇒ 自动删除**（0.13.0，用户决策；推翻 0.9.6 起的 W7 取舍）。
+      // `agent/disposed` 是"这个 agent 的句柄结束了"的确定性事件（`agent.dispose()` 会停循环、
+      // 注销注册表，见 dsh-agent/lib/types/index.d.ts:135-145），所以这一刻它**不可能**还在写文件：
+      // 立即释放它的**全部未过期**声明，并照旧把它从所有 claim 的 readers 里摘掉（功能 D）。
+      // W7 当年的顾虑是"退场会话常常恢复并继续干活"，恢复后的会话确实会以为自己还持锁 ——
+      // 缓解手段是留痕：`releaseOnLoopEnd` 会往频道 `agent:<holderId>` 写一条审计留言，
+      // 谁恢复谁能在 `collab_board op=read` 时看到；同时读者会收到"锁已释放"的通知。
       const holderId = h
       let releaserName = holderId
       try {
         releaserName = store.hname({ holderId, sessionId: String(agent.id), agent: agent as AgentLike }) || holderId
       } catch (e) {}
-      store.mutate(s => dropHolder(s, holderId, Date.now()), String(agent.id), agent as AgentLike)
+      store.mutate(s => {
+        const rel = releaseOnLoopEnd(s, holderId, releaserName, Date.now(), LOOP_END_GRACE_SEC_DEFAULT, 'disposed')
+        const dropped = dropHolder(s, holderId, Date.now())
+        const released = rel && rel.data && Array.isArray(rel.data.released) ? rel.data.released : []
+        if (rel.changed !== true && dropped.changed !== true) return { ok: true, changed: false, data: { released: [] } }
+        return { ok: true, changed: true, state: s, data: { released: released.concat(dropped.changed === true && Array.isArray(dropped.data && dropped.data.released) ? dropped.data.released : []) } }
+      }, String(agent.id), agent as AgentLike)
         .then(res => {
           if (res && res.ok === true && res.data && Array.isArray(res.data.released)) {
             // 0.9.6：这条路径**不需要**"活 Agent 当 sender"了（子代理回退通道已删）——

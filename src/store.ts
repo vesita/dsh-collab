@@ -549,8 +549,11 @@ export function installStore(ctx: CollabContext): StateStore {
   }
 
   async function msgs(a: CollabArgs, agentId: string | null, agent?: AgentLike): Promise<ToolResult> {
-    const { state } = await load(agentId, agent)
-    return { ok: true, data: filterMessages(state, a) }
+    // 与 list / status 同一降级纪律：load() 的 warning（例如"本会话没有 cwd ⇒ 按项目隔离已失效"）
+    // **必须透传**。0.13.0 之前这里只解构 { state }，把警告丢了 —— 于是"你在读另一个项目的板"
+    // 这件事返回到调用方手里时一个字都没有，而 read 与 list 的返回形状本来就该一致。
+    const { state, warn } = await load(agentId, agent)
+    return { ok: true, data: withWarn(filterMessages(state, a), warn) }
   }
 
   /**

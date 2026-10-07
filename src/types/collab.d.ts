@@ -45,7 +45,6 @@ export interface Message {
   author: string;
   ts: number;
   body: string;
-  mentions?: string[];
   replyTo?: string;
 }
 
@@ -115,7 +114,6 @@ export interface CollabBoardParams {
   op: 'post' | 'read';
   channel?: string;
   body?: string;
-  mentions?: string[];
   replyTo?: string;
   since?: number;
   limit?: number;

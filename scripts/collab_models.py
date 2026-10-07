@@ -37,7 +37,6 @@ class Message:
     author: str
     ts: int
     body: str
-    mentions: List[str] = field(default_factory=list)
     replyTo: Optional[str] = None
 
 @dataclass

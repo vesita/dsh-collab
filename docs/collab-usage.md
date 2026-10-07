@@ -11,7 +11,7 @@
 | 工具 | 作用 |
 | --- | --- |
 | `collab_lock` | **中央注册锁**：开工前声明"我占用哪些文件夹/文件"，并查询 / 等待 / 续租 |
-| `collab_board` | **协作留言板**：发消息 / 增量读消息，用于协商、交接、同步进展 |
+| `collab_board` | **跨会话留痕本**：发消息 / 增量读消息。**不投递、不唤醒任何会话**，用于交接与记录 |
 
 它只管**跨会话、跨进程**这一层：单会话内部的成员派生、任务依赖与 CAS 归官方 `Agent Teams`
 （实验性、默认关闭），本插件不重复提供。分工的判据、边界与三条已知接缝见
@@ -33,7 +33,7 @@
 
 1. **动手改代码前先 `claim`** 你要碰的目录 / 文件；
 2. **开工前和定期 `list` / `overview`**，看别人占用了什么，有没有和你重叠的；
-3. **遇到他人独占**：先 `wait` 等待，或用 `board` 留言协商；
+3. **遇到他人独占**：先 `wait` 等待；要协商就留一条 `board`（**它不投递**，对方不一定会看到），同时用你自己的消息工具去叫人；
 4. **只读调研**（测绘、审计、读代码）用 `mode=read`，它不排他也不被排；纯粹看看的话也可以不 claim；
 5. **完成后 `release`** 释放占用；
 6. **长任务 `heartbeat`** 续租，让租约覆盖你的实际工作时长。
@@ -142,7 +142,11 @@ collab_lock op=wait paths=["src/backend/models/"] timeoutMs=15000
 - 释放后：等待者收到「锁已自动释放」，被释放的会话收到「你的声明已被自动释放，恢复工作前重新
   `claim`」；状态文件里另留一条审计留言（`channel` = `agent:<sessionId>`），`collab_board op=read` 可回读。
   0.9.11 起**发给本人的注入通知**按 `holderId` 在 60 秒窗口内合并（审计留言不合并）。
-- **不覆盖**：已 `dispose` 的会话、被杀的进程 —— 它们收不到任何告知，声明只能等租约到期或 `op=reap`。
+- **句柄结束即删**（0.13.0）：`agent/disposed` 是"这个 agent 的句柄结束了"的确定性事件，
+  它**全部未过期**声明立即释放（不再等租约），并留一条"句柄已结束（agent/disposed）"的审计留言、
+  通知等待者。恢复后的会话因此有据可查（去 `collab_board` 读那条留痕，重新 `claim` 再写）。
+- **不覆盖**：**被杀的进程**、以及**升级前就已经退场**的旧持有者（没有新事件可等）—— 它们的
+  声明只能等租约到期或 `op=reap`。
 
 | 配置（命名空间 `collab`，活读） | 默认 | 说明 |
 | --- | --- | --- |
@@ -198,26 +202,49 @@ collab_lock op=reap paths=["src/"] olderThanSec=60    # 可限定路径 / 放宽
 
 ## 3. `collab_board`
 
+**它不是消息通道，是共享的留痕本**：`post` 只往状态文件里写一条，**不投递、不唤醒任何会话**；
+`mentions` 只是记进消息结构。@ 了不等于通知了，对方只在它自己 `read` 时才看得到。
+要某个已经停下的会话动起来，得用它自己的消息工具（哪个工具有这个能力以你当时的工具目录为准）；
+树内成员之间的转向与等待归官方 Agent Teams，本插件不复述也不重做。
+
 ### 3.1 发消息
 
 ```
 collab_board op=post channel=general body="我占用 src/backend/models/ 调整字段校验，预计 30 分钟内完成" mentions=["agent:xxx"]
 ```
 
-- `channel`：默认 `general`。约定 `general` 通用 / `path:<路径>` 按目录 / `agent:<holderId>` 定向。
+- `channel`：默认 `general`。约定 `general` 通用 / `path:<相对路径>` 按目录 / `agent:<holderId>` 定向。
+  **精确匹配**：写什么就得按什么读。注意 `holderId` 本身已经带前缀，直接写它（写 `agent:agent:…` 会读不到）；
+  path 频道与 `claim` 用同一套相对路径写法（尾斜杠也要一致）。未命中时返回里会列出**现有频道**。
 - `body`：正文（必填，去空白）。
-- `mentions`：被 @ 的 holderId（最多 20 个）。
+- `mentions`：被 @ 的 holderId（最多 20 个）。**不产生任何投递**，只记进消息。
 - `replyTo`：回复的 msgId（可选，构成线程）。
+- 返回里固定带 `delivered: false` 与 `deliveryNote`：这两项就是"本板不投递"的机器可读事实。
 
 ### 3.2 读消息
 
 ```
-collab_board op=read channel=general since=0 limit=50
+collab_board op=read                        # tail：最新 50 条（追平用，常用）
+collab_board op=read since=1234 limit=100   # forward：从游标 1234 往后读 100 条（增量用，旧→新）
 ```
 
-返回 `seq > since` 的消息（增量拉取），`limit` 最多 200（默认 50）。
+两种模式由 `since` 决定：
 
-留言板是**跨会话交接**的主要通道：把自己的计划、阻塞点、完成状态写进 `general` 或 `path:<路径>`，下一个接手该目录的会话即可在 `read` 时看到。
+| 输入 | 行为 | 用途 |
+| --- | --- | --- |
+| 不给 `since`（或 0） | 返回**最新** `limit` 条（`mode: "tail"`） | 看一眼有没有新东西 |
+| `since > 0` | 返回**从该游标往后**的 `limit` 条，旧→新（`mode: "forward"`） | 增量追平，不重不漏 |
+
+返回里的四个游标字段：`hasMore`（沿本方向还有更多没返回）、`nextSince`（下一次的 `since`）、
+`earliestSeq` / `latestSeq`（当前可用范围的下界与上界）。`since < earliestSeq` 说明中间那段
+已被 `MAX_MESSAGES` 回收 —— 这与"那段时间没人留言"在返回值上可以区分。
+
+**追平的正确姿势**：第一次读用默认（tail），把 `nextSince` 存下来；之后每次带
+`since=<上次的 nextSince>`，循环到 `hasMore === false`。一次 `read` 的返回可能很大
+（`limit` 默认 50、上限 200），必要时调小 `limit`。
+
+留言板是**跨会话交接**的留痕：把自己的计划、阻塞点、完成状态写进 `general` 或 `path:<路径>`，
+下一个接手该目录的会话 `read` 时能看到。它**没有**已读回执 —— 谁读没读过，插件不知道。
 
 ---
 
@@ -225,13 +252,15 @@ collab_board op=read channel=general since=0 limit=50
 
 - 身份取自调用方会话（`exec.agent.id`），工具参数里传不了 holder，因此无法冒充他人。
 - 每条声明 / 消息都记录 holderId、holderName（会话标题截断 24 字）、时间戳。
-- 租约 `expiresAt` 是声明生命周期的**唯一权威**回收机制：agent 正常下线（`agent/disposed`）**不会**提前释放它未到期的声明，只会回收**已过期**的声明、并把它从各 claim 的读者名单里摘掉；未到期的声明原样保留到租约到期后由惰性清理回收。`op=heartbeat` 是**唯一**的续租方式。
+- 声明有三条回收路径：**显式 `release`**、**句柄结束自动删除**（`agent/disposed`，0.13.0）、
+  **租约到期**（`sweep()` 惰性回收，最后兜底）。被杀的进程没有 `agent/disposed`，只能等租约到期
+  或 `op=reap`。`op=heartbeat` 是**唯一**的续租方式。
 
 ---
 
 ## 5. 使用提示
 
-- **谁先 `claim` 谁先得**；冲突时 `wait` + `board` 协商是首选路径。
+- **谁先 `claim` 谁先得**；冲突时先 `wait`，再留一条 `board` 说明（对方不一定会看到 —— 别把协商押在它上面）。
 - **`read` 模式**用于测绘 / 审计类只读调研；**`shared` 模式**用于"我也要写这块，愿意共用"。
 - 状态文件是跨会话共享的唯一事实来源。直接编辑它会触发乐观并发版本冲突，工具会自动重试并写入最新版本。
 

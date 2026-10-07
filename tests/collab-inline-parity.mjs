@@ -242,14 +242,17 @@ if (!hostCode || typeof hostCode !== 'string') {
 }
 
 // ---------------------------------------------------------------- 期望集合
-// 28 个"逐输出对拍"的同名函数（0.12.2 加 holderHandle / holderLabel / holderRosterNote）。
+// 30 个"逐输出对拍"的同名函数（0.13.0 加 filterMessages / channelRosterNote）。
 const EXPECTED_PARITY = [
   'claim', 'cleanName', 'clockUtc', 'dropHolder', 'expire', 'hashProjectKey', 'heartbeat',
   'holder', 'holderFresh', 'holderHandle', 'holderLabel', 'holderRosterNote', 'holderView',
   'inFamily', 'init', 'modeLabel', 'norm', 'ov', 'post', 'reap',
   'release', 'releaseOnLoopEnd', 'renderDigest', 'seg', 'sweep',
   // 0.11.0 官方 Agent Teams 交叉预警的三个同名纯函数（两形态逐输出对拍）。
-  'teamCrossWarnLine', 'teamScopeOverlaps', 'teamTaskScopeLine'
+  'teamCrossWarnLine', 'teamScopeOverlaps', 'teamTaskScopeLine',
+  // 0.13.0：留言读取抽成同名纯函数（以前宿主把这段抄在 async msgs 里，对拍抓不到漂移 ——
+  // 两边都是 slice(-limit) 时"一起丢中段"谁也没发现）。现在 30 个逐输出对拍函数。
+  'filterMessages', 'channelRosterNote'
 ].sort()
 // 同名但**不同形**：宿主的 overview(agentId) 是 async 的 I/O op（load→expire→聚合），
 // core 的 overview(state) 是纯状态变换。两者不是同一形状的函数，不能逐参对拍；
@@ -308,6 +311,9 @@ tryExtract('dropHolder', { pub: host.pub, hostReaders: host.hostReaders })
 tryExtract('releaseOnLoopEnd', { pub: host.pub, holderLabel: host.holderLabel })
 tryExtract('heartbeat', { now: fixedNow })
 tryExtract('post', { now: fixedNow, holder: host.holder })
+// 0.13.0：留言读取的同名纯函数（filterMessages 依赖 channelRosterNote，注入它的内联副本）。
+tryExtract('channelRosterNote')
+tryExtract('filterMessages', { channelRosterNote: host.channelRosterNote })
 let overviewLoad = async () => ({ state: null, target: { path: '/fake/collab/state.json' }, stateDir: '/tmp', warn: null })
 // 跨项目观测的宿主内联副本（0.9.11）：不在同名集合里（core 侧的对应实现住在 store.ts），
 // 只为让抽取出的 overview 能解析到它。fs 桩没有 listDir ⇒ 它会走"只报当前项目"的分支。
@@ -389,7 +395,7 @@ const HOLDER_B = { holderId: 'agent:B', sessionId: 'sess-B', name: 'Worker B' }
 const NAME_A = 'Worker A'
 const mkMessages = (n, startSeq) => Array.from({ length: n }, (_, i) => ({
   msgId: 'm_' + (startSeq + i), seq: startSeq + i, channel: (i % 3 === 0) ? 'general' : 'path:src/a/',
-  author: 'agent:A', ts: T0 + i, body: 'body ' + i, mentions: []
+  author: 'agent:A', ts: T0 + i, body: 'body ' + i
 }))
 const mkBackdated = (ms) => T0 - ms
 
@@ -1039,7 +1045,8 @@ group('releaseOnLoopEnd', '循环终止自动释放：只释放未过期声明 +
     const name = opts.name === undefined ? NAME_A : opts.name
     const t = opts.t === undefined ? T0 : opts.t
     const graceSec = opts.graceSec === undefined ? 15 : opts.graceSec
-    return { hostArgs: [state, holderId, name, t, graceSec], coreArgs: [state, holderId, name, t, graceSec], state }
+    const cause = opts.cause
+    return { hostArgs: [state, holderId, name, t, graceSec, cause], coreArgs: [state, holderId, name, t, graceSec, cause], state }
   })
   R('单条未过期声明被释放', { state: () => ({ claims: [mkClaimRec({ claimId: 'c_1' })] }) })
   R('已过期声明**不**动（那是 sweep 的活）', { state: () => ({ claims: [mkClaimRec({ claimId: 'c_e', expiresAt: T0 - 1 })] }) })
@@ -1057,6 +1064,9 @@ group('releaseOnLoopEnd', '循环终止自动释放：只释放未过期声明 +
     })
   })
   R('holderName 为空时留言用 holderId', { state: () => ({ claims: [mkClaimRec({ claimId: 'c_1' })] }), name: '' })
+  // 0.13.0：cause='disposed'（句柄结束）——正文必须说实话，不能写成"空闲超过 N 秒"。
+  R('cause=disposed：正文写「句柄已结束（agent/disposed）」', { state: () => ({ claims: [mkClaimRec({ claimId: 'c_1' })] }), cause: 'disposed' })
+  R('cause=disposed + 无声明 → changed:false（不留痕）', { state: () => ({ claims: [] }), cause: 'disposed' })
   R('graceSec 取非默认值时留言文案跟着变', { state: () => ({ claims: [mkClaimRec({ claimId: 'c_1' })] }), graceSec: 90 })
   R('边界：expiresAt === t **不算**未过期（与 sweep 的 > t 同一判据）', { state: () => ({ claims: [mkClaimRec({ claimId: 'c_bd', expiresAt: T0 })] }) })
   R('留言 seq 接在既有 seq 之后（claim 与 message 共用一个 seq）', { state: () => ({ seq: 41, claims: [mkClaimRec({ claimId: 'c_1' })] }) })
@@ -1089,7 +1099,7 @@ group('releaseOnLoopEnd', '循环终止自动释放：只释放未过期声明 +
     ok(st.claims.length === 1 && st.claims[0].claimId === 'c_2', 'state 里只剩别人的声明', JSON.stringify(st.claims.map((x) => x.claimId)))
     const m = r.data.notice
     ok(m && m.channel === 'agent:A' && m.author === 'system:dsh-collab', '留痕寻址到持有者（channel 就是 holderId，不再重复拼 agent:）、作者是 system:dsh-collab', JSON.stringify(m && [m.channel, m.author]))
-    ok(m && Array.isArray(m.mentions) && m.mentions[0] === 'agent:A' && String(m.body).includes('自动释放'), '留痕 mention 持有者且正文说明是自动释放', JSON.stringify(m && m.body))
+    ok(m && !('mentions' in m) && String(m.body).includes('自动释放'), '留痕不再带 mentions（0.13.0 移除）且正文说明是自动释放', JSON.stringify(m && m.body))
     ok(m && m.seq === 8 && m.msgId === 'm_8', '留痕序号接在既有 seq 之后', JSON.stringify(m && [m.seq, m.msgId]))
     ok(core.AUTO_RELEASE_AUTHOR === 'system:dsh-collab', 'AUTO_RELEASE_AUTHOR 常量与留痕作者一致（宿主内联字面量由上面的逐输出对拍守护）', String(core.AUTO_RELEASE_AUTHOR))
   }
@@ -1110,7 +1120,7 @@ group('heartbeat', '续租：expiresAt = now + ttlSec / forbidden / not-found')
   HB('已过期声明仍可续租', { state: () => ({ claims: [mkClaimRec({ claimId: 'c_1', expiresAt: T0 - 1 })] }), a: () => ({ claimId: 'c_1' }) })
 }
 // ---------------------------------------------------------------- post
-group('post', '留言：body 校验 / channel 缺省与 trim / mentions 过滤与截断 / replyTo')
+group('post', '留言：body 校验 / channel 缺省与 trim / mentions 已移除（传了即挡回）/ replyTo')
 {
   // 同 claim：宿主 post(state, h, name, a) 用 name 形参，core post(state, h, a, tNow) 用 h.name。
   const P = (label, opts) => pairCase('post', label, () => {
@@ -1128,14 +1138,110 @@ group('post', '留言：body 校验 / channel 缺省与 trim / mentions 过滤�
   P('body 非字符串 → bad-request', { a: () => ({ body: 42 }) })
   P('body 缺省 → bad-request', { a: () => ({}) })
   P('body 两端 trim', { a: () => ({ body: '  spaced  ' }) })
-  P('mentions 过滤非字符串', { a: () => ({ body: 'hi', mentions: ['agent:B', 5, '', 'agent:C', null] }) })
-  P('mentions 非数组 → []', { a: () => ({ body: 'hi', mentions: 'agent:B' }) })
-  P('mentions 超 20 截断', { a: () => ({ body: 'hi', mentions: Array.from({ length: 25 }, (_, i) => 'agent:' + i) }) })
+  // 0.13.0：mentions 已移除 —— 传了就 bad-request（fail-loud），连空数组也算"传了"。
+  P('mentions 非空数组 → bad-request', { a: () => ({ body: 'hi', mentions: ['agent:B'] }) })
+  P('mentions 空数组 → 也算传了 → bad-request', { a: () => ({ body: 'hi', mentions: [] }) })
+  P('mentions 非数组（字符串）→ bad-request', { a: () => ({ body: 'hi', mentions: 'agent:B' }) })
   P('replyTo 设置', { a: () => ({ body: 'hi', replyTo: 'm_3' }) })
   P('replyTo 空串不设置', { a: () => ({ body: 'hi', replyTo: '' }) })
   P('replyTo 非字符串不设置', { a: () => ({ body: 'hi', replyTo: 5 }) })
   P('seq 在既有留言后递增', { state: () => ({ seq: 9, messages: mkMessages(2, 8) }) })
   P('新 holder 登记', { h: HOLDER_B })
+}
+// ---------------------------------------------------------------- filterMessages（0.13.0）
+group('filterMessages', '留言读取：从 since 往后取 / limit 夹取 / channel / hasMore 与 nextSince')
+{
+  const F = (label, opts = {}) => pairCase('filterMessages', label, () => {
+    const s = mkState(opts.state ? opts.state() : { messages: mkMessages(5, 2) })
+    const a = opts.a ? opts.a() : {}
+    return { hostArgs: [s, a], coreArgs: [s, a] }
+  })
+  F('空留言板', { state: () => ({ messages: [] }) })
+  F('全部返回（5 条 / 默认 limit 50）')
+  F('不给 since → tail：最新 limit 条', { a: () => ({ limit: 2 }) })
+  F('limit=0 夹到 1', { a: () => ({ limit: 0 }) })
+  F('limit=300 夹到 200', { state: () => ({ messages: mkMessages(210, 1) }), a: () => ({ limit: 300 }) })
+  F('limit 非数字 → 默认 50', { state: () => ({ messages: mkMessages(60, 1) }), a: () => ({ limit: 'x' }) })
+  F('since 命中中段 → forward', { a: () => ({ since: 4 }) })
+  F('since 超过最新 → 空且 nextSince 原样回传', { a: () => ({ since: 999 }) })
+  F('channel 过滤 + hasMore', { state: () => ({ messages: mkMessages(12, 1) }), a: () => ({ channel: 'general', limit: 2 }) })
+  F('channel 空串不筛', { a: () => ({ channel: '   ' }) })
+  F('channel 未命中 → channelNote 列出既有频道', { state: () => ({ messages: mkMessages(6, 1) }), a: () => ({ channel: 'path:typo/' }) })
+  F('空板 + channel → 不加 channelNote', { state: () => ({ messages: [] }), a: () => ({ channel: 'general' }) })
+  F('earliestSeq 随 since 前的回收变化', { state: () => ({ messages: mkMessages(6, 1).slice(3) }), a: () => ({ since: 0 }) })
+  F('翻页第二页（since=nextSince）', { state: () => ({ messages: mkMessages(62, 1) }), a: () => ({ since: 50 }) })
+
+  // 两模式的**回归门禁**：只有两形态对拍抓不住「两侧一起退化」，这里直接断言语义。
+  // 现场两个失败模式都在这两条里：默认读到远古噪音（哨 A）、增量读静默丢中段（哨 B）。
+  {
+    // 哨 A：不给游标 ⇒ 必须读**最新** limit 条，不是最旧的。现场两次 read 都因此被历史淹没。
+    const st = mkState({ messages: mkMessages(5, 2) }) // seq 2..6
+    const first = core.filterMessages(st, { limit: 2 })
+    ok(first.mode === 'tail' && first.messages.map((m) => m.seq).join(',') === '5,6',
+      '不给 since ⇒ tail：返回最新两条（现场：默认读到远古噪音）', JSON.stringify(first.messages.map((m) => m.seq)))
+    ok(first.hasMore === true && first.nextSince === 6 && first.earliestSeq === 2 && first.total === 5 && first.latestSeq === 6,
+      'tail 报 hasMore/nextSince/earliestSeq/total/latestSeq（窗口被截断这件事必须可察觉）',
+      JSON.stringify({ mode: first.mode, hasMore: first.hasMore, nextSince: first.nextSince, earliestSeq: first.earliestSeq }))
+  }
+  {
+    // 哨 B：给了游标 ⇒ 从游标**往后**读，旧→新。旧实现 slice(-limit) 会取这段里最新的几条，
+    // 于是 10 条里只回 3 条、中间 4 条再也拿不回来（现场：62 条里静默丢 12 条）。
+    const st = mkState({ messages: mkMessages(10, 1) }) // seq 1..10
+    const seen = []
+    let since = 1
+    for (let guard = 0; ; guard++) {
+      if (guard > 100) { ok(false, '游标循环收敛（上限 100 次翻页）'); break }
+      const page = core.filterMessages(st, { since, limit: 3 })
+      for (const m of page.messages) seen.push(m.seq)
+      if (!page.hasMore) break
+      if (page.nextSince === since) { ok(false, 'hasMore=true 时游标必须前进（否则死循环）'); break }
+      since = page.nextSince
+    }
+    ok(seen.length === 9 && new Set(seen).size === 9 && seen.join(',') === '2,3,4,5,6,7,8,9,10',
+      '按 nextSince 循环无损读完后 9 条（旧实现取最新 3 条 ⇒ 中间 4 条永久丢）', seen.join(','))
+  }
+  {
+    // channelNote：实测踩过「按文档写 agent:<holderId> 读 0 条」「path 少个尾斜杠读 0 条」。
+    // 有消息但没命中才给一句话；空板与命中都不给（负向对照）。
+    const st = mkState({ messages: mkMessages(3, 1) })
+    const miss = core.filterMessages(st, { channel: 'path:typo/' })
+    ok(typeof miss.channelNote === 'string' && miss.channelNote.includes('该频道没有消息') && miss.channelNote.includes('general'),
+      'channel 未命中 → channelNote 列出既有频道', String(miss.channelNote))
+    ok(core.filterMessages(mkState({ messages: [] }), { channel: 'general' }).channelNote === undefined,
+      '空板 → 不加 channelNote（负向对照）')
+    ok(core.filterMessages(st, { channel: 'general' }).channelNote === undefined,
+      '命中 → 不加 channelNote（负向对照）')
+  }
+  {
+    // earliestSeq：区分「这段被 MAX_MESSAGES 回收了」与「那段时间没人留言」。
+    const st = mkState({ messages: mkMessages(6, 1).slice(3) }) // 现存 seq 4..6
+    ok(core.filterMessages(st, { since: 0 }).earliestSeq === 4,
+      'earliestSeq 报出还留着的最旧一条', String(core.filterMessages(st, { since: 0 }).earliestSeq))
+    ok(core.filterMessages(st, { since: 1 }).earliestSeq === 4,
+      'since < earliestSeq ⇒ 调用方判得出中间那段已被回收')
+  }
+}
+// ------------------------------------------- channelRosterNote（0.13.0，单独成组）
+group('channelRosterNote', '频道未命中时列出既有频道：按条数降序、最多 5 个、同数按名升序')
+{
+  const C = (label, st) => pureCase('channelRosterNote', label, [st], [st])
+  C('空板 → 「现有频道：」后面是空的（由调用方保证不出现：见上组负向对照）',
+    mkState({ messages: [] }))
+  C('单频道', mkState({ messages: mkMessages(2, 1) }))
+  C('按条数降序列前 5 个 + 等 N 个',
+    mkState({ messages: [
+      ...mkMessages(3, 1),
+      { msgId: 'm_90', seq: 90, channel: 'path:a/', author: 'agent:A', ts: T0, body: 'x' },
+      { msgId: 'm_91', seq: 91, channel: 'path:b/', author: 'agent:A', ts: T0, body: 'x' },
+      { msgId: 'm_92', seq: 92, channel: 'path:c/', author: 'agent:A', ts: T0, body: 'x' },
+      { msgId: 'm_93', seq: 93, channel: 'path:d/', author: 'agent:A', ts: T0, body: 'x' },
+      { msgId: 'm_94', seq: 94, channel: 'path:e/', author: 'agent:A', ts: T0, body: 'x' }
+    ] }))
+  C('同条数按频道名升序（确定性）',
+    mkState({ messages: [
+      { msgId: 'm_80', seq: 80, channel: 'path:zz/', author: 'agent:A', ts: T0, body: 'x' },
+      { msgId: 'm_81', seq: 81, channel: 'path:aa/', author: 'agent:A', ts: T0, body: 'x' }
+    ] }))
 }
 // ---------------------------------------------------------------- overview
 group('overview', '同名但不同形：用桩把宿主的 async op 收敛到聚合逻辑后对拍')
@@ -1198,7 +1304,7 @@ group('corpus', '每个同名函数的语料条数下限（防止语料被悄悄
     const n = g ? g.pass + g.fail : 0
     ok(n >= 4, 'corpus · ' + name + ' 至少 4 条断言', 'actual=' + n)
   }
-  ok(EXPECTED_PARITY.length === 28, '逐输出对拍的同名函数恰好 28 个', String(EXPECTED_PARITY.length))
+  ok(EXPECTED_PARITY.length === 30, '逐输出对拍的同名函数恰好 30 个', String(EXPECTED_PARITY.length))
 }
 
 // ---------------------------------------------------------------- 汇总

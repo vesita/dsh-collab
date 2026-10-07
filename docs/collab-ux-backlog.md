@@ -412,6 +412,23 @@
 - **仍未验证**：`subagent/end` 事件能否作为"后代已结束"的精确信号（它带子会话 id，
   `dsh-subagent/lib/types/types.d.ts:93-111`）；若可用，第 3 条可以做到秒级而不是 20 分钟。
 
+**0.13.0 复核（用户再次提出：更新后旧会话的失效锁不会自动清理）**：
+
+- **装备面被堵死的证据（新增，读 DSH 源码）**：`agents` 服务的 `get(id)` 是
+  `this.store.get(id)?.agent`、`list()` 是 `[...this.store.values()]`
+  （`/usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-agent/lib/index.js:594,612`）
+  —— **两者读的是同一个 live 注册表**。所以"装机时遍历 `agents.list()` 补武装"
+  （`src/auto-release.ts:234-243`）**看不到的持有者，`svc.get()` 同样解析不到**，
+  装机期对账**不可能**覆盖第 4/5 条那批旧持有者。这一条把"再加一次遍历就能修"的可能性排除了。
+- **仍成立**：自动清理要安全，前提是一条**跨进程/持久化的活性见证**（按项目落盘的进程心跳，
+  或把"持有时刻的进程身份"随声明落盘）。三个候选（装机期 session 存储对账 / 装机期租约强制截断 /
+  进程 epoch 绑定）的代价与误杀风险已评估：只有"见证"能同时满足"终结即释放"与"不误杀跨界活锁"。
+  **本轮未实现**（它是独立一块工作，且改判据必须配负向对照测试）。
+- **现场代价（本轮实测）**：子代理 `11adb78f` 因上下文耗尽异常退出，其独占声明 `c_191`
+  在 `experiments/entity_identity_v2/` 上滞留，直到 Lead 手动 `op=reap confirm=true` 才解开；
+  即"没有任何自动路径能回收它"。同一天 `op=wait` 2 次全部超时（15.25s / 90.29s），
+  另有 4 次 `claim` 被 `conflict` 顶回。
+
 ### 2.24 `list` 的 holders 被读成「过期锁」（0.12.2 已缓解）
 
 - **一手**：使用者看着 `collab_lock op=list` 的返回问「是不是在罗列过期锁」。该次实测：
@@ -426,6 +443,87 @@
   `tests/collab-hostcode-parity.mjs`：空状态 list 断言 `!('holdersNote' in data)`。
 - **仍未做**：名册照旧逐条返回（`STALE-VISIBLE` 那条测试明确要求 stale holder 可见），
   所以那条返回的量级没变 —— 变的是它不再能被读成锁。
+
+### 2.26 句柄结束即删：推翻 W7（0.13.0，用户决策）
+
+- **一手（用户提出）**：「失效锁清除少处理了一个边界情况 —— 更新后旧会话的失效锁不会自动清理」。
+- **审计结论（三路只读审计 + 读 DSH 源码）**：
+  1. `agents.get(id)` 与 `agents.list()` 读的是**同一个 live 注册表**
+     （`dsh-agent/lib/index.js:594` / `:612`）⇒ 不在名单里的持有者，`get()` 也解析不到；
+     "装机时再遍历一次"这类修法**不可能**覆盖它们。
+  2. 现场实证：子代理 `11adb78f` 上下文耗尽退场后，独占声明 `c_191` 挡住
+     `experiments/entity_identity_v2/`，直到人工 `op=reap confirm=true` 才解开。
+  3. 因此候选只有两条：跨进程活性见证（落盘心跳）或**句柄生命周期**。
+- **决策（用户）**：不用心跳包，**句柄结束自动删除**。`agent/disposed` 是"句柄结束"的确定性事件
+  （`agent.dispose()` 停循环 + 注销注册表，`dsh-agent/lib/types/index.d.ts:135-145`），
+  这一刻立即释放该 holder **全部未过期**声明。
+- **实现（0.13.0）**：`releaseOnLoopEnd` 加 `cause`（'loop-end' | 'disposed'）；包形态在
+  `src/push.ts` 的 `agent/disposed` 处理器里释放 + `dropHolder` + 通知读者；动态形态
+  （`src/collab-plugin.host.ts`）同源但**不投递**（受限宿主构造不出诚实来源的消息）。
+  两形态的 `releaseOnLoopEnd` 逐输出对拍（含 `cause:'disposed'` 语料）。
+- **风险与缓解（如实记）**：W7 当年的顾虑仍然成立 —— dispose 后被**恢复**的会话会按对话历史
+  以为自己持锁。缓解是留痕：频道 `agent:<holderId>` 里那条"句柄已结束（agent/disposed）"的
+  审计留言 + 发给等待者的"锁已释放"通知。**残余风险**：恢复的会话若从不读留言板，就会以为自己
+  还持锁（与租约到期那条老路径的风险同级，但发生得更早）。
+- **仍未覆盖**：①**被杀的进程**（没有 `agent/disposed`）；②**升级前就已退场**的旧持有者
+  （没有新事件可等）—— 两者的声明只能等租约到期或 `op=reap`。跨进程活性见证这条路本轮被否，
+  但需求仍在（若将来要做，判据与代价见 §2.23 的候选表）。
+- **测试**：`collab-auto-release.mjs` §8（释放 + 留痕 + 通知读者 + 与 idle 武装路径幂等）、
+  `collab-integration.mjs` step 5-6、`collab-readers-push.mjs`、
+  `collab-hostcode-parity.mjs`（两形态对拍）。
+
+### 2.25 留言板「写了没人读、@ 了没人知道」（0.13.0 部分修）
+
+**现场取证**（卡片式训练框架 Lead 会话家族 47 个会话，2026-10-07 全天转录 + 同一个
+`my-16d6093f0d1330.json`；数法与脚本见取证报告，原始命令为解压 `.zstd` 后按 `tool/call` 聚合）：
+
+| 数字 | 值 | 说明 |
+| --- | --- | --- |
+| `collab_board` post / read | **14 / 2** | 一天 14 条留言，全天只被读 2 次 |
+| 带 `mentions` 的留言 | 3 条，**回应 0 条** | 目标会话转录里连 msgId 都没出现过 —— 不是"没回"，是**从未收到** |
+| 两次 read 的结果 | 一次漏掉当天全部留言；一次返回 49.9 KB 触发宿主 spill 截断 30 KB | 两次都是 `since=0`（默认）|
+| `collab_board` 漏 `op` | 1 次 `未知操作：undefined` | §2.17 |
+| `collab_lock` release 失败 | **23 / 46** | 10 次缺参 `bad-request`、13 次 `not-found`（锁已被自动释放，模型扑空）|
+
+**根因（三条，都是本板的设计问题，不是使用问题）**：
+
+1. **默认读到远古**：`since` 缺省 = 0，而旧实现 `matched.slice(-limit)` 取的是"最新 limit 条"——
+   但当历史已累积几十条时，调用方以为自己按文档"增量拉取"，实际读到的窗口与它想要的错位；
+   更要命的是返回里**没有 `hasMore`/`earliestSeq`**，"窗口被截断"这件事不可察觉（§2.25 修）。
+2. **`since` 方向与文档矛盾**：给 `since` 时旧实现仍取"最新 limit 条"，于是被跳过的**中段**永久不可达
+   （现场 62 条留言、默认 limit 50：一次只回 50 条，最旧 12 条再也拿不回来）（§2.25 修）。
+3. **mentions 没有任何投递面**（§2.13 的根因，行号已漂移）：`post` 只入库，
+   `agent.inject` 全仓只有 access / push（release/reap/auto）/ gate 三处调用，**没有一处由 board 触发**；
+   返回也不告诉调用方"没投递"。
+
+**0.13.0 处置**：
+
+- `filterMessages` 分**两种模式**：不给 `since`（或 0）= **tail**（最新 limit 条，追平用）；
+  `since > 0` = **forward**（从游标往后、旧→新，可循环到 `hasMore === false` 无损追平）。
+  回传 `mode` / `hasMore` / `nextSince` / `earliestSeq`，"截断"与"被回收"从此可察觉。
+- `post` 返回固定带 `delivered: false` + `deliveryNote`（不投递、不唤醒；要对方动起来用它自己的消息工具），
+  并原样回显 `channel` / `mentions`。
+- 频道未命中时返回 `channelNote`：列出**现有频道**（按条数降序，最多 5 个）。
+  实测踩过两种写法不一致 —— 文档写 `agent:<holderId>` 而 holderId 本身已含 `agent:`
+  （读 0 条，现场 K=10 vs L=0）、path 频道少个尾斜杠（读 0 条，I=6 vs J=0）。
+  schema 与 `collab-usage.md` 的模板同时改正。
+- `read` 透传 `load()` 的 warning（以前只解构 `{state}`，把"按项目隔离已失效"丢了）。
+- 宿主形态把读取逻辑抽成同名纯函数 `filterMessages` / `channelRosterNote` 进对拍集合
+  （25 → **30 个**）—— 此前这段逻辑两边各抄一份，一起退化时**无人守护**。
+
+**仍未做（如实记，含理由）**：
+
+1. **mention / channel 的投递**：按定位（README「与官方 Agent Teams 的分工」）树内转向归官方
+   `send_message`，本插件不重做。跨树**未投递**只能如实告知 —— 是否给同进程、非团队成员的会话
+   补一条 best-effort notice（`agent.inject`，不唤醒），是一个**定位取舍**，待拍板。
+2. **已读游标 / "你有 N 条未读"**：消息结构里没有已读字段（`Message` 是
+   `additionalProperties:false`），态势摘要里也没有留言信号 ⇒ **发了没人读**这一半没解决。
+   要做就得升契约（SSOT + 四份派生物），是独立一块。
+3. **更早的历史不可达**：tail 只给最新 `limit` 条（上限 200）；`before` 反向翻页未做。
+4. **单次 read 可能很大**：现场 50 条 = 49.9 KB，触发宿主 spill 截断。`limit` 可调小，但返回值里
+   没有"体量"提示。
+5. **`release` 无参默认释放自己的全部声明**（现场 10 次缺参报错）、**`not-found` 不算失败**
+   （现场 13 次）：都会改变锁语义，未动。
 
 ---
 

@@ -77,26 +77,24 @@ if (!postRes.ok) throw new Error('post failed')
 const readRes = await boardTool.execute({ op: 'read', channel: 'general' }, exec2)
 if (!readRes.ok || readRes.data.messages.length !== 1) throw new Error('read failed')
 
-// 5. agent-1 disposed
-//    W7（**改了语义**）：dispose **不是**释放信号 —— 声明的生命周期只由租约 expiresAt 决定。
-//    原断言是 `claims.length !== 0 → throw 'disposed claims not cleaned'`，它编码的是
-//    "dispose 释放声明"，与 W7 决策直接冲突。这里改成如实断言**新**语义（强度不降：
-//    既钉住"未过期声明必须留下"，也钉住"它仍属于 agent-1"）。
+// 5. agent-1 disposed —— **0.13.0：句柄结束 = 自动删除**（推翻 0.9.6 起的 W7 取舍）
+//    `agent/disposed` 是"这个 agent 的句柄结束了"的确定性事件（agent.dispose() 停循环 + 注销注册表），
+//    这一刻它不可能还在写文件，所以立即释放它**全部未过期**声明，并在频道 agent:<holderId> 留一条审计。
 ctx.emit('agent/disposed', { agent: { id: 'agent-1' } })
 await new Promise(r => setTimeout(r, 60))
 
-// 6. check list after dispose：未到期的声明必须还在（dispose 不缩短租约）
+// 6. dispose 之后：未到期声明也没了；留痕如实说"句柄已结束"，不是"空闲超过 N 秒"
 const listRes = await lockTool.execute({ op: 'list' }, exec2)
-if (!listRes.ok || listRes.data.claims.length !== 1) {
-  throw new Error('dispose must NOT release an unexpired claim (W7: the lease is the only reclamation), got ' + JSON.stringify(listRes.data.claims))
+if (!listRes.ok || listRes.data.claims.length !== 0) {
+  throw new Error('dispose must release the unexpired claim (handle ended => auto delete), got ' + JSON.stringify(listRes.data.claims))
 }
-if (listRes.data.claims[0].holderId !== 'agent:agent-1') {
-  throw new Error('the surviving claim must still belong to agent-1, got ' + listRes.data.claims[0].holderId)
+const auditRes = await boardTool.execute({ op: 'read', channel: 'agent:agent-1' }, exec2)
+if (!auditRes.ok || auditRes.data.messages.length !== 1) {
+  throw new Error('dispose must leave exactly one audit message in channel agent:agent-1, got ' + JSON.stringify(auditRes.data))
 }
-// 后续步骤沿用旧版"此时已无占用"的前置条件 —— 用**显式 release** 腾出路径
-// （agent-1 即便已被 dispose，仍按 holderId 匹配，这正是"dispose 不改变持有关系"的体现）。
-const relRes = await lockTool.execute({ op: 'release', claimId: listRes.data.claims[0].claimId }, exec1)
-if (!relRes.ok) throw new Error('explicit release after dispose failed, got ' + JSON.stringify(relRes))
+if (!String(auditRes.data.messages[0].body).includes('句柄已结束')) {
+  throw new Error('audit message must say the handle ended, got ' + String(auditRes.data.messages[0].body))
+}
 
 // 7. unified error envelope: failures carry a top-level error code
 const badRelease = await lockTool.execute({ op: 'release' }, exec2)

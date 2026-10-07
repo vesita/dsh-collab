@@ -38,11 +38,10 @@
       "properties": {
         "msgId": { "type": "string", "description": "消息 id，如 m_1。" },
         "seq": { "type": "integer", "description": "单调递增序号，用于增量读取（read since）。" },
-        "channel": { "type": "string", "default": "general", "description": "频道：general / path:<路径> / agent:<holderId>。" },
+        "channel": { "type": "string", "default": "general", "description": "频道：general / path:<相对路径> / agent:<holderId>（holderId 本身已含 agent: 前缀，直接写它，不要再加一层）。写什么就得按什么读：精确匹配。" },
         "author": { "type": "string", "description": "作者 holderId。" },
         "ts": { "type": "integer", "description": "发送时刻（Unix 毫秒）。" },
         "body": { "type": "string", "minLength": 1, "description": "消息正文。" },
-        "mentions": { "type": "array", "items": { "type": "string" }, "maxItems": 20, "description": "被 @ 的 holderId。" },
         "replyTo": { "type": "string", "description": "回复的 msgId，可做成线程。" }
       }
     },
@@ -138,9 +137,8 @@
         "op": { "type": "string", "enum": ["post", "read"] },
         "channel": { "type": "string" },
         "body": { "type": "string" },
-        "mentions": { "type": "array", "items": { "type": "string" }, "maxItems": 20 },
         "replyTo": { "type": "string" },
-        "since": { "type": "integer", "minimum": 0, "description": "read 用，只返回 seq 大于此值的消息。" },
+        "since": { "type": "integer", "minimum": 0, "description": "read 用：省略或 0 = 读最新 limit 条（tail）；>0 = 从该 seq 往后读 limit 条（forward，旧→新）。返回的 nextSince 是下一次的游标。" },
         "limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 }
       }
     }

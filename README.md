@@ -7,7 +7,7 @@
 | 工具 | 作用 |
 | --- | --- |
 | `collab_lock` | **中央注册锁**：开工前声明"我占用哪些文件夹/文件"，并查询/等待/协商 |
-| `collab_board` | **协作留言板**：发消息 / 增量读消息，用于协商、交接、同步进展 |
+| `collab_board` | **跨会话留痕本**：发消息 / 增量读消息。**不投递、不唤醒任何会话**（@ 谁 ≠ 通知谁） |
 
 ## 多会话协同靠三个机制
 
@@ -78,7 +78,7 @@ DSH 自带一套实验性的 `Agent Teams`（`dsh-experimental-agent-team*`）�
 | 任务依赖 / 认领 / CAS | `team_task_*`（`revision` CAS、`blocked_by`、owner） | 不重做；只读在跑任务的 `write_scopes` 做交叉预警 |
 | 写协调纪律 | `team:policy`：写域互斥但 advisory、"not a lock"、Lead 复核最终 diff | 不复述；只补官方明说不做的那一层 |
 | 文件系统级锁 / 跨进程 | 明说没有（`dsh-experimental-agent-team/README.md:205,209`） | **互补面**：租约式路径声明 + 原生写门控，状态按项目 cwd 派生、跨进程共享 |
-| 自动释放 owner | 明说没有（同文件 `:208`） | **互补面**：循环终止自动释放 + `op=reap` 回收僵尸声明 |
+| 自动释放 owner | 明说没有（同文件 `:208`） | **互补面**：循环终止自动释放 + **句柄结束（`agent/disposed`）即删** + `op=reap` 回收僵尸声明 |
 | 对非团队成员会话的可见性 | 不给非成员注入任何 prompt，只有浏览器投影 | **互补面**：态势注入进**每一个**同项目会话的运行时上下文 |
 
 ---
@@ -128,7 +128,7 @@ DSH 自带一套实验性的 `Agent Teams`（`dsh-experimental-agent-team*`）�
     ├── collab-pure-logic.mjs        # 纯逻辑回归 + hostCode 内联副本漂移守护
     ├── collab-integration.mjs       # Cordis 插件端到端（fake ctx）
     ├── collab-hostcode-parity.mjs   # 动态宿主形态**行为**对拍（路径 + 三态语义 + holder 回收）
-    ├── collab-inline-parity.mjs     # 两形态**同名函数**逐输出对拍（25 个，含集合回归守护）
+    ├── collab-inline-parity.mjs     # 两形态**同名函数**逐输出对拍（30 个，含集合回归守护）
     ├── collab-contract-derivation.mjs # 契约派生守卫（schema ⇄ d.ts ⇄ Python ⇄ Rust ⇄ 真实工具 schema）
     ├── collab-message-provenance.mjs # 规范守卫：严禁冒充用户（AGENTS.md §1）
     ├── collab-digest-stability.mjs  # 态势摘要文本时间稳定性回归（运行时快照去重）
@@ -324,8 +324,15 @@ agents.currentInitiator()            → 正在装配的那个会话
 （`dsh-agent/lib/types/runtime-types.d.ts:202-209`），停下的循环读不到留言。结果只能干等租约
 （默认 1800 秒）或让别人 `op=reap`。根子是**锁的生命周期比会话的循环长**。
 
-**判据**：`agent/status` 从 `running` 翻到 `idle`（循环停了）。**不是** `agent/disposed` ——
-idle 的 agent 仍在 `agents.list()` 里、仍可唤醒，所以 W7「dispose 不释放」没有被推翻。
+**判据**：`agent/status` 从 `running` 翻到 `idle`（循环停了）。
+
+**另一条判据是 `agent/disposed`（0.13.0：句柄结束 ⇒ 自动删除）**。这条推翻了 0.9.6 起
+W7「dispose 不释放」的取舍：`agent/disposed` 是"这个 agent 的句柄结束了"的**确定性**事件
+（`agent.dispose()` 会停循环、注销注册表，`dsh-agent/lib/types/index.d.ts:135-145`），
+这一刻它不可能还在写文件，所以立即释放它**全部未过期**声明（不再有"未过期声明要等到租约到期"
+这一说）。风险与缓解：dispose 后**被恢复**的会话仍会按对话历史以为自己持锁 —— 缓解是留痕，
+`releaseOnLoopEnd(cause:'disposed')` 会往频道 `agent:<holderId>` 写一条"句柄已结束"的审计留言，
+读者也会收到"锁已释放"的通知。
 
 **四道闸门**（前三道方向都是"少放"）：宽限期 `loopEndGraceSec`（0.9.11 起默认 **120 秒**，
 此前 15）排除回合之间的正常停顿；宽限期内任何状态变化都让本次武装作废（代次）；到点**必须**
@@ -353,13 +360,12 @@ idle 的 agent 仍在 `agents.list()` 里、仍可唤醒，所以 W7「dispose �
 | 租约到期 | 时间 | `sweep()` 回收，仍是最后兜底 |
 | `op=release` | 持有者显式 | — |
 | **循环终止自动释放** | `idle` + 宽限到点 | 本版新增；**仅限仍加载着的会话** |
-| `agent/disposed` | agent 离开注册表 | **不释放**未过期声明（W7） |
+| **句柄结束自动删除** | `agent/disposed` | 立即释放**全部未过期**声明（0.13.0，推翻 W7）+ 审计留痕 + 通知读者 |
 | `op=reap` | 显式 `confirm:true` | 只收确认的僵尸，默认 dry-run |
 
-**边界**：只覆盖"循环停了、agent 还加载着"的持有者。**已 dispose** 的持有者不在此列 ——
-它收不到告知（注入面对未加载会话不可达），恢复后必然会以为自己还持锁，所以交给租约到期与
-`op=reap`。**被杀的进程**同理：既没有 `agent/status` 也没有 `agent/disposed`，本功能看不到它，
-它的声明只能等租约到期或 `op=reap`。
+**边界**：**被杀的进程**不在覆盖范围 —— 既没有 `agent/status` 也没有 `agent/disposed`，
+本插件看不到它，它的声明只能等租约到期或 `op=reap`。**升级之前就已经退场**的旧持有者同理：
+没有新事件可等，只能靠 `op=reap`（或租约到期）收尾 —— 这也是为什么 `reap` 仍然保留。
 
 **设置**：`releaseOnLoopEnd`（默认 `true`）、`loopEndGraceSec`（0.9.11 起默认 `120`，夹在 `[1, 3600]`），
 **活读**——武装后到点前关掉也照样拦住。**取舍**：宽限期排不掉"等真人回复"这种停顿，超过宽限期
@@ -439,7 +445,7 @@ idle 的 agent 仍在 `agents.list()` 里、仍可唤醒，所以 W7「dispose �
   消息由宿主代造并写死 `source: { kind: 'user', rpcId: 'dsh-collab-…' }` ⇒ 客户端按 `source.kind`
   分流后渲染成**用户气泡**（落进 next-step 收件箱还会升级成 steering 气泡，与真人输入共用同一个
   渲染器）。插件既改不了也看不见来源 ⇒ 只能换载体。
-- **会话被 dispose 会提前丢掉未到期的声明**。`dropHolder` 原先只按 `holderId` 过滤、完全不看
+- **会话被 dispose 会提前丢掉未到期的声明**（0.9.6-0.12.x 的行为；**0.13.0 起这是刻意的**）。`dropHolder` 原先只按 `holderId` 过滤、完全不看
   `expiresAt`：会话一结束就释放。但同一个 session 常常随后恢复并继续干活（对话历史里仍"记得"
   自己持锁），而别的会话在 `overview` 里看到路径**空闲** ⇒ 两边同时以为可以写。
 
@@ -451,7 +457,7 @@ idle 的 agent 仍在 `agents.list()` 里、仍可唤醒，所以 W7「dispose �
    解析不到就**如实跳过**（`skipped.reason = 'agent-not-resolvable'`），**没有任何回退通道**；
    `inject` 是同步契约 ⇒ 不再有 `timeout` 这一态；`prompt-failed` / `not-adjacent` /
    `subagent-failed` 三个 reason 随通道一起删除。
-2. **租约 `expiresAt` 是声明生命周期的唯一权威**：`agent/disposed` 只回收该 holder **已过期**的声明、
+2. **（0.9.6–0.12.x）租约 `expiresAt` 是声明生命周期的唯一权威**：`agent/disposed` 只回收该 holder **已过期**的声明、
    并把它从各 claim 的 `readers` 里摘掉；未到期声明原样保留，到期由惰性清理回收，`op=heartbeat`
    是唯一续租方式。安全侧后果如实记：会话死亡后其声明会占用到租约到期。
 3. 常驻纪律新增一条：**主会话上下文最贵**（主 AI 跑最强也最贵的模型 ⇒ 目标是低上下文运行），
@@ -517,7 +523,7 @@ claim 删除并强制刷新后双方都回落通用规范。修复前实测 `6 p
 **三道新的守卫**（都进了 `npm test`）：
 
 - `tests/collab-inline-parity.mjs`：从动态形态的 `hostCode` 字符串里用**括号配对扫描**抽出
-  **全部 25 个两形态同名函数**逐输出对拍。此前只有 `clockUtc` / `renderDigest` 两个被比对；
+  **全部 30 个两形态同名函数**逐输出对拍。此前只有 `clockUtc` / `renderDigest` 两个被比对；
   并用「实测同名集合必须**恰好等于**期望集合」做回归守护——任何一侧新增同名函数却忘记接进对拍都会红。
 - `tests/collab-contract-derivation.mjs`：把「schema 是单一事实源」从**声称**变成**可执行**——
   逐字段核对 `$defs` ⇄ `src/types/collab.d.ts` ⇄ `scripts/collab_models.py` ⇄
@@ -694,15 +700,18 @@ mode, content})` 与 `ctx.subagents.sendMessage(sender, targetId, content, {sign
 
 **claim 生命周期（0.9.6 语义）：租约 `expiresAt` 是声明生命周期的唯一权威。**
 
-`agent/disposed`（会话结束）**不再提前释放未到期的声明**，它只做两件事：
+`agent/disposed`（会话结束）在 **0.9.6–0.12.x** 只做两件事（**0.13.0 起改为立即释放全部未过期声明**）：
 
 1. 回收该 holder **已过期**的声明（若确实回收到了，走同一条 `notifyReaders` 通知其读者）；
 2. 把已消失的 holder 从**各 claim 的 `readers`** 里摘掉（否则会向一个已经死掉的会话推送）。
 
 **未到期的声明原样保留**（含它自己的 `readers`），到期由 `sweep()` 回收。
 
-> **为什么**：会话 dispose 之后常常会被恢复，并继续按对话历史认为自己持有锁；如果声明在
+> **为什么（当时）**：会话 dispose 之后常常会被恢复，并继续按对话历史认为自己持有锁；如果声明在
 > dispose 时就消失，另一个会话会看到"路径空闲"，于是两边同时以为可以写。
+> **0.13.0 的翻转**：这条取舍的代价更实在 —— 子代理被 dispose/上下文耗尽后留下的独占锁会一直挡人
+> （实测现场：`c_191` 挡住 `experiments/entity_identity_v2/` 直到人工 `op=reap`）。现在按"句柄结束
+> 即删 + 审计留痕 + 通知读者"处理，恢复后的会话有据可查（`collab_board` 里那条"句柄已结束"）。
 
 **安全侧后果（如实写）**：会话死亡后，它**未到期**的声明会一直占用到租约到期，期间他人只能
 `op=wait` 等待或用 `collab_board` 协商；`op=heartbeat` 是**唯一**的续租方式。
@@ -727,7 +736,7 @@ npm test                # 依次运行下列全部测试
 node tests/collab-pure-logic.mjs       # 纯逻辑 + hostCode 漂移守护
 node tests/collab-integration.mjs      # Cordis 插件端到端（fake ctx）
 node tests/collab-hostcode-parity.mjs  # 动态宿主形态**行为**对拍
-node tests/collab-inline-parity.mjs    # 两形态**同名函数**逐输出对拍（25 个 + 集合回归守护）
+node tests/collab-inline-parity.mjs    # 两形态**同名函数**逐输出对拍（30 个 + 集合回归守护）
 node tests/collab-contract-derivation.mjs # 契约派生守卫（schema ⇄ d.ts ⇄ Python ⇄ Rust ⇄ 真实工具 schema）
 node tests/collab-message-provenance.mjs # 规范守卫：严禁冒充用户（AGENTS.md §1）
 node tests/collab-digest-stability.mjs # 态势摘要文本时间稳定性

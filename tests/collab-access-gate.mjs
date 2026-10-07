@@ -471,12 +471,14 @@ console.log('# A: block 分支 / 无命中 / 无候选 / 绝对路径 / 自己�
   ok(injectLog.length === 0, '声明已过期 -> 不投递', 'injects=' + injectLog.length)
 
   // 字符串数组里的候选路径（题面要求"含字符串数组"）。用干净实例，避开上面的去重状态。
+  // 0.13.0 起 `collab_board` 的 `mentions` 已移除（那是官方 send_message 的活），所以这条性质
+  // 改在一个**普通工具**的字符串数组参数上验：候选提取本来与工具无关。
   resetInject()
   const h5 = await makeHarness({ claims: [foreign] })
-  const arr = await h5.post(execOf('collab_board', { op: 'post', body: 'hi', mentions: ['src/a/2'] }))
+  const arr = await h5.post(execOf('write', { file_path: 'src/a/1', extra: ['src/a/2'] }))
   ok(arr.decision === arr.downstream && !('additionalContexts' in arr.decision), '字符串数组命中同样不改工具结果')
   ok(injectLog.length === 1 && noticeText(injectLog[0]).includes('src/a/2'),
-    'mentions 这类字符串数组里的路径也参与候选提取，命中后通知点出该路径',
+    '字符串数组里的路径也参与候选提取，命中后通知点出该路径',
     'injects=' + injectLog.length + ' ' + JSON.stringify(noticeText(injectLog[0])))
   // body 里的自由文本同样会被当作候选字符串，但它不是路径（'hi' 没有父目录），不会命中。
   resetInject()
@@ -506,7 +508,7 @@ console.log('# A2: 占用管理工具 collab_lock 不算「访问路径」——
   // collab_board **不在**跳过集合里（理由见 src/access.ts 的 OCCUPANCY_TOOLS 常量注释）：
   // board 的普通消息（op=read 没有 paths，op=post 的 body 是自由文本）本来就不含路径，
   // 提取不到候选，因此自然不通知 —— 这是"无候选"，不是"被跳过"。
-  // 正因如此，board 的 mentions 里出现路径时仍照旧通知（见上面 # A 块那条用例）。
+  // （0.13.0 起 board 连 mentions 参数都没有了，见上面 # A 块那条用例的说明。）
   await h.post(execOf('collab_board', { op: 'read', channel: 'general' }))
   ok(injectLog.length === 0, 'collab_board 的 op=read 参数不含路径 -> 无候选自然不通知（不是被跳过）', 'injects=' + injectLog.length)
   ok((h.readState().claims[0].readers || []).length === 0, '它们也都不登记 reader', JSON.stringify(h.readState().claims[0].readers))

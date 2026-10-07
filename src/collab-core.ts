@@ -86,7 +86,6 @@ export const REAP_DEFAULT_OLDER_THAN_SEC: number = 600
 export interface PostInput {
   body?: string
   channel?: string
-  mentions?: string[]
   replyTo?: string
 }
 
@@ -173,13 +172,30 @@ export interface OverviewResult {
   holders: OverviewHolder[]
 }
 
-/** filterMessages 的返回结构。total 是筛选前的总条数，便于调用方判断是否有更早历史。 */
+/**
+ * filterMessages 的返回结构。
+ *
+ * `total` 是本次筛选（channel + since）命中的总条数，`latestSeq` 是状态文件里最后一条消息的 seq
+ * （**全局**，不按 channel 收窄）。`hasMore` / `nextSince` 是 0.13.0 加的**有损读的出口**：
+ * 把 `nextSince` 当下一次 read 的 `since`，循环到 `hasMore === false` 即可无损追平；
+ * 一条都没返回时 `nextSince` 原样回传 `since`（游标不前进，也不会跳段）。
+ */
 export interface FilterMessagesResult {
   since: number
+  /** tail = 不给游标时读最新 limit 条；forward = 给了 since>0 时从游标往后读。 */
+  mode: 'tail' | 'forward'
   returned: number
   total: number
   latestSeq: number
+  /** 沿本模式的方向还有更多没返回。 */
+  hasMore: boolean
+  /** 下一次 read 的游标：本次返回的最后一条的 seq（一条都没返回时原样回传 since）。 */
+  nextSince: number
+  /** 这个筛选范围内**还留着**的最旧一条的 seq（0 = 一条都没有）。`since < earliestSeq` ⇒ 中间那段已被 MAX_MESSAGES 回收。 */
+  earliestSeq: number
   messages: Message[]
+  /** 只在「给了 channel 但一条都没命中，且板里确实有消息」时出现：列出**现有频道**。 */
+  channelNote?: string
 }
 
 export const seqNever: number = 0
@@ -660,14 +676,16 @@ export const AUTO_RELEASE_AUTHOR: string = 'system:dsh-collab'
  *
  * - 只处理**未过期**的声明：已过期的归 sweep()，这里不抢它的活（与 reap 同一条口径）。
  * - 一条都没有时 `changed: false`，调用方据此**不写盘、不发通知、不留痕**（没有发生释放事件）。
+ * - `cause`（0.13.0）决定留痕正文说哪种结束：`'loop-end'` = 循环停了、空闲超过宽限期；
+ *   `'disposed'` = 会话句柄结束了（`agent/disposed`）。两种都是"这个持有者不会再动"的确定性信号，
+ *   区别只在文本 —— 正文必须说实话，不能让"句柄结束"被写成"空闲超过 N 秒"。
  * - 留痕消息进 `messages`（契约里已有的结构，不改状态文档 schema）：channel 就是 `holderId`
  *   —— agent holder 的 holderId 本身已经是 `agent:<sessionId>`，正是工具文档里"频道
  *   agent:…"那种寻址写法（**不要**再拼一次 `agent:`，那会得到 `agent:agent:<id>`），
- *   mentions 指向持有者本人，于是"这条锁是谁、因为什么、什么时候被拿掉的"从
  *   `collab_board op=read` 就能复述。
  * - 返回 `data.released` 是**真正被删掉**的那些声明的公开视图（供通知使用）。
  */
-export function releaseOnLoopEnd(state: StateDocument, holderId: string, holderName: string, t: number, graceSec: number): OpResult {
+export function releaseOnLoopEnd(state: StateDocument, holderId: string, holderName: string, t: number, graceSec: number, cause: 'loop-end' | 'disposed' = 'loop-end'): OpResult {
   const mine = state.claims.filter(c => c.holderId === holderId && c.expiresAt > t)
   if (!mine.length) return { ok: true, changed: false, data: { released: [] } }
   state.claims = state.claims.filter(c => !mine.includes(c))
@@ -683,9 +701,11 @@ export function releaseOnLoopEnd(state: StateDocument, holderId: string, holderN
     channel: holderId,
     author: AUTO_RELEASE_AUTHOR,
     ts: t,
-    body: '[自动释放] ' + who + ' 的会话循环已结束（空闲超过 ' + graceSec + ' 秒），其对 ' + shown +
-      ' 的声明已被自动释放。恢复工作前如需写入这些路径，请重新 collab_lock op=claim。',
-    mentions: [holderId]
+    body: cause === 'disposed'
+      ? '[自动释放] ' + who + ' 的会话句柄已结束（agent/disposed），其对 ' + shown +
+        ' 的声明已被自动释放。恢复工作前如需写入这些路径，请重新 collab_lock op=claim。'
+      : '[自动释放] ' + who + ' 的会话循环已结束（空闲超过 ' + graceSec + ' 秒），其对 ' + shown +
+        ' 的声明已被自动释放。恢复工作前如需写入这些路径，请重新 collab_lock op=claim。'
   }
   state.messages.push(m)
   return { ok: true, changed: true, state, data: { released, notice: m } }
@@ -936,15 +956,35 @@ export function heartbeat(state: StateDocument, h: HolderInput, a: HeartbeatInpu
   return { ok: true, changed: true, state, tNow, data: { claimId: c.claimId, expiresAt: c.expiresAt, serverTime: tNow() } }
 }
 
-// 发消息。a = {body, channel?, mentions?, replyTo?}。
+/**
+ * 留言板**没有投递面**的如实说明（0.13.0）：`post` 只写共享状态文件。
+ *
+ * 为什么放进返回值而不只是写在文档里：「发了就等于通知了」是实测发生过的误读
+ * （backlog §2.13）。调用方只能从返回值知道自己**没有**通知到任何人。
+ * **不写死任何工具名**：让某个会话动起来用哪个工具，由调用方当时的工具目录决定。
+ */
+export const BOARD_NO_DELIVERY_HINT: string = '留言板只写共享状态文件：不投递、不唤醒任何会话；对方只在它自己 collab_board op=read 时才会看到这条。要让某个已停下的会话动起来，用它自己的消息工具（以你当时的工具目录为准）。'
+
+/** `post` 收到已移除的 `mentions` 时的报错文案（fail-loud：不静默忽略）。 */
+export const BOARD_NO_MENTIONS_HINT: string = 'mentions 已移除：本板没有任何投递面，@ 谁都不等于通知谁。要通知/唤醒某个会话，用它自己的消息工具（以你当时的工具目录为准）；本条消息**没有写入**，请去掉 mentions 重发。'
+
+// 发消息。a = {body, channel?, replyTo?}。
+// **没有 mentions**（0.13.0 移除）：@ 某人并让他动起来是官方 Agent Teams 的投递面（`send_message`），
+// 本板不重做。旧实现把 mentions 记进消息却不产生任何投递，实测被读成"通知过了"（backlog §2.13），
+// 所以现在**显式拒绝**这个参数而不是静默忽略 —— 静默忽略等于继续骗调用方。
 export function post(state: StateDocument, h: HolderInput, a: PostInput, tNow: Clock): OpResult {
+  // 参数类型里已经没有 mentions 了，这里显式读一次"旧参数"：挡回去而不是静默忽略。
+  const legacyMentions = (a as unknown as { mentions?: unknown }).mentions
+  if (legacyMentions !== undefined) {
+    return { ok: false, changed: false, state, tNow, data: { error: 'bad-request', message: BOARD_NO_MENTIONS_HINT } }
+  }
   const body = typeof a.body === 'string' ? a.body.trim() : ''
   if (!body) return { ok: false, changed: false, state, tNow, data: { error: 'bad-request', message: 'body required' } }
   holder(state, h, h.name, tNow)
-  const m: Message = { msgId: 'm_' + (++state.seq), seq: state.seq, channel: (typeof a.channel === 'string' && a.channel.trim()) ? a.channel.trim() : 'general', author: h.holderId, ts: tNow(), body, mentions: Array.isArray(a.mentions) ? a.mentions.filter(x => typeof x === 'string').slice(0, 20) : [] }
+  const m: Message = { msgId: 'm_' + (++state.seq), seq: state.seq, channel: (typeof a.channel === 'string' && a.channel.trim()) ? a.channel.trim() : 'general', author: h.holderId, ts: tNow(), body }
   if (typeof a.replyTo === 'string' && a.replyTo) m.replyTo = a.replyTo
   state.messages.push(m)
-  return { ok: true, changed: true, state, tNow, data: { msgId: m.msgId, seq: state.seq, ts: m.ts } }
+  return { ok: true, changed: true, state, tNow, data: { msgId: m.msgId, seq: state.seq, ts: m.ts, channel: m.channel, delivered: false, deliveryNote: BOARD_NO_DELIVERY_HINT } }
 }
 
 // 按 holder 分组的占用全景。holder 的 mode 在多条声明不一致时聚合为 'mixed'。
@@ -963,14 +1003,56 @@ export function related(state: StateDocument, paths: string[]): Claim[] {
   return state.claims.filter(c => paths.some(p => c.paths.some(cp => ov(p, cp))))
 }
 
-// 筛选消息（channel / since / limit）。total 是筛选前的总条数，便于调用方判断是否有更早历史。
+// 筛选消息（channel / since / limit）。**两种模式**，由 `since` 决定方向：
+//
+//   - 不给 `since`（或 0）→ **tail**：返回**最新** limit 条。这是"看一眼有没有新东西"的用法，
+//     也是实测里模型唯一会用的用法（现场 2 次 read 都没带游标）。0.13.0 之前这里也是 tail，
+//     但**不给 `hasMore`/`earliestSeq`**，调用方看不出"窗口被截断了"。
+//   - 给 `since > 0` → **forward**：从该游标**往后** limit 条（旧→新）。这是增量追平：
+//     按 `nextSince` 循环到 `hasMore === false` 就是无损读完。
+//
+// 为什么必须分两种（两侧都有实测）：
+//   - 只用 tail：`since` 只能往后走，被 `slice(-limit)` 跳过的**中段**再也拿不回来 ——
+//     现场 62 条留言、默认 limit 50，一次 read 只回 seq 61..206，最旧 12 条静默丢失；
+//     按"读到 latestSeq 就算追平"的直觉再读一次得到 0 条，那 12 条永久不可达。
+//   - 只用 forward：默认 since=0 会把最老的 50 条倒给调用方 —— 现场两次 read 都因此被历史
+//     噪音淹没（其中一次 49KB 触发宿主溢出截断），最新的一条（正是发给它的）反而没进窗口。
+//
+// `hasMore` = 沿本模式的方向**还有更多没返回**（tail 是"更早的还有"，forward 是"更新的还有"）；
+// `earliestSeq` / `latestSeq` 是可用范围的下界/上界，调用方据此知道窗口落在哪一段。
 export function filterMessages(state: StateDocument, a: ReadInput): FilterMessagesResult {
   const since = Number(a.since) || 0, limit = Math.max(1, Math.min(200, Number(a.limit) || 50))
-  let l = state.messages
-  if (typeof a.channel === 'string' && a.channel.trim()) l = l.filter(m => m.channel === a.channel.trim())
+  const ch = typeof a.channel === 'string' && a.channel.trim() ? a.channel.trim() : null
+  const l = ch ? state.messages.filter(m => m.channel === ch) : state.messages
   const matched = l.filter(m => m.seq > since)
-  const returned = matched.slice(-limit)
-  return { since, returned: returned.length, total: matched.length, latestSeq: state.messages.length ? state.messages[state.messages.length - 1].seq : 0, messages: returned }
+  const mode: 'tail' | 'forward' = since > 0 ? 'forward' : 'tail'
+  const returned = mode === 'forward' ? matched.slice(0, limit) : matched.slice(-limit)
+  const hasMore = matched.length > returned.length
+  const nextSince = returned.length ? returned[returned.length - 1].seq : since
+  // earliestSeq = 这个筛选范围内**还留着**的最旧一条（0 = 一条都没有）。调用方 `since` 小于它，
+  // 说明那段已被 sweep 的 MAX_MESSAGES 回收 —— 与"那段时间没人留言"在返回值上可区分。
+  const earliestSeq = l.length ? l[0].seq : 0
+  // channel 是**精确匹配**的自由字符串（写什么就得按什么读）。实测踩过两种写法不一致：
+  // 文档写 `agent:<holderId>` 而 holderId 本身已是 `agent:…`（于是读 0 条）、path 频道少个尾斜杠
+  // （于是读 0 条）。空结果时把现有频道如实列出来，调用方一眼看出自己该写哪个。
+  const channelNote = ch && matched.length === 0 && state.messages.length ? channelRosterNote(state) : undefined
+  const out: FilterMessagesResult = { since, mode, returned: returned.length, total: matched.length, hasMore, nextSince, earliestSeq, latestSeq: state.messages.length ? state.messages[state.messages.length - 1].seq : 0, messages: returned }
+  if (channelNote) out.channelNote = channelNote
+  return out
+}
+
+/**
+ * 给定频道没有命中时的一句话：列出**现有频道**（按条数降序，最多 5 个），并说明 channel 的匹配口径。
+ * 只在"确实有消息但你这个频道一条都没有"时出现 —— 没有消息时一个字都不加（与 otherProjects /
+ * holderRosterNote 同一降级纪律）。
+ */
+export function channelRosterNote(state: StateDocument): string {
+  const count = new Map<string, number>()
+  for (const m of state.messages) count.set(m.channel, (count.get(m.channel) || 0) + 1)
+  const top = [...count.entries()].sort((x, y) => (y[1] - x[1]) || String(x[0]).localeCompare(String(y[0])))
+  const shown = top.slice(0, 5).map(([c, n]) => c + '（' + n + ' 条）').join('、')
+  const more = top.length > 5 ? ' 等 ' + top.length + ' 个' : ''
+  return '该频道没有消息。现有频道：' + shown + more + '。channel 是精确匹配的字符串：写什么就得按什么读（path: 频道与 claim 用同一套相对路径写法）。'
 }
 
 // 计算在当前时刻 blocking 的独占声明（供 wait）。

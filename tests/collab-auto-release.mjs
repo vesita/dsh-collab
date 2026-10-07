@@ -20,8 +20,8 @@
 //      （"你已不再持锁，重新 claim 再写"）；每一条来源都显式非 user；
 //   8) 审计留痕：状态文件里追加一条 channel=agent:<holderId> 的留言，`collab_board op=read` 读得到；
 //   9) 无声明 → 不留痕、不投递（"没有发生释放事件"与"通道坏了"可分辨）；
-//  10) W7 回归：`agent/disposed` **仍然不释放**未过期声明 —— 含真路径「先 idle 武装、再 dispose」，
-//      到点必须**不**释放（退场会话收不到告知，恢复后必然会以为自己还持锁）；
+//  10) 句柄结束 ⇒ 自动删除（0.13.0，推翻 0.9.6 起的 W7 取舍）：`agent/disposed` 立即释放未过期
+//      声明 + 留痕（"句柄已结束"）+ 通知读者；含真路径「先 idle 武装、再 dispose」不重复留痕；
 //  10b) 判据不可用（`agents.get` 抛错 / `agents` 服务缺失）⇒ **放弃本次释放**，不是当成"会话不存在"；
 //  11) 卸载后不再释放（effect disposer 关闸）；
 //  12) 装机时已经 idle 的会话补一次武装（插件热重载 / 晚装载不至于漏掉那一轮）；
@@ -246,7 +246,7 @@ console.log('# 核心路径：idle → 宽限 15s 到点 → 自动释放')
   const m = st.messages[0]
   ok(m && m.channel === 'agent:A', '留痕频道寻址到持有者本人（agent:<sessionId>，不重复拼前缀）', String(m && m.channel))
   ok(m && m.author === 'system:dsh-collab', '留痕作者是 system:dsh-collab（不是任何会话）', String(m && m.author))
-  ok(m && Array.isArray(m.mentions) && m.mentions[0] === 'agent:A', '留痕 mention 持有者', JSON.stringify(m && m.mentions))
+  ok(m && !('mentions' in m), '留痕不再带 mentions（0.13.0 移除：本板没有投递面）', JSON.stringify(m && m.mentions))
   ok(m && String(m.body).includes('自动释放') && String(m.body).includes('120 秒'), '留痕正文写明触发条件与宽限期', String(m && m.body))
 
   // 两个群体：读者 agent:B + 被释放的 agent:A。
@@ -383,59 +383,43 @@ console.log('# 无声明 / 只过期声明：不留痕、不投递')
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// 8. W7 回归：agent/disposed 不释放未过期声明（含"已武装后 dispose"这条真路径）
+// 8. 句柄结束 ⇒ 自动删除（0.13.0，用户决策；推翻 0.9.6 起的 W7 取舍）
 // ════════════════════════════════════════════════════════════════════════
-console.log('# W7 回归：agent/disposed 不释放未过期声明（含 idle 已武装后 dispose）')
+console.log('# 句柄结束 ⇒ 自动删除（agent/disposed 释放未过期声明 + 留痕 + 通知读者）')
 {
-  const hh = await makeHarness({ claims: [mkClaim({ claimId: 'c_1' })] })
+  const hh = await makeHarness({
+    claims: [mkClaim({ claimId: 'c_1', readers: ['agent:B'] }), mkClaim({ claimId: 'c_b', holderId: 'agent:B' })]
+  })
   hh.addAgent('A', 'idle')
+  hh.addAgent('B', 'running')
   hh.ctx.emit('agent/disposed', { agent: { id: 'A' } })
   await settle(); await settle()
-  ok(hh.readState().claims.length === 1, 'dispose 之后未过期声明仍然在（租约是唯一回收机制，没被本功能改掉）',
-    JSON.stringify(hh.readState().claims.map((c) => c.claimId)))
+  const st = hh.readState()
+  ok(!st.claims.some((c) => c.claimId === 'c_1'), 'dispose 后**未过期**声明被立即释放（句柄结束 = 自动删除）',
+    JSON.stringify(st.claims.map((c) => c.claimId)))
+  ok(st.claims.some((c) => c.claimId === 'c_b'), '别人的声明不受影响', JSON.stringify(st.claims.map((c) => c.claimId)))
+  const m = st.messages.find((x) => x.channel === 'agent:A')
+  ok(!!m && String(m.body).includes('句柄已结束') && String(m.body).includes('agent/disposed'),
+    '留痕说的是实话：句柄结束（不是"空闲超过 N 秒"）', String(m && m.body))
+  ok(hh.deliveries.some((d) => d.sessionId === 'B' && /已释放/.test(JSON.stringify(d.message))),
+    '读者（agent:B）收到"锁已释放"的通知', JSON.stringify(hh.deliveries.map((d) => d.sessionId)))
   await hh.fiber.dispose()
 
-  // 真路径：会话先翻到 idle（武装了宽限计时器），随后退场（agent/disposed）。
-  // 到点解析不到它 ⇒ **不许**释放：退场的会话常常恢复并继续干活，而它此刻收不到任何告知
-  // （agent.inject 对未加载的会话结构上不可达）。这条路径是 W7 的原话，自动释放不得穿透它。
+  // 已武装（先 idle）再退场：dispose 路径自己就放了，计时器到点无事可做（幂等，不重复留痕）。
   const armed = await makeHarness({ claims: [mkClaim({ claimId: 'c_1' })] })
   armed.addAgent('A', 'running')
   armed.emitStatus('A', 'idle')
   await settle()
   ok(armed.timers.length === 1, '前置：idle 已武装宽限计时器', String(armed.timers.length))
   armed.dispose('A')
-  await armed.flush()
-  ok(armed.readState().claims.length === 1, '已武装后 dispose：到点**不释放**（W7 不被计时器穿透）',
+  await settle(); await settle()
+  ok(armed.readState().claims.length === 0, '已武装后 dispose：声明也已被释放（两条路径都指向"句柄没了"）',
     JSON.stringify(armed.readState().claims.map((c) => c.claimId)))
-  ok(armed.readState().messages.length === 0 && armed.deliveries.length === 0,
-    '这条路径也不留痕、不投递（没有发生释放事件）',
-    JSON.stringify([armed.readState().messages.length, armed.deliveries.length]))
+  const before = armed.readState().messages.length
+  await armed.flush()
+  ok(armed.readState().messages.length === before, '计时器到点不再重复留痕（没有发生第二次释放事件）',
+    JSON.stringify([before, armed.readState().messages.length]))
   await armed.fiber.dispose()
-}
-
-// ════════════════════════════════════════════════════════════════════════
-// 8b. 判据不可用 ⇒ 一个也不放（agents.get 抛错 / agents 服务缺失）
-// ════════════════════════════════════════════════════════════════════════
-console.log('# 判据不可用（get 抛错 / 服务缺失）⇒ 放弃本次释放')
-{
-  const boom = await makeHarness({ claims: [mkClaim({ claimId: 'c_1' })], agentsGetThrows: true })
-  boom.addAgent('A', 'running')
-  boom.emitStatus('A', 'idle')
-  await boom.flush()
-  ok(boom.readState().claims.length === 1, 'agents.get 抛错时**不**放锁（判据坏了 ≠ 会话不存在）',
-    JSON.stringify(boom.readState().claims.map((c) => c.claimId)))
-  ok(boom.deliveries.length === 0, '判据坏掉时不投递任何通知', JSON.stringify(boom.deliveries.length))
-  await boom.fiber.dispose()
-
-  const noSvc = await makeHarness({ claims: [mkClaim({ claimId: 'c_1' })], withAgents: false })
-  noSvc.addAgent('A', 'running')
-  noSvc.emitStatus('A', 'idle')
-  await settle()
-  ok(noSvc.timers.length === 1, '前置：没有 agents 服务时仍然武装（服务可能晚到）', String(noSvc.timers.length))
-  await noSvc.flush()
-  ok(noSvc.readState().claims.length === 1, 'agents 服务缺失时**不**放锁（没有判据就没有释放）',
-    JSON.stringify(noSvc.readState().claims.map((c) => c.claimId)))
-  await noSvc.fiber.dispose()
 }
 
 // ════════════════════════════════════════════════════════════════════════

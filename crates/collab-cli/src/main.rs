@@ -55,7 +55,6 @@ pub struct Message {
     pub ts: i64,
     pub body: String,
     #[serde(default)]
-    pub mentions: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<String>,
 }
@@ -528,7 +527,6 @@ fn main() -> Result<()> {
                     author,
                     ts: now,
                     body,
-                    mentions: vec![],
                     reply_to: None,
                 };
                 state.messages.push(msg.clone());

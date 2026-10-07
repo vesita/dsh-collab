@@ -464,7 +464,9 @@ return {
     // （channel=agent:<holderId>，author=system:dsh-collab）。释放之后由谁告知读者与本人，
     // 见下面的 agent/status 接线注释 —— 本形态**不投递**任何通知。
     // 与包形态的一致性由 tests/collab-inline-parity.mjs 逐输出对拍本函数守护。
-    const releaseOnLoopEnd = (s, holderId, holderName, t, graceSec) => {
+    // cause：'loop-end'（循环停了、空闲超过宽限期）| 'disposed'（句柄结束，见下面的 agent/disposed）。
+    // 正文必须说实话，不能让"句柄结束"被写成"空闲超过 N 秒"。
+    const releaseOnLoopEnd = (s, holderId, holderName, t, graceSec, cause) => {
       const mine = s.claims.filter(c => c.holderId === holderId && c.expiresAt > t)
       if (!mine.length) return { ok: true, changed: false, data: { released: [] } }
       s.claims = s.claims.filter(c => !mine.includes(c))
@@ -479,9 +481,11 @@ return {
         channel: holderId,
         author: 'system:dsh-collab',
         ts: t,
-        body: '[自动释放] ' + who + ' 的会话循环已结束（空闲超过 ' + graceSec + ' 秒），其对 ' + shown +
-          ' 的声明已被自动释放。恢复工作前如需写入这些路径，请重新 collab_lock op=claim。',
-        mentions: [holderId]
+        body: cause === 'disposed'
+          ? '[自动释放] ' + who + ' 的会话句柄已结束（agent/disposed），其对 ' + shown +
+            ' 的声明已被自动释放。恢复工作前如需写入这些路径，请重新 collab_lock op=claim。'
+          : '[自动释放] ' + who + ' 的会话循环已结束（空闲超过 ' + graceSec + ' 秒），其对 ' + shown +
+            ' 的声明已被自动释放。恢复工作前如需写入这些路径，请重新 collab_lock op=claim。',
       }
       s.messages.push(m)
       return { ok: true, changed: true, state: s, data: { released: released, notice: m } }
@@ -494,13 +498,19 @@ return {
       return { ok: true, changed: true, state, data: { claimId: c.claimId, expiresAt: c.expiresAt, serverTime: now() } }
     }
     function post(state, h, name, a) {
+      // mentions 已移除（0.13.0）：@ 谁都不等于通知谁；挡回去而不是静默忽略（文案与 collab-core 同源）。
+      if (a && a.mentions !== undefined) {
+        return { ok: false, changed: false, data: { error: 'bad-request', message: 'mentions 已移除：本板没有任何投递面，@ 谁都不等于通知谁。要通知/唤醒某个会话，用它自己的消息工具（以你当时的工具目录为准）；本条消息**没有写入**，请去掉 mentions 重发。' } }
+      }
       const body = typeof a.body === 'string' ? a.body.trim() : ''
       if (!body) return { ok: false, changed: false, data: { error: 'bad-request', message: 'body required' } }
       holder(state, h, name)
-      const m = { msgId: 'm_' + (++state.seq), seq: state.seq, channel: (typeof a.channel === 'string' && a.channel.trim()) ? a.channel.trim() : 'general', author: h.holderId, ts: now(), body, mentions: Array.isArray(a.mentions) ? a.mentions.filter(x => typeof x === 'string').slice(0, 20) : [] }
+      const m = { msgId: 'm_' + (++state.seq), seq: state.seq, channel: (typeof a.channel === 'string' && a.channel.trim()) ? a.channel.trim() : 'general', author: h.holderId, ts: now(), body }
       if (typeof a.replyTo === 'string' && a.replyTo) m.replyTo = a.replyTo
       state.messages.push(m)
-      return { ok: true, changed: true, state, data: { msgId: m.msgId, seq: state.seq, ts: m.ts } }
+      // delivered/deliveryNote：与 collab-core 的 BOARD_NO_DELIVERY_HINT 同源，字面量漂移由
+      // tests/collab-inline-parity.mjs 的 post 语料逐输出抓到（宿主形态没有 import，只能内联）。
+      return { ok: true, changed: true, state, data: { msgId: m.msgId, seq: state.seq, ts: m.ts, channel: m.channel, delivered: false, deliveryNote: '留言板只写共享状态文件：不投递、不唤醒任何会话；对方只在它自己 collab_board op=read 时才会看到这条。要让某个已停下的会话动起来，用它自己的消息工具（以你当时的工具目录为准）。' } }
     }
     async function list(agentId) {
       const { state, target, stateDir, warn } = await load(agentId); const t = now()
@@ -566,14 +576,37 @@ return {
       const rel = state.claims.filter(c => paths.some(p => c.paths.some(cp => ov(p, cp))))
       return { ok: true, data: withWarn({ statePath: fs.processPath(target), stateDir: stateDir, paths, related: rel.map(pub), exclusive: rel.filter(c => c.mode === 'exclusive').map(pub), serverTime: t }, warn) }
     }
-    async function msgs(a, agentId) {
-      const { state } = await load(agentId)
+    // 留言读取的**纯函数**：与 collab-core.filterMessages 同名同形，逐输出对拍
+    // （tests/collab-inline-parity.mjs 的 EXPECTED_PARITY）。宿主以前把这段抄在 msgs 里，
+    // 对拍抓不到漂移 —— 0.12.2 及以前两边都取 matched 的末尾 limit 条，一起丢中段谁也没发现。
+    // 注意：本段在模板字符串里，注释里**不能出现反引号**（会截断 hostCode）。
+    function filterMessages(state, a) {
       const since = Number(a.since) || 0, limit = Math.max(1, Math.min(200, Number(a.limit) || 50))
-      let l = state.messages
-      if (typeof a.channel === 'string' && a.channel.trim()) l = l.filter(m => m.channel === a.channel.trim())
+      const ch = typeof a.channel === 'string' && a.channel.trim() ? a.channel.trim() : null
+      const l = ch ? state.messages.filter(m => m.channel === ch) : state.messages
       const matched = l.filter(m => m.seq > since)
-      const returned = matched.slice(-limit)
-      return { ok: true, data: { since, returned: returned.length, total: matched.length, latestSeq: state.messages.length ? state.messages[state.messages.length - 1].seq : 0, messages: returned } }
+      const mode = since > 0 ? 'forward' : 'tail'
+      const returned = mode === 'forward' ? matched.slice(0, limit) : matched.slice(-limit)
+      const hasMore = matched.length > returned.length
+      const nextSince = returned.length ? returned[returned.length - 1].seq : since
+      const earliestSeq = l.length ? l[0].seq : 0
+      const channelNote = ch && matched.length === 0 && state.messages.length ? channelRosterNote(state) : undefined
+      const out = { since, mode, returned: returned.length, total: matched.length, hasMore, nextSince, earliestSeq, latestSeq: state.messages.length ? state.messages[state.messages.length - 1].seq : 0, messages: returned }
+      if (channelNote) out.channelNote = channelNote
+      return out
+    }
+    // 给定频道没有命中时列出**现有频道**（与 collab-core.channelRosterNote 同名同形、逐输出对拍）。
+    function channelRosterNote(state) {
+      const count = new Map()
+      for (const m of state.messages) count.set(m.channel, (count.get(m.channel) || 0) + 1)
+      const top = [...count.entries()].sort((x, y) => (y[1] - x[1]) || String(x[0]).localeCompare(String(y[0])))
+      const shown = top.slice(0, 5).map(([c, n]) => c + '（' + n + ' 条）').join('、')
+      const more = top.length > 5 ? ' 等 ' + top.length + ' 个' : ''
+      return '该频道没有消息。现有频道：' + shown + more + '。channel 是精确匹配的字符串：写什么就得按什么读（path: 频道与 claim 用同一套相对路径写法）。'
+    }
+    async function msgs(a, agentId) {
+      const { state, warn } = await load(agentId)
+      return { ok: true, data: withWarn(filterMessages(state, a), warn) }
     }
     async function waitFor(a, h, agentId) {
       const timeoutMs = Math.max(0, Math.min(120000, Number(a.timeoutMs) || 30000))
@@ -662,18 +695,17 @@ return {
     })
     const boardTool = harness.defineTool({
       name: 'collab_board',
-      description: '多智能体协作留言板：向协作域发消息（频道 general / path:<路径> / agent:<holderId>）或增量读取消息，用于协商、交接、同步进展。',
+      description: '跨会话协作留言板：post 往共享状态文件留痕 / read 增量读取。用于同一仓库上互不相识的会话之间交接进度与协商。**不投递、不唤醒任何会话**（没有 mentions 参数）：对方只在它自己 read 时才看得到；要让某个已停下的会话动起来，用它自己的消息工具（以你当时的工具目录为准）。read 两种模式：不给 since（或 0）读**最新** limit 条（追平用）；给 since>0 从该游标**往后**读 limit 条（增量用，旧→新）——按返回的 nextSince 继续调、直到 hasMore=false 才算读完。',
       parameters: {
         type: 'object',
         additionalProperties: true,
         properties: {
           op: { type: 'string', enum: ['post', 'read'], description: 'post 发消息 / read 增量读取' },
-          channel: { type: 'string', description: '频道，默认 general' },
+          channel: { type: 'string', description: '频道，默认 general；**精确匹配**的自由字符串（写什么就得按什么读，path: 频道与 claim 用同一套相对路径写法），未命中时返回会列出既有频道' },
           body: { type: 'string', description: 'post 用，消息正文' },
-          mentions: { type: 'array', items: { type: 'string' }, description: '被 @ 的 holderId' },
           replyTo: { type: 'string', description: '回复的 msgId' },
-          since: { type: 'number', description: 'read 用，只返回 seq 大于此值的消息' },
-          limit: { type: 'number', description: 'read 用，最多条数，默认 50' }
+          since: { type: 'number', description: 'read 用：省略或 0 = 读最新 limit 条（tail）；>0 = 从该 seq 往后读 limit 条（forward，旧→新）。返回的 nextSince 是下一次的游标' },
+          limit: { type: 'number', description: 'read 用，最多条数，默认 50，上限 200' }
         },
         required: ['op']
       },
@@ -689,7 +721,7 @@ return {
     // text 必须同步返回字符串，所以读盘走后台缓存（TTL 15s），失败时沿用上一份缓存。
     const agents = ctx.get('agents')
     const systemPrompt = ctx.get('systemPrompt')
-    const OPEN_HINT = '多会话协作（dsh-collab）：同一项目可能有其他 DSH 会话并行工作。改动文件前用 collab_lock op=claim 声明占用（目录以 / 结尾，如 src/backend/），并先 op=overview 查看他人占用；只读调研用 mode=read；完成后 op=release，长任务 op=heartbeat 续租；协商与交接走 collab_board。'
+    const OPEN_HINT = '多会话协作（dsh-collab）：同一项目可能有其他 DSH 会话并行工作。改动文件前用 collab_lock op=claim 声明占用（目录以 / 结尾，如 src/backend/），并先 op=overview 查看他人占用；只读调研用 mode=read；完成后 op=release，长任务 op=heartbeat 续租；跨会话交接与协商走 collab_board（只留痕，不投递、不唤醒；要某个已停下的会话动起来用它自己的消息工具）。'
     const DIGEST_TTL_MS = 15000
     // 缓存的是**原始活跃 claim 列表**，不是"某个人视角渲染好的文本"（0.9.1 修，与包形态同语义）。
     // 原实现的"排除自己"做在刷新侧、缓存又只按 cwd 做键 ⇒ 同 cwd 的刷新互相覆盖：
@@ -893,9 +925,16 @@ return {
         const agent = payload && payload.agent
         if (!agent || !agent.id) return
         const h = 'agent:' + String(agent.id)
-        // 与 collab-core/包形态的 dropHolder 同形：只回收**已过期**的声明，并把这个已消失的
-        // holder 从所有剩余 claim 的 readers 摘掉。租约是唯一的回收机制 —— dispose 不缩短租约。
-        mutate(s => dropHolder(s, h, now()), String(agent.id), agent).catch(() => {})
+        // **句柄结束 ⇒ 自动删除**（0.13.0，与包形态 src/push.ts 同源）：释放它的全部未过期声明
+        // （带审计留痕），并照旧把它从所有 claim 的 readers 里摘掉。本形态不投递任何通知。
+        let name = h
+        try { name = hname({ holderId: h, sessionId: String(agent.id), agent: agent }) || h } catch (e) {}
+        mutate(s => {
+          const rel = releaseOnLoopEnd(s, h, name, now(), 120, 'disposed')
+          const dropped = dropHolder(s, h, now())
+          if (rel.changed !== true && dropped.changed !== true) return { ok: true, changed: false, data: {} }
+          return { ok: true, changed: true, state: s, data: {} }
+        }, String(agent.id), agent).catch(() => {})
       } catch (e) {}
     }, { global: true })
 
@@ -985,6 +1024,7 @@ return {
         for (const a of boot.list()) if (a && a.id && agentStatusOf(a) === 'idle') armIdleRelease(String(a.id))
       }
     } catch (e) {}
+
   }
 }
 `

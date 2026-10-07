@@ -48,7 +48,10 @@ const B = { id: '', session: { header: { cwd: PROJECT_CWD } } }
 
 const store = new Map()
 const promptContexts = new Map()
-let intervalFn = null
+// 0.13.0 起插件注册了**不止一个** interval（态势刷新 + 跨进程见证心跳），所以全部收下来，
+// 强制刷新时逐个调用 —— 只记最后一个会让这条对照断在"刷新根本没发生"上（不是产品缺陷）。
+const intervalFns = []
+const fireIntervals = () => { for (const fn of intervalFns) { try { fn() } catch (e) {} } }
 let current = B
 
 const ctx = new Context()
@@ -57,7 +60,7 @@ for (const n of ['tools', 'timer', 'fs', 'sessions', 'sessionTitle', 'agents', '
 ctx.set('tools', { register: () => () => {} })
 ctx.set('timer', {
   timeout: (ms) => new Promise((r) => setTimeout(r, ms)),
-  interval: (fn) => { intervalFn = fn; return () => {} } // 捕获回调：需要强制刷新时手动调用
+  interval: (fn) => { intervalFns.push(fn); return () => {} } // 捕获回调：需要强制刷新时手动调用
 })
 ctx.set('fs', {
   resolve: async (p) => ({ displayPath: p, path: p }),
@@ -111,8 +114,8 @@ console.log('# (c) claim removed + forced refresh -> both fall back to generic g
   const doc = JSON.parse(store.get(statePath))
   doc.claims = doc.claims.filter((c) => c.claimId !== 'c_mine')
   store.set(statePath, JSON.stringify(doc))
-  ok(typeof intervalFn === 'function', 'timer interval callback was captured (forced refresh available)')
-  if (typeof intervalFn === 'function') intervalFn()
+  ok(intervalFns.length >= 1, 'timer interval callbacks were captured (forced refresh available)', String(intervalFns.length))
+  fireIntervals()
   await new Promise((r) => setTimeout(r, 120))
   const textA2 = pc.text()
   current = B

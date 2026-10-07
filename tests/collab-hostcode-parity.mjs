@@ -579,8 +579,10 @@ console.log('# agent/disposed wiring: an unexpired claim survives dispose (W7)')
   }
   const claims = after.claims || []
   const own = claims.filter((c) => c.holderId === 'agent:agent-dead-host')
-  ok(own.length === 1, '未过期声明在 agent/disposed 之后仍然存在（dispose 不是释放信号）', JSON.stringify(claims.map((c) => c.claimId)))
-  ok(own.length === 1 && own[0].expiresAt > Date.now(), '保留下来的正是那条未到期声明（租约没有被缩短）', JSON.stringify(own.map((c) => c.expiresAt)))
+  // 0.13.0：句柄结束 = 自动删除 —— 未过期声明也一并释放（本形态只做状态变更 + 审计留痕，不投递）。
+  ok(own.length === 0, '未过期声明在 agent/disposed 之后被释放（句柄结束 = 自动删除）', JSON.stringify(claims.map((c) => c.claimId)))
+  ok((after.messages || []).some((m) => m.channel === 'agent:agent-dead-host' && String(m.body).includes('句柄已结束')),
+    '留痕说明是句柄结束（不是"空闲超过 N 秒"）', JSON.stringify((after.messages || []).map((m) => m.channel)))
   const other = claims.find((c) => c.claimId === 'c_other_readers')
   ok(!!other && !other.readers.includes('agent:agent-dead-host'), 'dispose 仍把这个 holder 从其他 claim 的 readers 摘掉', JSON.stringify(other && other.readers))
   ok(!!other && other.readers.includes('agent:keep'), '其他读者不受影响', JSON.stringify(other && other.readers))

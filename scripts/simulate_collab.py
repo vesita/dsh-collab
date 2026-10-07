@@ -140,7 +140,6 @@ class CollabSimulatorEngine:
                 "author": author,
                 "ts": self.now(),
                 "body": body,
-                "mentions": []
             })
             self.stats["posts"] += 1
             return msg_id

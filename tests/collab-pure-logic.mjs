@@ -92,6 +92,19 @@ console.log('# board: post / read')
   const f2 = filterMessages(st, { since: st.messages[0].seq })
   ok(f2.returned === 0, 'read since seq -> none')
   ok(post(st, { holderId: 'agent:a', name: 'A' }, { body: '  ' }, T).data.error === 'bad-request', 'post empty body -> bad-request')
+  // 0.13.0：投递诚实性 + mentions 已移除（@ 谁都不等于通知谁；显式挡回，不静默忽略）
+  const p2 = post(init(), { holderId: 'agent:a', name: 'A' }, { body: 'hi' }, T)
+  ok(p2.data.delivered === false, 'post 如实回 delivered:false（本板没有投递面）')
+  ok(typeof p2.data.deliveryNote === 'string' && p2.data.deliveryNote.includes('不投递') && p2.data.deliveryNote.includes('不唤醒'),
+    'post 回 deliveryNote 说明不投递/不唤醒', String(p2.data.deliveryNote))
+  const stM = init()
+  const p3 = post(stM, { holderId: 'agent:a', name: 'A' }, { body: 'hi', mentions: ['agent:b'] }, T)
+  ok(p3.ok === false && p3.data.error === 'bad-request' && String(p3.data.message).includes('mentions 已移除'),
+    'post 收到 mentions ⇒ bad-request（fail-loud，不静默忽略）', JSON.stringify(p3.data))
+  ok(stM.messages.length === 0, '被挡回时**不写入**消息（调用方去掉 mentions 重发即可）')
+  const stNo = init()
+  post(stNo, { holderId: 'agent:a', name: 'A' }, { body: 'hi' }, T)
+  ok(!('mentions' in stNo.messages[0]), '新消息不再带 mentions 字段（契约里已移除）')
 }
 
 // ===== 6. overview / related =====
@@ -138,11 +151,25 @@ console.log('# expire / sweep')
   ok(st.holders.some(h => h.holderId === 'agent:live'), 'sweep: keeps holder with a live claim')
 }
 {
-  // filterMessages 增加 total/latestSeq
+  // filterMessages 增加 total/latestSeq（0.13.0 再补 mode/hasMore/nextSince/earliestSeq）
   const st = init()
   for (let i = 0; i < 5; i++) post(st, { holderId: 'agent:a', name: 'A' }, { body: 'x' + i }, () => 1000)
   const f = filterMessages(st, { limit: 2 })
   ok(f.returned === 2 && f.total === 5 && f.latestSeq === 5, 'filterMessages: total/latestSeq reported')
+  ok(f.mode === 'tail' && f.messages.map(m => m.body).join(',') === 'x3,x4', 'filterMessages: 不给 since = tail（最新 limit 条，追平用）', JSON.stringify(f.messages.map(m => m.body)))
+  ok(f.hasMore === true && f.nextSince === 5 && f.earliestSeq === 1, 'filterMessages: tail 报 hasMore/nextSince/earliestSeq', JSON.stringify({ hasMore: f.hasMore, nextSince: f.nextSince, earliestSeq: f.earliestSeq }))
+  // forward：给了游标就从游标**往后**读，旧→新，不重不漏
+  const g1 = filterMessages(st, { since: 1, limit: 2 })
+  ok(g1.mode === 'forward' && g1.messages.map(m => m.body).join(',') === 'x1,x2', 'filterMessages: since>0 = forward（从游标往后，旧→新）', JSON.stringify(g1.messages.map(m => m.body)))
+  const g2 = filterMessages(st, { since: g1.nextSince, limit: 2 })
+  ok(g2.messages.map(m => m.body).join(',') === 'x3,x4' && g2.hasMore === false, 'filterMessages: 按 nextSince 翻页不重不漏（第二页即最后一页）')
+  const g3 = filterMessages(st, { since: 99 })
+  ok(g3.returned === 0 && g3.hasMore === false && g3.nextSince === 99, 'filterMessages: 游标越界 → 空集且 nextSince 原样回传（游标不跳段）')
+  // 旧语义（slice(-limit)）在 since>0 时会静默丢中段：这一条就是那个回归门禁
+  const big = init()
+  for (let i = 0; i < 10; i++) post(big, { holderId: 'agent:a', name: 'A' }, { body: 'y' + i }, () => 1000)
+  const p1 = filterMessages(big, { since: 1, limit: 3 })
+  ok(p1.messages.map(m => m.body).join(',') === 'y1,y2,y3', 'filterMessages: since>0 时取的是游标后最早 3 条（旧实现取最新 3 条 ⇒ 中间 4 条永久丢）', JSON.stringify(p1.messages.map(m => m.body)))
 }
 
 // ===== 8. blockers（wait 使用） =====
