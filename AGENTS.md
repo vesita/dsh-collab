@@ -117,18 +117,23 @@
 
 - **测试里"跳过"默认判失败**：只有显式 `COLLAB_ALLOW_SKIP=1` 才放行，且要打「未验证」横幅。
   见 `README.md`「运行测试」。
-- **两形态同源（0.14.0 起）—— 仅限纯逻辑**：纯逻辑的唯一事实源是 `src/collab-core.ts`。动态宿主形态的
-  `hostCode` 由 `scripts/build-host.mjs` 在构建时把 `lib/collab-core.js` **原样内联**进
-  `src/host-shell.js` 的外壳模板 —— 纯逻辑**不存在第二份手写副本**。守护：
-  `tests/collab-inline-parity.mjs` 断言生成物里的内联区与 `lib/collab-core.js` 去 `export` 后
-  **逐字节一致**（并断言外壳不复刻任何 core 名），`tests/collab-hostcode-parity.mjs` 把 hostCode
-  装进假 ctx 跑端到端行为。**改纯逻辑只改 `src/collab-core.ts`**。
-- **⚠ 状态层仍是两份，别被上一句误导**：`src/store.ts`（包形态）与 `src/host-shell.js` 的外壳里
-  各有一份 `load` / `mutate` / 损坏自愈 / 路径解析（外壳那份必须自己来：受限宿主里没有 `os`/`process`，
-  状态目录只能从 `settings.prepareDocument()` 反推）。**改存储层行为要两处都改**；已知尚未同步的两处：
-  「`changed:false` 时也把 sweep 清理落盘」与「损坏备份只保留最近 N 份」目前**只在包形态**有。
-  抽成第三份共享源是已记在案的待办（见 `docs/collab-ux-backlog.md`）。只有改"外壳接线"
-  （工具注册、事件接线）才碰 `src/host-shell.js`，改完必须重新 build。
+- **两形态同源（0.16.0 起）—— 纯逻辑与状态层都是**：
+  - **纯逻辑**的唯一事实源是 `src/collab-core.ts`；
+  - **状态层**（读改写 / 磁盘布局 / 损坏自愈 / 历史落点迁移 / 只读 op）的唯一事实源是
+    `src/state-core.ts`。
+  动态宿主形态的 `hostCode` 由 `scripts/build-host.mjs` 在构建时把 `lib/collab-core.js` 与
+  `lib/state-core.js` **原样内联**进 `src/host-shell.js` 的两个标记处 —— 两者都**不存在第二份
+  手写副本**。守护：`tests/collab-inline-parity.mjs` 断言两段内联区各自与去 `export` 后的构建产物
+  **逐字节一致**（并断言外壳不复刻任何 core 名、也不再自带状态层的任何一件），
+  `tests/collab-hostcode-parity.mjs` 把 hostCode 装进假 ctx 跑端到端行为，
+  `tests/collab-state-split.mjs` 用同一串操作断言两形态的**磁盘布局与逻辑状态逐个相同**。
+  **改纯逻辑只改 `src/collab-core.ts`；改状态层行为只改 `src/state-core.ts`。**
+- **两形态剩下的差异只有环境适配，各自只有一份**：`src/store.ts`（包形态）与 `src/host-shell.js`
+  里只留**环境面** —— 状态目录怎么找（包形态 `src/paths.ts` 的 `DSH_HOME`/`HOME` + `node:os`；
+  外壳从 `settings.prepareDocument()` 反推，受限宿主里没有 `os`/`process`）、cwd 与血缘怎么来、
+  会话显示名怎么取、进程身份与删除原语（外壳两者都给不出，按注入面缺失降级）。
+  这些差异经 `StateCorePorts` **注入** `src/state-core.ts`。只有改"外壳接线"（工具注册、事件接线、
+  环境面）才碰 `src/host-shell.js`，改完必须重新 build。
 - **契约只有一份**：`src/schema/collab.schema.json` 是 SSOT，TS / Python / Rust 三份派生物由
   `tests/collab-contract-derivation.mjs` 逐字段核对。
 - **不验证不许说"没问题"**：区分「没测出问题」与「没有问题」；用户可见文案改动要配负向对照。

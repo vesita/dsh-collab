@@ -1,19 +1,23 @@
 // tests/collab-inline-parity.mjs
 //
 // 守护什么
-//   dsh-collab 曾经两形态**各写一份**纯逻辑：
+//   dsh-collab 曾经两形态**各写一份**纯逻辑与状态层：
 //     · 包形态      src/collab-core.ts → lib/collab-core.js（可 import）
-//     · 动态宿主形态 src/collab-plugin.host.ts 里 hostCode 字符串内联的手写自包含副本
-//   0.14.0 起宿主形态的纯逻辑**不再手写**：scripts/build-host.mjs 把 lib/collab-core.js
-//   剥掉顶层 `export ` 后原样内联进 src/host-shell.js 的核心标记处，生成
-//   lib/collab-plugin.host.js。两形态的纯逻辑因此逐字节同源 —— 漂移这一整类问题从根上消失。
+//                   与 src/state-core.ts → lib/state-core.js（同一份状态机，store.ts 只做适配）
+//     · 动态宿主形态 hostCode 字符串里内联的手写自包含副本
+//   0.14.0 起宿主形态的纯逻辑**不再手写**、0.15.0 起状态层也不再手写：
+//   scripts/build-host.mjs 把 lib/collab-core.js 与 lib/state-core.js 剥掉顶层 export 前缀后
+//   原样内联进 src/host-shell.js 的两个标记处，生成 lib/collab-plugin.host.js。两形态因此
+//   逐字节同源 —— 漂移这一整类问题从根上消失。
 //
 //   本文件守这条链路的**同源事实**（旧版"31 个同名函数逐输出对拍"在内联之后是同一份代码，
 //   比对不可能失败，已删除）：
 //     1. hostCode 内联的核心与 lib/collab-core.js 去 export 后**逐字节一致**；
-//     2. 内联区自包含（无 import/export/require/process/os），能被 new Function 独立求值；
+//     1b. hostCode 内联的状态层与 lib/state-core.js 去 export 后**逐字节一致**；
+//     2. 两段内联区各自自包含（无 import/export/require/process/os），能被 new Function 独立求值；
 //     3. 外壳层没有把任何 collab-core 导出的名字再写一遍（不遮蔽、不复刻），
-//        每个核心导出在 hostCode 里恰好声明一次且都在内联区里；
+//        每个核心导出在 hostCode 里恰好声明一次且都在内联区里；外壳也不再自带状态层的
+//        任何一件（load / mutate / writeState / 只读 op / 磁盘布局 / 损坏自愈）；
 //     4. hostCode 仍能被 new Function 直接构造，宿主真实 I/O op（overview / status）
 //        与几条继承来的核心语义（sweep 消费 opts、filterMessages 的 tail/forward）仍然工作。
 //
@@ -34,6 +38,10 @@ const BEGIN = '/*__COLLAB_CORE_BEGIN__*/'
 const END = '/*__COLLAB_CORE_END__*/'
 // 外壳模板里的内联点（构建时被换成 BEGIN + 核心 + END）。生成物里不许再有它。
 const MARKER_LINE = '    /*__COLLAB_CORE__*/'
+// 状态层（第二个源码内联区）：唯一事实源 src/state-core.ts，包形态 src/store.ts 与之同源。
+const SBEGIN = '/*__COLLAB_STATE_CORE_BEGIN__*/'
+const SEND = '/*__COLLAB_STATE_CORE_END__*/'
+const SMARKER_LINE = '    /*__COLLAB_STATE_CORE__*/'
 
 const show = (v) => {
   let s
@@ -62,10 +70,12 @@ const shellDeclNames = (src) => {
 let hostCode = null
 let core = null
 let coreSrc = ''
+let stateCoreSrc = ''
 try {
   hostCode = (await import(new URL('../lib/collab-plugin.host.js', import.meta.url))).hostCode
   core = await import(new URL('../lib/collab-core.js', import.meta.url))
   coreSrc = readFileSync(new URL('../lib/collab-core.js', import.meta.url), 'utf8')
+  stateCoreSrc = readFileSync(new URL('../lib/state-core.js', import.meta.url), 'utf8')
 } catch (e) {
   console.log('FAIL cannot load built artifacts (run `npm run build`): ' + String((e && e.message) || e))
   console.log('\nFAILURES: 0 passed, 1 failed')
@@ -77,6 +87,8 @@ ok(typeof hostCode === 'string' && hostCode.length > 1000, 'lib/collab-plugin.ho
   'len=' + String(hostCode && hostCode.length))
 ok(typeof core === 'object' && core !== null, 'lib/collab-core.js 可 import')
 ok(Boolean(core && core.MODES && core.MODES.length === 3), 'lib/collab-core.js 是构建产物（MODES 就位）')
+ok(stateCoreSrc.startsWith('// src/state-core.ts'), 'lib/state-core.js 是构建产物（文件头注释就位）',
+  stateCoreSrc.slice(0, 40))
 if (typeof hostCode !== 'string') {
   console.log('\nFAILURES: ' + h.pass + ' passed, ' + h.fail + ' failed')
   process.exit(1)
@@ -85,10 +97,16 @@ if (typeof hostCode !== 'string') {
 // ---------------------------------------------------------------- 1. 内联区位置
 const bi = hostCode.indexOf(BEGIN)
 const ei = hostCode.indexOf(END)
+const sbi = hostCode.indexOf(SBEGIN)
+const sei = hostCode.indexOf(SEND)
 ok(bi >= 0, 'hostCode 含核心内联区起点标记 ' + BEGIN, 'i=' + bi)
 ok(ei > bi, 'hostCode 含核心内联区终点标记 ' + END, 'i=' + ei)
 const region = (bi >= 0 && ei > bi) ? hostCode.slice(bi + BEGIN.length + 1, ei) : ''
-const shellRegion = (bi >= 0 && ei > bi) ? hostCode.slice(0, bi) + hostCode.slice(ei + END.length) : ''
+// 外壳层 = 生成物**去掉两段源码内联区**之后剩下的那一层。两段内联区里的函数会被 tsc 重新
+// 缩进到 4 空格，所以不切掉的话它们会被当成"外壳自己的声明"（本文件下面就是按 4 空格缩进判的）。
+const shellRegion = (bi >= 0 && ei > bi && sbi > ei && sei > sbi)
+  ? hostCode.slice(0, bi) + hostCode.slice(ei + END.length, sbi) + hostCode.slice(sei + SEND.length)
+  : ''
 ok(hostCode.indexOf(MARKER_LINE) === -1, '外壳模板里的内联点标记已被替换（生成物里不残留）')
 ok(region.length > 1000 && region.indexOf(BEGIN) === -1 && region.indexOf(END) === -1,
   '内联区唯一且非空', 'len=' + region.length)
@@ -104,6 +122,35 @@ ok(region.length > 1000 && region.indexOf(BEGIN) === -1 && region.indexOf(END) =
   ok(!/\brequire\s*\(/.test(region), '内联核心不含 require（动态宿主里没有 require）')
   ok(!/\bprocess\b/.test(region), '内联核心不引用 process（受限动态宿主里 undefined）')
   ok(!/\bos\b/.test(region), '内联核心不引用 os（受限动态宿主里 undefined）')
+}
+
+// ---------------------------------------------------------------- 1b. 状态层内联区（第二个源码内联点）
+// 唯一事实源 src/state-core.ts：包形态 src/store.ts 与动态外壳共用它（外壳那份是构建期内联）。
+// 这一条就是"状态层不再有两份"的机器判据 —— 与核心那条同形：逐字节 + 自包含。
+console.log('# 状态层内联区（src/state-core.ts → lib/state-core.js）')
+{
+  ok(sbi > ei, '状态层内联区排在核心内联区之后（它引用的纯函数名来自核心那段）',
+    'coreEnd=' + ei + ' stateBegin=' + sbi)
+  ok(sbi >= 0, 'hostCode 含状态层内联区起点标记 ' + SBEGIN, 'i=' + sbi)
+  ok(sei > sbi, 'hostCode 含状态层内联区终点标记 ' + SEND, 'i=' + sei)
+  ok(hostCode.indexOf(SMARKER_LINE) === -1, '外壳模板里的状态层内联点标记已被替换（生成物里不残留）')
+  const sregion = (sbi >= 0 && sei > sbi) ? hostCode.slice(sbi + SBEGIN.length + 1, sei) : ''
+  const sStripped = stateCoreSrc.replace(/^export /gm, '')
+  ok(sregion.length > 5000, '状态层内联区非空', 'len=' + sregion.length)
+  ok(sregion === sStripped,
+    '内联状态层与 lib/state-core.js 去 export 后逐字节一致（两形态状态层同源的根）',
+    firstDiff(sregion, sStripped))
+  ok(!/^\s*(?:import|export)\b/m.test(sregion), '内联状态层不含顶层 import/export（自包含）')
+  ok(!/\brequire\s*\(/.test(sregion), '内联状态层不含 require（动态宿主里没有 require）')
+  ok(!/\bprocess\b/.test(sregion), '内联状态层不引用 process（受限动态宿主里 undefined）')
+  ok(!/\bos\b/.test(sregion), '内联状态层不引用 os（受限动态宿主里 undefined）')
+  // 状态机本体确实在区里（而不是一个空壳标记），且真的被外壳装配用上。
+  ok(/function createStateCore\s*\(/.test(sregion), '状态层内联区定义了 createStateCore')
+  const shellAfterState = hostCode.slice(sei + SEND.length)
+  ok(/createStateCore\(\{/.test(shellAfterState), '外壳用 createStateCore 装配状态层（注入环境面）')
+  for (const port of ['fs', 'core', 'now', 'targetFor', 'legacyTargets', 'liveProcsOf', 'selfProcToken', 'sleep', 'liveAgentHolderIds', 'teamTasks', 'log']) {
+    ok(new RegExp('\\b' + port + ':').test(shellAfterState), '外壳注入了环境面 ' + port)
+  }
 }
 
 // ---------------------------------------------------------------- 2b. 纪律文本内联区（第二处内联）
@@ -202,9 +249,22 @@ ok(inlined && typeof inlined.sweep === 'function' && typeof inlined.claim === 'f
   console.log('  外壳顶层声明(' + shellDecls.size + ')：' + show([...shellDecls].sort()))
   ok(shellDecls.size > 0, '外壳层有顶层声明（不是被掏空的外壳）', 'n=' + shellDecls.size)
   ok(shadow.length === 0, '外壳层不声明任何 collab-core 导出的名字（不遮蔽、不复刻）', show(shadow))
-  // 唯一被逼改名的接缝：核心有纯函数 overview(state)，外壳的 I/O op 因此改名 overviewOf。
-  ok(shellDecls.has('overviewOf') && !shellDecls.has('overview'),
-    'op=overview 的 I/O 层叫 overviewOf（避免与核心 overview 同名）', show([...shellDecls].filter((n) => n === 'overview' || n === 'overviewOf')))
+  // 唯一被逼改名的接缝：核心有纯函数 overview(state)，状态层的 I/O op 因此叫 overviewOp，
+  // 外壳只把 op=overview 转发过去 —— 它自己不再声明这一层的任何名字。
+  ok(!shellDecls.has('overview'),
+    '外壳层不声明 overview（核心纯函数名不被遮蔽）', show([...shellDecls].filter((n) => n === 'overview')))
+  ok(/store\.overviewOp\(/.test(shellRegion),
+    'op=overview 由状态层的 overviewOp 提供（外壳只转发，不再自己实现一份）')
+
+  // 状态层曾经在外壳里也有手写的一份（load / mutate / writeState / 只读 op / 磁盘布局 /
+  // 损坏自愈）。0.15.0 起这些名字不许再出现在外壳层 —— 出现了就是把副本写回来了。
+  const stateLayerNames = ['load', 'mutate', 'writeState', 'list', 'status', 'msgs', 'waitFor', 'overviewOf',
+    'overviewOp', 'otherProjects', 'pruneCorruptBackups', 'sidecarNameOf', 'mainDocOf', 'sideDocOf',
+    'msgFingerprint', 'sweepOpts', 'stale', 'withWarn', 'describeError', 'SIDECAR_EXT', 'createStateCore']
+  const revived = stateLayerNames.filter((n) => shellDecls.has(n)).sort()
+  ok(revived.length === 0, '外壳层不再自带状态层的任何一件（没有第二份 load/mutate/只读 op/磁盘布局）', show(revived))
+  ok(/^ {4}const store = createStateCore\(/m.test(shellRegion),
+    '外壳把状态层装配成一个 store（唯一入口）', show([...shellDecls].filter((n) => n === 'store')))
 
   const missing = [], dup = [], outside = []
   for (const n of coreNames) {

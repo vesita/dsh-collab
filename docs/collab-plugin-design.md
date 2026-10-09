@@ -452,15 +452,16 @@ Holder = {
 | 路径 | 职责 |
 | --- | --- |
 | `src/collab-core.ts` | **纯逻辑唯一事实源**。不碰 fs/ctx/sessions，只操作 state，时间可注入。可 import / 可测 / 供未来 CLI、Python、Rust 对照复用 |
-| `src/host-shell.js` + `scripts/build-host.mjs` | 动态宿主形态：外壳模板 + 构建期把 `lib/collab-core.js` 原样内联，生成 `lib/collab-plugin.host.js`（导出 `hostCode`，直接作为 cordis 的 `code.host`）。因 Cordis 动态插件**不接受 import/打包**，纯逻辑只能内联 |
+| `src/state-core.ts` | **状态机唯一事实源**（0.16.0）。读改写 / 磁盘布局（主文件 + 留言旁挂）/ 损坏自愈 / 历史落点迁移 / 只读 op；环境相关的一律经 `StateCorePorts` 注入。包形态 `src/store.ts` 与动态外壳都只是它的适配器，两形态因此共用同一份状态层 |
+| `src/host-shell.js` + `scripts/build-host.mjs` | 动态宿主形态：外壳模板（**只剩环境适配**）+ 构建期把 `lib/collab-core.js` 与 `lib/state-core.js` 原样内联，生成 `lib/collab-plugin.host.js`（导出 `hostCode`，直接作为 cordis 的 `code.host`）。因 Cordis 动态插件**不接受 import/打包**，两份自包含源码只能内联 |
 | `src/schema/collab.schema.json` | **JSON Schema v1（单一契约）**：`StateDocument`（注册表状态结构）+ `colabLockParams` / `colabBoardParams`（两工具参数）。§5.3 定义 TS/Python/Rust 类型均由此派生 |
 | `docs/collab-usage.md` | 面向任意会话的使用指南 |
 | `tests/collab-pure-logic.mjs` | 纯逻辑 + 宿主一致性的回归测试 |
 | `README.md` | 仓库说明与目录结构 |
 
-> 一致性保障（0.14.0 起）：内联不再手写 —— `tests/collab-inline-parity.mjs` 断言生成物里的内联区与 `lib/collab-core.js` 去 `export` 后**逐字节一致**，并断言外壳不复刻任何核心名。
+> 一致性保障（0.16.0 起）：内联的两段源码都不再手写 —— `tests/collab-inline-parity.mjs` 断言生成物里的**两段内联区**分别与 `lib/collab-core.js`、`lib/state-core.js` 去 `export` 后**逐字节一致**，并断言外壳不复刻任何核心名、也不再自带状态层的任何一件。
 >
-> **0.9.0 起**这条保障被强化成两层：`tests/collab-inline-parity.mjs` 用括号配对扫描从 `hostCode` 里抽出**全部 19 个两形态同名函数**逐输出对拍（原先只有 `clockUtc`/`renderDigest` 两个），并以「实测同名集合必须恰好等于期望集合」做回归守护——任何一侧新增同名函数却忘记接入对拍都会变红。
+> **历史纪要**：0.9.0 曾把这条保障做成"从 `hostCode` 里抽出 19 个两形态同名函数逐输出对拍"。0.14.0 起纯逻辑改为构建期内联，对拍两侧已是同一份代码、比对不可能失败，该机制随之删除。
 
 > **0.9.0 架构变更**：上表是 M3 当时（0.4 时代）的落库结构。0.9.0 把 1640 行的单体 `src/index.ts`
 > 拆成 **11 个模块**（`contract` / `spec` / `skill` / `store` / `access` / `gate` / `push` / `tools` /
@@ -530,7 +531,7 @@ Holder = {
 
 ### 18.6 测试资产
 
-- `tests/collab-pure-logic.mjs`：纯逻辑回归（`node tests/collab-pure-logic.mjs`；通过数以脚本自身输出为准，本文件不写死计数）。**import 自 `lib/collab-core.js`（由 `src/collab-core.ts` 构建）而非复制**，；两形态的同源由 `tests/collab-inline-parity.mjs`（内联区与 `lib/collab-core.js` 逐字节一致）与 `tests/collab-hostcode-parity.mjs`（把 hostCode 装进假 ctx 跑端到端）守护。
+- `tests/collab-pure-logic.mjs`：纯逻辑回归（`node tests/collab-pure-logic.mjs`；通过数以脚本自身输出为准，本文件不写死计数）。**import 自 `lib/collab-core.js`（由 `src/collab-core.ts` 构建）而非复制**；两形态的同源由 `tests/collab-inline-parity.mjs`（**两段**内联区分别与 `lib/collab-core.js`、`lib/state-core.js` 逐字节一致）与 `tests/collab-hostcode-parity.mjs`（把 hostCode 装进假 ctx 跑端到端）守护，状态层的磁盘布局与两形态等价另由 `tests/collab-state-split.mjs` 守护。
 
 ---
 

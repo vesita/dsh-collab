@@ -8,14 +8,18 @@
 //   1) 迁移：旧布局（主文件里带 messages）跑一次操作后 ⇒ 主文件没有 messages 键、
 //      旁挂存在且**一条不漏**、`op=read` 迁移前后返回一致；
 //   2) 写放大：锁操作只写主文件（KB 级），**不碰**旁挂 —— 并打印改前/改后的实测字节数；
-//   3) 字节预算：与条数上限取先到者、丢最旧、`swept.droppedMessages` 如实报数；
-//   4) 两形态同构 + `otherProjects` 不把旁挂文件当成一个项目。
+//   3) 字节预算：与条数上限取先到者、丢最旧、`swept.droppedMessages` 如实报数（两形态都报）；
+//   4) 两形态同构 + `otherProjects` 不把旁挂文件当成一个项目；
+//   5) 混合版本不丢留言：主文件与旁挂**都有** messages 时按 msgId 求并集（0.15.0 R2 残留修）；
+//   6) 损坏备份的保留份数对**旁挂**同样生效（主文件与旁挂各一份命名空间）；
+//   7) 两形态等价：同一串操作后磁盘布局与逻辑状态逐个相同（时间戳/进程章/显示名按环境面归一化）。
 //
 // 运行：node tests/collab-state-split.mjs
 
 import { createHarness, readStateMerged, sidecarPathOf } from './_harness.mjs'
 import path from 'node:path'
 import os from 'node:os'
+import { existsSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs'
 
 const cordis = await import('@deepseek-ai/cordis').catch(() => import('../node_modules/.pnpm/node_modules/@deepseek-ai/cordis/lib/index.js'))
 const { Context } = cordis
@@ -342,6 +346,200 @@ console.log('# 4b. otherProjects 不把 *.messages.json 当成一个项目')
   ok((ov2.data.otherProjects || []).length === 0,
     '旁挂文件里就算塞了活跃声明也不出现在 otherProjects（排除是文件名判据）',
     JSON.stringify((ov2.data.otherProjects || []).map((o) => o.file)))
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// 4c. 加载期留言**并集**（0.15.0 R2 残留修）：主文件与旁挂交替写也不丢
+//     旧行为"以主文件为准"会在下次写盘时把旁挂那份整批覆盖掉 —— 这一节的断言各自能独立失败。
+// ════════════════════════════════════════════════════════════════════════
+console.log('# 4c. 混合版本：主文件 [m1,m2] + 旁挂 [m2,m3] ⇒ 并集 [m1,m2,m3]')
+{
+  const m = (i, body) => ({ msgId: 'm_' + i, seq: i, channel: 'general', author: 'agent:x', ts: 1000 + i, body: body })
+  const mainDoc = { schemaVersion: 1, seq: 3, claims: [], holders: [], messages: [m(1, 'main-1'), m(2, 'main-2')] }
+  const sideDoc = { schemaVersion: 1, seq: 3, messages: [m(2, 'side-2'), m(3, 'side-3')] }
+  const env = makeFs([[STATE, JSON.stringify(mainDoc)], [SIDE, JSON.stringify(sideDoc)]])
+  const { lock, board } = await bootPackaged(env)
+
+  const before = await board.execute({ op: 'read', limit: 200 }, A)
+  const idsBefore = before.data.messages.map((x) => x.msgId)
+  ok(JSON.stringify(idsBefore) === JSON.stringify(['m_1', 'm_2', 'm_3']),
+    '两边的留言按 msgId 求并集、按 seq 升序（不是"主文件说了算"）', JSON.stringify(idsBefore))
+  const dup = before.data.messages.find((x) => x.msgId === 'm_2')
+  ok(dup && dup.body === 'main-2',
+    '同 msgId 以主文件那一份为准（内容应逐字节相同，这里只钉住确定的取值）',
+    JSON.stringify(before.data.messages.map((x) => x.body)))
+
+  const claim = await lock.execute({ op: 'claim', paths: ['src/union/'], ttlSec: 600 }, A)
+  ok(claim.ok === true, '混合布局上跑一次写操作成功（迁移就发生在这一次写盘）', JSON.stringify(claim))
+  const mainAfter = JSON.parse(env.store.get(STATE))
+  ok(!('messages' in mainAfter), '迁移后主文件里没有 messages 键', Object.keys(mainAfter).join(','))
+  const sideAfter = JSON.parse(env.store.get(SIDE) || '{}')
+  ok(JSON.stringify((sideAfter.messages || []).map((x) => x.msgId)) === JSON.stringify(['m_1', 'm_2', 'm_3']),
+    '迁移把**并集**完整搬进旁挂（旧行为会在这里丢掉旁挂那份 m_3）',
+    JSON.stringify((sideAfter.messages || []).map((x) => x.msgId)))
+  const after = await board.execute({ op: 'read', limit: 200 }, A)
+  ok(JSON.stringify(after.data.messages.map((x) => x.msgId)) === JSON.stringify(idsBefore),
+    '迁移后 op=read 与迁移前一致（一条都没丢）', JSON.stringify(after.data.messages.map((x) => x.msgId)))
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// 4d. 旁挂的损坏备份也纳入保留份数（主文件与旁挂各一份命名空间，同一规则）
+// ════════════════════════════════════════════════════════════════════════
+console.log('# 4d. 损坏备份保留最近 3 份（主文件 + 旁挂）')
+{
+  // 真的在状态目录里造文件：prune 的删除原语是 node:fs 的 rm，只认绝对路径。
+  const REAL_DIR = collabDir()
+  mkdirSync(REAL_DIR, { recursive: true })
+  const mainName = path.basename(STATE)
+  const sideName = path.basename(SIDE)
+  const stamps = [1000, 2000, 3000, 4000, 5000]
+  const realPath = (name, s) => path.join(REAL_DIR, name + '.corrupt-' + s)
+  for (const s of stamps) {
+    writeFileSync(realPath(mainName, s), 'x')
+    writeFileSync(realPath(sideName, s), 'x')
+  }
+  const foreign = path.join(REAL_DIR, 'someone-else.json.corrupt-9999')
+  writeFileSync(foreign, 'x')
+
+  const listDirReal = async () => readdirSync(REAL_DIR)
+    .map((n) => ({ name: n, type: 'file', target: { displayPath: path.join(REAL_DIR, n), path: path.join(REAL_DIR, n) } }))
+  const store = new Map([[STATE, 'not-json{{{'], [SIDE, 'not-json{{{']])
+  const versions = new Map()
+  let v = 0
+  const fsImpl = {
+    resolve: async (p) => ({ displayPath: p, path: p }),
+    stat: async (t) => (store.has(t.path) ? { version: versions.get(t.path) || 1 } : null),
+    readText: async (t) => store.get(t.path) || '',
+    writeText: async (t, c) => { store.set(t.path, c); versions.set(t.path, ++v); return { operation: 'create', version: v } },
+    processPath: (t) => t.path,
+    listDir: listDirReal
+  }
+  const { lock } = await bootPackaged({ fs: fsImpl })
+  const r = await lock.execute({ op: 'list' }, A)
+  ok(r.ok === true, '损坏主文件 + 损坏旁挂上跑一次 list 成功（自愈而非砖化）',
+    JSON.stringify(r.data && r.data.warning))
+  const kept = (name) => stamps.filter((s) => existsSync(realPath(name, s)))
+  ok(JSON.stringify(kept(mainName)) === JSON.stringify([3000, 4000, 5000]),
+    '主文件的 .corrupt-* 只保留最近 3 份', JSON.stringify(kept(mainName)))
+  ok(JSON.stringify(kept(sideName)) === JSON.stringify([3000, 4000, 5000]),
+    '旁挂的 .corrupt-* 也只保留最近 3 份（旧行为一份都不清）', JSON.stringify(kept(sideName)))
+  ok(existsSync(foreign), '不符合自己命名规则的备份一个都不动（someone-else.json.corrupt-9999）')
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// 4e. 外壳形态也报 swept（留言被字节预算截断时，"截断发生了"必须可见）
+// ════════════════════════════════════════════════════════════════════════
+console.log('# 4e. 外壳形态：截断在返回值里可见（swept）')
+{
+  const big = msgsOf(40, 'w'.repeat(8000))
+  const store = new Map([
+    [STATE, JSON.stringify({ schemaVersion: 1, seq: big.length, claims: [], holders: [] })],
+    [SIDE, JSON.stringify({ schemaVersion: 1, seq: big.length, messages: big })]
+  ])
+  const { tools, harness, ctx } = makeHostHarness(store)
+  await new Function('harness', 'ctx', HOST_CODE)(harness, ctx).apply(ctx)
+  const board = tools.find((t) => t.name === 'collab_board')
+  const post = await board.execute({ op: 'post', channel: 'general', body: '外壳最新一条' }, A)
+  ok(post.ok === true, '外壳形态 post 成功', JSON.stringify(post).slice(0, 120))
+  ok(post.data && post.data.swept && post.data.swept.droppedMessages > 0,
+    '外壳形态的返回值如实带上 swept.droppedMessages（旧行为一个字都不报）',
+    JSON.stringify(post.data && post.data.swept))
+  const merged = readStateMerged((p) => store.get(p), STATE)
+  ok(merged.messages.length < big.length, '最旧的那批确实被丢掉（' + big.length + ' → ' + merged.messages.length + '）')
+  ok(merged.messages[merged.messages.length - 1].body === '外壳最新一条', '最新那条（本次 post）在')
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// 4f. 两形态等价：同一串操作（claim → post → release → list）后，磁盘布局与逻辑状态一致
+// ════════════════════════════════════════════════════════════════════════
+console.log('# 4f. 两形态等价（claim → post → release → list）')
+{
+  const readMergedOf = (map) => () => readStateMerged((p) => map.get(p), STATE)
+  const seqOps = async (lock, board, readState) => {
+    const claim = await lock.execute({ op: 'claim', paths: ['src/eq/'], mode: 'exclusive', ttlSec: 600, note: 'eq' }, A)
+    const claimId = claim.data && claim.data.claim && claim.data.claim.claimId
+    const afterClaim = readState()
+    const post = await board.execute({ op: 'post', channel: 'general', body: '等价性检查' }, A)
+    const afterPost = readState()
+    const rel = await lock.execute({ op: 'release', claimId: claimId }, A)
+    const list = await lock.execute({ op: 'list' }, A)
+    return { claim, claimId, post, rel, list, afterClaim, afterPost }
+  }
+
+  const pEnv = makeFs([])
+  const { lock: pLock, board: pBoard } = await bootPackaged(pEnv)
+  const pRun = await seqOps(pLock, pBoard, readMergedOf(pEnv.store))
+  ok(pRun.claim.ok === true && pRun.post.ok === true && pRun.rel.ok === true && pRun.list.ok === true,
+    '包形态：claim → post → release → list 全部成功',
+    JSON.stringify([pRun.claim.ok, pRun.post.ok, pRun.rel.ok, pRun.list.ok]))
+
+  const hStore = new Map()
+  const hHarnessPack = makeHostHarness(hStore)
+  await new Function('harness', 'ctx', HOST_CODE)(hHarnessPack.harness, hHarnessPack.ctx).apply(hHarnessPack.ctx)
+  const hLock = hHarnessPack.tools.find((t) => t.name === 'collab_lock')
+  const hBoard = hHarnessPack.tools.find((t) => t.name === 'collab_board')
+  const hRun = await seqOps(hLock, hBoard, readMergedOf(hStore))
+  ok(hRun.claim.ok === true && hRun.post.ok === true && hRun.rel.ok === true && hRun.list.ok === true,
+    '外壳形态：claim → post → release → list 全部成功',
+    JSON.stringify([hRun.claim.ok, hRun.post.ok, hRun.rel.ok, hRun.list.ok]))
+
+  // ---- 磁盘布局一致 ----
+  const pKeys = Object.keys(JSON.parse(pEnv.store.get(STATE)))
+  const hKeys = Object.keys(JSON.parse(hStore.get(STATE)))
+  ok(JSON.stringify(pKeys) === JSON.stringify(['schemaVersion', 'seq', 'claims', 'holders']),
+    '包形态主文件键集合恰是 {schemaVersion, seq, claims, holders}', JSON.stringify(pKeys))
+  ok(JSON.stringify(hKeys) === JSON.stringify(pKeys),
+    '外壳形态主文件键集合与包形态逐个相同', JSON.stringify({ pkg: pKeys, host: hKeys }))
+  ok(!pKeys.includes('messages') && !hKeys.includes('messages'), '两形态的主文件都不含 messages')
+  const pSide = JSON.parse(pEnv.store.get(SIDE) || '{}')
+  const hSide = JSON.parse(hStore.get(SIDE) || '{}')
+  ok(pEnv.store.has(SIDE) && hStore.has(SIDE), '两形态都生成了留言旁挂文件')
+  ok((pSide.messages || []).length === (hSide.messages || []).length,
+    '两形态旁挂的留言条数相同', JSON.stringify({ pkg: (pSide.messages || []).length, host: (hSide.messages || []).length }))
+  ok((pSide.messages || []).length === 1, '旁挂里就是本次 post 的那一条', String((pSide.messages || []).length))
+
+  // ---- 逻辑状态一致（时间戳、进程章与显示名按环境面归一化：它们本来就是注入的差异） ----
+  const norm = (doc) => ({
+    schemaVersion: doc.schemaVersion,
+    seq: doc.seq,
+    claims: (doc.claims || []).map((c) => ({
+      claimId: c.claimId, holderId: c.holderId, paths: c.paths, mode: c.mode, ttlSec: c.ttlSec,
+      readable: c.readable, createdAtType: typeof c.createdAt, expiresAtType: typeof c.expiresAt
+    })),
+    messages: (doc.messages || []).map((x) => ({ msgId: x.msgId, seq: x.seq, channel: x.channel, author: x.author, body: x.body, replyTo: x.replyTo || null })),
+    holders: (doc.holders || []).map((x) => x.holderId).sort()
+  })
+  const pMid = norm(pRun.afterPost)
+  const hMid = norm(hRun.afterPost)
+  ok(pMid.claims.length === 1 && hMid.claims.length === 1,
+    'post 之后两形态都持有同一条声明（比较的是非空状态，不是空集合的假相等）',
+    JSON.stringify({ pkg: pMid.claims.length, host: hMid.claims.length }))
+  ok(JSON.stringify(pMid) === JSON.stringify(hMid),
+    '两形态的逻辑状态一致（claim+post 后的声明/留言/名册）',
+    'pkg=' + JSON.stringify(pMid) + ' host=' + JSON.stringify(hMid))
+  const pEnd = norm(readMergedOf(pEnv.store)())
+  const hEnd = norm(readMergedOf(hStore)())
+  ok(JSON.stringify(pEnd) === JSON.stringify(hEnd),
+    'release + list 之后两形态的逻辑状态仍一致', 'pkg=' + JSON.stringify(pEnd) + ' host=' + JSON.stringify(hEnd))
+
+  // 名册行的**唯一**环境差异：包形态盖进程章（proc），外壳形态给不出（受限宿主无进程身份）。
+  const pHolder = readMergedOf(pEnv.store)().holders[0]
+  const hHolder = readMergedOf(hStore)().holders[0]
+  const stripEnv = (row) => { const o = {}; for (const k of Object.keys(row)) if (k !== 'proc' && k !== 'lastSeenAt' && k !== 'name') o[k] = row[k]; return o }
+  ok(JSON.stringify(stripEnv(pHolder)) === JSON.stringify(stripEnv(hHolder)),
+    '名册行除 proc / lastSeenAt / name 外逐字段相同',
+    JSON.stringify({ pkg: stripEnv(pHolder), host: stripEnv(hHolder) }))
+  ok(pRun.claim.data.claim.holderName === 'Split Worker' && hRun.claim.data.claim.holderName === 'Host Worker',
+    '两形态的 holderName 各来自自己的 sessionTitle 服务（环境面，不参与上面的等价断言）',
+    JSON.stringify([pRun.claim.data.claim.holderName, hRun.claim.data.claim.holderName]))
+  ok(pRun.list.data.claims.length === hRun.list.data.claims.length &&
+    pRun.list.data.holdersTotal === hRun.list.data.holdersTotal &&
+    pRun.list.data.seq === hRun.list.data.seq,
+    'list 视图的 claims 条数 / holdersTotal / seq 一致',
+    JSON.stringify({
+      pkg: [pRun.list.data.claims.length, pRun.list.data.holdersTotal, pRun.list.data.seq],
+      host: [hRun.list.data.claims.length, hRun.list.data.holdersTotal, hRun.list.data.seq]
+    }))
 }
 
 // 5. 默认常量与文档口径一致（防空口说白话）

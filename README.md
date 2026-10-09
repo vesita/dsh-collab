@@ -102,8 +102,9 @@ DSH 自带一套实验性的 `Agent Teams`（`dsh-experimental-agent-team*`）�
 │   ├── contract.ts               # 对外契约类型（工具/服务/返回结构的类型面）
 │   ├── spec.ts                   # 纯常量与纯函数（工具路径规格、状态目录文案、sessionIdOf…）
 │   ├── collab-core.ts            # 纯逻辑唯一事实源（可 import / 可测 / 供多语言对照）
+│   ├── state-core.ts             # 状态机唯一事实源（读改写 / 磁盘布局 / 损坏自愈 / 只读 op）；构建期原样内联进动态外壳
 │   ├── paths.ts                  # 状态目录的唯一路径事实源（绝对路径推导 + 历史落点）
-│   ├── store.ts                  # 状态文件存取 + 只读 op（list/overview/status/msgs/wait）
+│   ├── store.ts                  # 包形态的**状态存取适配器**：环境面（targetFor / 血缘 / 显示名 / 存活判据）注入 state-core
 │   ├── tools.ts                  # collab_lock / collab_board 注册（消费 store + push）
 │   ├── access.ts                 # 功能 A：访问通知（逐事件经 agent.inject 投递 form:'notice' 的显式来源消息）+ 读者反向注册（tools/post-execute）
 │   ├── gate.ts                   # 功能 C：写/读的原生审批门控（tools/pre-execute）
@@ -114,7 +115,7 @@ DSH 自带一套实验性的 `Agent Teams`（`dsh-experimental-agent-team*`）�
 │   ├── skill.ts                  # 随包 skill 读盘与 buildSkillIndex（delegation 与路由共用）
 │   ├── client-route.ts           # 浏览器半边只读 loopback 路由（技能索引）
 │   ├── client.ts                 # 浏览器半边：侧边栏 Plugins 页里 dsh-collab 卡上的配置区
-│   ├── host-shell.js             # 动态宿主形态的外壳模板；hostCode 由 scripts/build-host.mjs 构建期内联核心生成
+│   ├── host-shell.js             # 动态宿主形态的外壳模板（只留环境适配）；hostCode 由 scripts/build-host.mjs 构建期内联核心与状态层生成
 │   ├── schema/
 │   │   └── collab.schema.json    # JSON Schema v1：状态文档 + 工具参数（单一契约）
 │   └── types/
@@ -128,7 +129,8 @@ DSH 自带一套实验性的 `Agent Teams`（`dsh-experimental-agent-team*`）�
     ├── collab-pure-logic.mjs        # 纯逻辑回归 + hostCode 内联副本漂移守护
     ├── collab-integration.mjs       # Cordis 插件端到端（fake ctx）
     ├── collab-hostcode-parity.mjs   # 动态宿主形态**行为**对拍（路径 + 三态语义 + holder 回收）
-    ├── collab-inline-parity.mjs     # 两形态**同名函数**逐输出对拍（30 个，含集合回归守护）
+    ├── collab-inline-parity.mjs     # 两形态**源码同源**守护（核心 + 状态层两段内联区逐字节一致，外壳不复刻）
+    ├── collab-state-split.mjs       # 磁盘布局（主文件 + 留言旁挂）/ 并集合并 / 备份保留 / 两形态等价
     ├── collab-contract-derivation.mjs # 契约派生守卫（schema ⇄ d.ts ⇄ Python ⇄ Rust ⇄ 真实工具 schema）
     ├── collab-message-provenance.mjs # 规范守卫：严禁冒充用户（AGENTS.md §1）
     ├── collab-digest-stability.mjs  # 态势摘要文本时间稳定性回归（运行时快照去重）
@@ -291,7 +293,7 @@ agents.currentInitiator()            → 正在装配的那个会话
 | `gate.ts` | 原生写门控（子代理写父占的路径） |
 | `awareness.ts` | 常驻态势摘要（不把自家子代理报成"其他会话占用"，backlog §2.2） |
 | `access.ts` | 访问通知（不为自家人发通知） |
-| `src/host-shell.js` + `scripts/build-host.mjs` | 动态形态：外壳模板 + 构建期把 `lib/collab-core.js` 原样内联 ⇒ 两形态纯逻辑**逐字节同源**（由 parity 测试断言） |
+| `src/host-shell.js` + `scripts/build-host.mjs` | 动态形态：外壳模板 + 构建期把 `lib/collab-core.js` 与 `lib/state-core.js` 原样内联 ⇒ 两形态的纯逻辑与状态层**逐字节同源**（由 parity 测试断言） |
 
 **边界**：这条豁免的前提是"同一棵树里的子代理与我共享同一写域"。当树里跑的是官方 `Agent Teams`
 的 teammate（长期并行、各有独立任务）时，树内占用归团队任务 DAG 的 `write_scopes` —— 见
@@ -782,6 +784,9 @@ cargo test --manifest-path crates/collab-cli/Cargo.toml
 | 陈旧 holder 回收 | 无活跃声明且 `HOLDER_TTL_MS = 24h` 未出现 | 回收由 `sweep()` 执行；`list` 另用 `holderView()` 给出 `ageSec` / `active` / `stale` 与 `staleHolders`，并在有 stale 条目时附 `holdersNote` 说明「`holders` 是名册不是锁」 |
 | holder 废弃预警 | 无活跃声明且静默 `HOLDER_STALE_WARN_MS = 1h` | `stale` 走这条更短的阈值，因此它是"看起来已废弃"的先行信号，在 `list` 上始终可达 |
 | 损坏状态自愈 | JSON 解析失败 | 备份为 `<state>.corrupt-<ts>` 后重置为空状态，并以 `warning` 上报；旧备份只保留最近 3 份（`fs.listDir` 拿不到时静默跳过清理，绝不让自愈失败） |
+| 旁挂损坏自愈 | 留言旁挂 JSON 解析失败 | 同样先备份为 `<name>.messages.json.corrupt-<ts>` 再按无留言继续（**不删不覆盖**），旧备份与主文件**共用同一份保留份数**（最近 3 份） |
+
+> 「旧备份只保留最近 3 份」需要一个**删除原语**：包形态用 `node:fs` 的 rm；受限动态宿主没有删除能力，因此那一形态不清理备份（备份只增不减）—— 这是宿主能力限制，不是漏做。`state-core` 的注入面里 `removeFile` 缺失即整段跳过。
 
 工具返回统一信封：失败时 `error` / `message` 在顶层（`bad-request`、`not-found`、`conflict`、`forbidden`、`timeout`、`concurrent-modification`、`internal`）。
 
@@ -796,7 +801,7 @@ cargo test --manifest-path crates/collab-cli/Cargo.toml
 
 - **加载期合并**：主文件 + 旁挂合并成一个逻辑文档；`seq` 取两边的较大值（它是 `claimId` 与 `msgId` 共用的计数器）。
 - **写盘**：`claim` / `release` / `heartbeat` 只写主文件；旁挂**只在留言真的变了**时才写（判据是"条数 + 首条 msgId + 末条 msgId"指纹，留言只有尾部追加与头部截断两种变化）。迁移那一次**先写旁挂再写主文件**，保证任何一步失败时留言都还在磁盘上。
-- **迁移**：主文件里仍有 `messages`（旧布局）时以它为准，**首次写盘**搬进旁挂并从主文件里去掉这个键；**只搬不删**，`collab_board op=read` 迁移前后返回一致。
+- **迁移**：主文件里仍有 `messages`（旧布局）时与旁挂按 `msgId` 求**并集**（同 `msgId` 以主文件那份为准、按 `seq` 升序），**首次写盘**把并集搬进旁挂并从主文件里去掉这个键；**只搬不删**，`collab_board op=read` 迁移前后返回一致。求并集而不是"以主文件为准"的理由：滚动升级期间同一份状态会被新旧两个版本交替写（旧版写主文件、新版写旁挂），任何"以某一边为准"都会在下次写盘时把另一边整批覆盖掉。
 - `overview` 的 `otherProjects` 扫状态目录时排除 `*.messages.json`，不会把旁挂当成一个项目。
 
 ---

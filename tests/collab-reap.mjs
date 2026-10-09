@@ -325,20 +325,25 @@ console.log('\n# 9. 静态：reap 只由工具 handler 调用（无自动触发�
 {
   const rel = (p) => readFileSync(join(ROOT, p), 'utf8')
   // 9.1 真正"碰到 reap"（调用或定义，带括号）的文件必须是有限的几个：
-  //     核心定义 + 状态接线 + 工具 handler + 宿主外壳（接线层；纯逻辑已由 collab-core 内联）。
+  //     核心定义 + 状态层接线 + 包形态适配 + 工具 handler + 宿主外壳（接线层）。
   //     注释里提到 reap 的（contract/push）不算。
-  const srcFiles = ['collab-core.ts', 'store.ts', 'tools.ts', 'host-shell.js', 'contract.ts', 'index.ts', 'push.ts', 'gate.ts', 'access.ts', 'awareness.ts', 'spec.ts', 'paths.ts', 'delegation.ts', 'client.ts']
+  const srcFiles = ['collab-core.ts', 'state-core.ts', 'store.ts', 'tools.ts', 'host-shell.js', 'contract.ts', 'index.ts', 'push.ts', 'gate.ts', 'access.ts', 'awareness.ts', 'spec.ts', 'paths.ts', 'delegation.ts', 'client.ts']
   const withReap = srcFiles.filter((f) => /\breap[a-zA-Z]*\s*\(/.test(rel('src/' + f)))
-  ok(JSON.stringify(withReap) === JSON.stringify(['collab-core.ts', 'store.ts', 'tools.ts', 'host-shell.js']),
-    '9.1 调用/定义 reap 的 src 文件恰好是核心/状态/工具/宿主外壳四份', JSON.stringify(withReap))
+  ok(JSON.stringify(withReap) === JSON.stringify(['collab-core.ts', 'state-core.ts', 'store.ts', 'tools.ts', 'host-shell.js']),
+    '9.1 调用/定义 reap 的 src 文件恰好是核心/状态层/包适配/工具/宿主外壳五份', JSON.stringify(withReap))
   // 9.2 sweep() 的函数体里没有 reap（它只能回收过期声明，不得碰未过期的僵尸判定）。
   const coreSrc = rel('src/collab-core.ts')
   const sweepBody = coreSrc.slice(coreSrc.indexOf('export function sweep('), coreSrc.indexOf('// 惰性清理过期声明'))
   ok(sweepBody.length > 0 && !/reap/i.test(sweepBody), '9.2 sweep() 函数体里不含 reap（读/写前的惰性清理不碰僵尸判定）')
-  // 9.3 宿主形态同理：只有 handler 里那一处调用，没有定时器/读路径调用。
+  // 9.3 宿主形态同理：只有 handler 里那一处**转发**（store.reapOp），没有定时器/读路径调用。
+  //     核心 reap 本身现在只在状态层里接上一次 —— 外壳连直接调它的机会都没有。
   const hostSrc = rel('src/host-shell.js')
-  const reapCalls = [...hostSrc.matchAll(/reap\(s, h, a, liveAgentHolderIds\(\), now\(\)\)/g)].length
-  ok(reapCalls === 1, '9.3 宿主里 reap 的调用点恰好 1 处（工具 handler 内联的那一句）', String(reapCalls))
+  const reapCalls = [...hostSrc.matchAll(/store\.reapOp\(a, h, aId, agent\)/g)].length
+  ok(reapCalls === 1, '9.3 宿主里 op=reap 的转发点恰好 1 处（工具 handler 那一句）', String(reapCalls))
+  ok(!/\breap\s*\(/.test(hostSrc), '9.3b 宿主不直接调核心 reap（接线只在状态层里发生一次）')
+  const stateCoreSrc = rel('src/state-core.ts')
+  const stateReapCalls = [...stateCoreSrc.matchAll(/core\.reap\(/g)].length
+  ok(stateReapCalls === 1, '9.3c 状态层里 reap 的接线点恰好 1 处（op=reap 专用）', String(stateReapCalls))
   const timerBody = hostSrc.slice(hostSrc.indexOf('ctx.timer.interval'), hostSrc.indexOf('ctx.on(\'agent/disposed\''))
   ok(timerBody.length > 0 && !/reap/i.test(timerBody), '9.4 宿主的定时器（态势刷新）不含 reap')
 }

@@ -1,19 +1,22 @@
 #!/usr/bin/env node
 // scripts/build-host.mjs
 //
-// 生成动态宿主形态的 hostCode（唯一事实源是两半：外壳 + 核心）。
+// 生成动态宿主形态的 hostCode（唯一事实源是三半：外壳 + 核心 + 状态层）。
 //
-//   src/host-shell.js        外壳模板（inject/apply 接线、状态文件读写、工具注册、事件接线）
+//   src/host-shell.js        外壳模板（inject/apply 接线、状态目录定位、工具注册、事件接线）
 //   lib/collab-core.js       ← src/collab-core.ts（构建产物，可 import 的纯逻辑唯一事实源）
+//   lib/state-core.js        ← src/state-core.ts（构建产物，可 import 的**状态机**唯一事实源；
+//                              包形态 src/store.ts 与动态外壳共用它，两处都只留环境适配）
 //   lib/spec.js              ← src/spec.ts（构建产物；取 DELEGATION_DISCIPLINE_TEXT 的**值**，
 //                              以及功能 C 的路径规格 TOOL_PATH_SPECS / COMMAND_AWARE_TOOL 的值
 //                              与 pathArgsFor 的源码）
 //   ────────────────────────
 //   lib/collab-plugin.host.js  生成物：export const hostCode = <整段 JS 源码字符串>
 //
-// Cordis 动态插件的 code.host 是**纯文本**，不接受 import/打包。所以核心源码在这里被
-// 原样内联进外壳的 /*__COLLAB_CORE__*/ 标记处 —— 只剥掉顶层 `export ` 前缀；由于
-// lib/collab-core.js 完全自包含（0 个 import/require），剥完就是一段可直接求值的 JS。
+// Cordis 动态插件的 code.host 是**纯文本**，不接受 import/打包。所以核心与状态层在这里被
+// 原样内联进外壳的 /*__COLLAB_CORE__*/ 与 /*__COLLAB_STATE_CORE__*/ 标记处 —— 只剥掉顶层
+// export 前缀；由于两者都完全自包含（0 个 import/require），剥完就是可直接求值的 JS。
+// 状态层内联点必须排在核心之后：它引用的纯函数名字来自核心那一段（同一个作用域）。
 //
 // 委托纪律文本（order 131）走**另一条路**：lib/spec.js **不自包含**（顶层 import
 // schemastery 与 collab-core），整份内联进不去动态宿主。所以这里不内联其源码，而是
@@ -25,8 +28,8 @@
 // 反斜杠层级；JSON 字符串字面量（双引号）对这些全部免转义，只有 JSON 自己处理的那几个
 // 字符会被正确转义。手写模板字符串的转义层级是这条链路上最容易腐烂的地方。
 //
-// 确定性：不写时间戳、不依赖环境。同一个 lib/collab-core.js + src/host-shell.js
-// 连续跑两次，字节完全相同（tests/collab-inline-parity.mjs 亦断言两半同源）。
+// 确定性：不写时间戳、不依赖环境。同一个 lib/collab-core.js + lib/state-core.js +
+// src/host-shell.js 连续跑两次，字节完全相同（tests/collab-inline-parity.mjs 亦断言各半同源）。
 
 import { readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
@@ -36,15 +39,19 @@ import { hostShell } from '../src/host-shell.js'
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
 const CORE_JS = join(ROOT, 'lib', 'collab-core.js')
+const STATE_CORE_JS = join(ROOT, 'lib', 'state-core.js')
 const SPEC_JS = join(ROOT, 'lib', 'spec.js')
 const OUT_JS = join(ROOT, 'lib', 'collab-plugin.host.js')
 
 // 标记：外壳模板里独占一行（4 空格缩进）；生成时整行换成"BEGIN\n内联内容\nEND"。
 const MARKER_LINE = '    /*__COLLAB_CORE__*/'
+const STATE_CORE_MARKER_LINE = '    /*__COLLAB_STATE_CORE__*/'
 const DISCIPLINE_MARKER_LINE = '    /*__COLLAB_DISCIPLINE_TEXT__*/'
 const PATH_SPECS_MARKER_LINE = '    /*__COLLAB_PATH_SPECS__*/'
 export const CORE_BEGIN = '/*__COLLAB_CORE_BEGIN__*/'
 export const CORE_END = '/*__COLLAB_CORE_END__*/'
+export const STATE_CORE_BEGIN = '/*__COLLAB_STATE_CORE_BEGIN__*/'
+export const STATE_CORE_END = '/*__COLLAB_STATE_CORE_END__*/'
 export const DISCIPLINE_BEGIN = '/*__COLLAB_DISCIPLINE_BEGIN__*/'
 export const DISCIPLINE_END = '/*__COLLAB_DISCIPLINE_END__*/'
 export const PATH_SPECS_BEGIN = '/*__COLLAB_PATH_SPECS_BEGIN__*/'
@@ -94,6 +101,16 @@ async function main () {
   }
   assertSelfContained(coreStripped, 'lib/collab-core.js')
 
+  // 状态层（第四个内联点、第二段源码）：唯一事实源 src/state-core.ts。
+  // 它与核心一样必须**完全自包含**（只许 import type，编译后擦除），否则内联后装不起来。
+  const stateCoreSrc = readFileSync(STATE_CORE_JS, 'utf8')
+  const stateCoreStripped = stripTopLevelExports(stateCoreSrc)
+  if (!stateCoreSrc.startsWith('// src/state-core.ts')) {
+    throw new Error('lib/state-core.js 看起来不是 state-core 的构建产物（缺少文件头注释）')
+  }
+  assertSelfContained(stateCoreStripped, 'lib/state-core.js')
+  assertNoProcessOs(stateCoreStripped, 'lib/state-core.js')
+
   // 委托纪律文本：从**构建产物** lib/spec.js 读值（唯一事实源 src/spec.ts）。
   // 不内联源码，因为 spec.js 有顶层 import（schemastery / collab-core），不是自包含段。
   const spec = await import(pathToFileURL(SPEC_JS).href)
@@ -125,7 +142,7 @@ async function main () {
   assertSelfContained(pathSpecsSrc, 'lib/spec.js 的路径规格内联区')
   assertNoProcessOs(pathSpecsSrc, 'lib/spec.js 的路径规格内联区')
 
-  for (const [marker, label] of [[MARKER_LINE, '核心'], [DISCIPLINE_MARKER_LINE, '纪律文本'], [PATH_SPECS_MARKER_LINE, '路径规格']]) {
+  for (const [marker, label] of [[MARKER_LINE, '核心'], [STATE_CORE_MARKER_LINE, '状态层'], [DISCIPLINE_MARKER_LINE, '纪律文本'], [PATH_SPECS_MARKER_LINE, '路径规格']]) {
     const n = hostShell.split(marker).length - 1
     if (n !== 1) {
       throw new Error('src/host-shell.js 必须恰好有一行 `' + marker + '`（' + label + '内联点），实际 ' + n + ' 处')
@@ -134,6 +151,11 @@ async function main () {
 
   const block = CORE_BEGIN + '\n' + coreStripped + CORE_END
   let hostCode = hostShell.split(MARKER_LINE).join(block)
+
+  // 状态层内联区（第二个源码内联点）：与核心同一条路，唯一事实源 src/state-core.ts。
+  // 顺序上它在核心之后 —— 它引用的纯函数名在同一作用域里由上面那段定义。
+  const stateCoreBlock = STATE_CORE_BEGIN + '\n' + stateCoreStripped + STATE_CORE_END
+  hostCode = hostCode.split(STATE_CORE_MARKER_LINE).join(stateCoreBlock)
 
   // 只内联**值**（JSON.stringify 包成字符串字面量），不做任何手抄：重新 build 即同步。
   const disciplineBlock = DISCIPLINE_BEGIN + '\n'
@@ -162,8 +184,9 @@ async function main () {
 
   const out = [
     '// AUTO-GENERATED by scripts/build-host.mjs —— 不要手改这个文件。',
-    '// 源：src/host-shell.js（外壳）+ src/collab-core.ts → lib/collab-core.js（核心，剥掉顶层 `export ` 后内联）。',
-    '// 内联的核心与 lib/collab-core.js 逐字节同源，由 tests/collab-inline-parity.mjs 守护。',
+    '// 源：src/host-shell.js（外壳）+ src/collab-core.ts → lib/collab-core.js（核心，剥掉顶层 export 前缀后内联）',
+    '//     + src/state-core.ts → lib/state-core.js（状态机，同法内联）。',
+    '// 两段内联区与 lib/collab-core.js / lib/state-core.js 逐字节同源，由 tests/collab-inline-parity.mjs 守护。',
     '// 委托纪律文本与功能 C 的路径规格取自 src/spec.ts → lib/spec.js（只内联值，路径规格另含 pathArgsFor 源码）。',
     'export const hostCode = ' + JSON.stringify(hostCode) + ';',
     'export default { hostCode };',
