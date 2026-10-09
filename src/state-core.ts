@@ -374,6 +374,11 @@ export function createStateCore(ports: StateCorePorts): StateCore {
     // 历史落点（只读扫描 + 一次性搬进正确位置）：候选由环境面给（包形态三代、外壳第一代、
     // 没有历史的形态给空数组）。文件名沿用 projectStorageFileName，故能与历史产物一一对上。
     for (const cand of await ports.legacyTargets(cwd, fileName)) {
+      // 目标已存在 ⇒ **没有任何东西要迁移**（createIfAbsent 本来就写不进去），直接收工。
+      // 这里曾漏掉这一句：于是每次读路径都会走一遍注定失败的迁移，把"旧落点迁移失败"当 warning
+      // 喊出来 —— 一个每次都喊的 warning 等于没有 warning（还会训练人忽略它）。
+      // 真失败（目标缺失但迁移的读/写炸了）仍然如实上报，见下面 catch。
+      if (info) break
       try {
         const legacyTarget = await fs.resolve(cand.path, cand.cwd ? { cwd: cand.cwd } : undefined)
         const legInfo = await fs.stat(legacyTarget)

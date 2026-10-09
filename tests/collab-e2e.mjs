@@ -428,6 +428,13 @@ await runTest('T8', '老 `~` 目录迁移：预置旧落点数据后再 list', a
   expect(readLegacy, '旧 `~` 落点的状态没有被迁移进来（readLegacy = false）',
     `readLegacy = ${readLegacy}\n      actual   = ${sp}\n      expected = ${EXPECTED_DIR}${path.sep}... 且能读到 c_legacy`)
   notes.push('→ 已从旧落点迁移，并读到 c_legacy')
+
+  // 回归：迁移**只在目标缺失时**才有意义。目标已在 ⇒ 再读一次不得再喊「旧落点迁移失败」。
+  // 此前缺这一句守卫，于是每次读路径都走一遍注定失败的 createIfAbsent 并喊 warning
+  // —— 一个每次都喊的 warning 等于没有 warning。
+  const { res: res2 } = await statePathOf(lock, 'agent-t8')
+  expect(!res2.data.warning, '目标已存在时不应再出现「旧落点迁移失败」warning',
+    'warning = ' + JSON.stringify(res2.data && res2.data.warning))
 })
 
 await runTest('T9', 'hostCode 形态：状态目录绝对、不含 ~、且走 settings.prepareDocument', async (notes) => {
