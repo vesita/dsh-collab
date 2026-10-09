@@ -25,7 +25,7 @@ import type {
   AgentLike, CollabArgs, CollabFs, FileRef, LoadResult, ToolResult
 } from './contract.js'
 import type {
-  Claim, FilterMessagesResult, HolderInput, HolderView, Message, OpResult, OverviewResult,
+  Claim, FilterMessagesResult, HolderInput, HolderView, Message, OpData, OpResult, OverviewResult,
   PublishedClaim, ReadInput, ReapInput, StateDocument, SweepOptions, SweepResult, TeamScopeTask
 } from './collab-core.js'
 
@@ -139,8 +139,9 @@ export interface StateCore {
 // 名册 1,058 B），而 claim/release/heartbeat 每次都整份重写 —— 为了改 1.3 KB 的锁状态写 82 KB。
 // 拆开之后锁操作只写主文件（KB 级），那条大尾巴只在**留言真的变了**时才动。
 //
-// 硬约束：**内存里的 StateDocument 一个字不改**（仍是 `{schemaVersion, seq, claims, messages, holders}`）
-// —— src/schema/collab.schema.json 是 SSOT，TS/Python/Rust 三份派生物与全部纯函数因此零改动。
+// 硬约束：**内存里的 StateDocument 与磁盘上是同一份逻辑文档**（拆盘只发生在落盘/加载这一层）。
+// —— src/schema/collab.schema.json 是 SSOT；单元 C 起该文档多了 `writer`（写者戳）与
+// `released`（终态墓碑表），claims/messages 的记录上多了 `seq` / `writer`。
 // 变的只有"怎么把它摊到磁盘上"：
 //   <name>.json          {schemaVersion, seq, claims, holders}  主文件（锁状态）
 //   <name>.messages.json {schemaVersion, seq, messages}         旁挂（留言）
@@ -226,13 +227,18 @@ function withWarn(data: Record<string, any>, warn: string | null): Record<string
  * 后者正是"并发方抢先创建了状态文件"的竞态：重读一次就能拿到 version 再写。
  * 只认精确文案，不用裸 /stale/i —— 它会命中路径里的 "stale" 字样。
  *
- * ⚠ **这个重试只保证同进程串行；跨进程的 CAS 并不成立**（2026-10 审计实测，未修）：
+ * ⚠ **这个重试只保证同进程串行；跨进程的 CAS 并不成立**（2026-10 审计实测）：
  *   dsh-fs-local 的串行化锁 `locks` 是 LocalFileSystem **实例**字段（只在本进程内排队），
  *   而 replaceIfVersion 是 probe → rename：两个进程可以同时 probe 到同一个 version、
  *   再各自 rename 成功，**后写者静默覆盖先写者**。实测（64MB 内容拉开窗口 + 文件屏障对齐）
  *   4/4 轮两个写者都返回成功 = 丢更新。所以"并发时重读重试"这条保证**不要**跨进程引用。
  *   （仓库自带 CLI 早先的 `fs::write` 非原子且零版本守卫，在防线上又开了一个洞；
  *    已由 R3a 改成原子替换 + 跨进程写锁，见 crates/collab-cli/src/main.rs。）
+ *
+ * 单元 C 起这条竞态不再是"丢更新"：版本守卫只当**快速路径**，真正的保证来自
+ * `mutate()` 的 读 → `mergeDocs(盘上, 本实例副本)` → 应用 op → 写 → **写后验证**
+ * （重读主文件确认写者戳还是自己）→ 重读重合并重试。所以即使两个 rename 都成功，
+ * 被覆盖的那一份也会在下一次写里被 join 回来（见 tests/collab-write-merge.mjs）。
  */
 function stale(e: unknown): boolean {
   const err = e as { message?: string; code?: string } | null | undefined
@@ -526,6 +532,45 @@ export function createStateCore(ports: StateCorePorts): StateCore {
   }
 
   /**
+   * **本实例的本地副本**（单元 C，载荷收敛的核心）。
+   *
+   * 为什么需要它：盘上的写入是"读改写"，而 CAS 只在本进程有效（实测：两个进程可以同时
+   * probe 到同一个 version、各自 rename 都成功，后写者静默覆盖先写者 = 丢更新）。一旦被覆盖，
+   * 丢失的那份改动**已经不在盘上**，只在丢掉它的那个写者的记忆里 —— 所以要有一个跨调用保留的
+   * 本地副本，下一次写盘时把"盘上 ∪ 我的副本"按半格 join 合起来，两边独有的记录都不丢。
+   *
+   * 只用于**写路径**（读路径仍以盘上为准，行为不变）。它只在 merge 与 sweep 的收敛规则下
+   * 增长与收缩：已过期的记录会被 sweep 再清一次，越限留言会被同一条确定性规则再截一次，
+   * 墓碑（`released`）参与 join 因而"释放"不会被旧副本翻案。所以它不会把状态带偏。
+   */
+  let replica: StateDocument | null = null
+
+  /**
+   * 写后验证（单元 C）：落盘成功 **不等于** 这份内容还在盘上。
+   *
+   * `replaceIfVersion` 是 probe → rename，而串行化锁是文件系统实例的**实例字段**（只在本进程
+   * 内排队）—— 两个写者可以同时 probe 成功、各自 rename 成功，后写者静默覆盖先写者。所以写完
+   * 必须**重读主文件**确认盘上的写者戳还是我自己。
+   *
+   * 三态（fail-open，只认"明确被别人盖了"这一种失败）：
+   *   · 盘上的 `writer` 就是我自己 ⇒ 我的写入还在（true）；
+   *   · `writer` 是**另一个非空**写者 ⇒ 被覆盖了（false）⇒ 重读 + 重合并 + 重试；
+   *   · 观测不到（没有 stat / 读不出 / JSON 坏 / 没有 writer 字段 / 本形态给不出写者戳）⇒ 不判定
+   *     （true）—— 这里绝不能把"观测不到"当成"被覆盖"，否则没有写入能力的宿主形态会被反复重试。
+   */
+  async function writeLanded(target: FileRef): Promise<boolean> {
+    if (!WRITER_ID) return true
+    let info: { version: number } | null
+    try { info = await fs.stat(target) } catch (e) { return true }
+    if (!info) return true
+    let doc: unknown
+    try { doc = JSON.parse(await fs.readText(target)) } catch (e) { return true }
+    const w = doc && typeof doc === 'object' ? (doc as { writer?: unknown }).writer : undefined
+    if (typeof w !== 'string' || w === '') return true
+    return w === WRITER_ID
+  }
+
+  /**
    * 读改写事务：load → merge(盘上, 我的副本) → sweep → op → 写盘 → **写后验证**；
    * 写失败（乐观并发冲突）或验证发现被覆盖时，重读 + 重合并 + 重试（最多 5 轮）。
    *
@@ -539,61 +584,88 @@ export function createStateCore(ports: StateCorePorts): StateCore {
    * `sweep()` 用同一条确定性规则（条数 / 字节预算，都丢最旧）施加，因此两边结果相同。
    */
   async function mutate(fn: (s: StateDocument) => OpResult, agentId: string | null, agent?: AgentLike): Promise<ToolResult> {
+    // 「本次 op 的结果」跨重试携带。重试**不重跑 op**，只做"重读 → 重合并 → 重写 → 再验证"：
+    // 重跑对 claim 只是幂等（会并回自己那条），但对 post 会**再多出一条 seq 不同的留言**
+    // —— 同一条消息落两条。op 的效果已经在 `applied` 里，合并它即可。
+    let applied: StateDocument | null = null
+    let resultData: OpData | undefined
     for (let i = 0; i < 5; i++) {
       const { state, version, target, sidecar, sideVersion, messagesInMain } = await load(agentId, agent)
-      // 跑 op **之前**取留言指纹：sweep() 也会截断留言（条数/字节上限），所以要在它之前取，
-      // 否则"这次只清掉了旧留言"会被判成"留言没变"而丢掉截断结果。
-      // 单元 C：盖上**本次写者**的戳 —— 本事务里 claim / post / releaseOnLoopEnd 分配 id 时读它
-      // （id 形如 `c_<seq>@<writer>`：Lamport 只保证 seq 不小于所见最大值，唯一性靠写者戳）。
-      state.writer = WRITER_ID
-      const fpBefore = msgFingerprint(state.messages)
-      const swept = core.sweep(state, now(), sweepOpts(state))
-      let out: OpResult | undefined
-      try {
-        out = fn(state)
-      } catch (e) {
-        if (e && e.collabConflict) return { ok: false, error: 'conflict', conflicts: e.conflicts }
-        throw e
-      }
-      if (!out || out.changed === false) {
-        if (!out) return { ok: false, error: 'not-found', message: 'nothing to change' }
-        const data = out.data || {}
-        // 统一错误信封：ok:false 时 error/message 提升到顶层，调用方无需再挖 data。
-        // **错误分支绝不写盘**：被挡回的 op 没有产生任何该持久化的状态。
-        if (out.ok === false) return { ok: false, error: data.error || 'bad-request', message: data.message, ...data }
-        // 本次 op 自己什么都没改时，过去会直接返回、不写盘。但 `sweep()` 已经在**这个事务里**
-        // 清掉了过期声明 / 超限留言 / 死名册行 —— 丢掉它们意味着：读路径只 sweep 内存、不写盘，
-        // 只要写操作一直返回 changed:false（反复 release 不存在的路径、reap dry-run、reader 已登记），
-        // 磁盘就会长期留着已清理的内容，**视图与磁盘长期不一致**。
-        // 所以只要本次确实有清理，就把它写回；返回值形状保持不变（仍 `{ok:true, data}`）。
-        const cleaned = swept.expiredClaims > 0 || swept.droppedMessages > 0 || swept.prunedHolders > 0
-        if (out.changed === false && !cleaned) return { ok: true, data }
-        if (out.changed !== false && (swept.droppedMessages > 0 || swept.prunedHolders > 0)) {
-          out.data = Object.assign({}, out.data, { swept })
-        }
-        // changed:false 的 op 可能不带 state（如 registerReader 的幂等分支）；此时本地 `state`
-        // 就是唯一事实（fn 在 changed:false 语义下不改它，sweep 已经改过它）。
-        const next = out.state || state
+      let next: StateDocument
+      let fpBefore: string
+      if (applied) {
+        // 重试路径：把「本次 op 的结果」与新盘按半格 join 合起来，再按同一条确定性规则 sweep
+        // （截断必须在合并**之后**：两个副本各自先截一半会让尾巴来回抖动、永不收敛）。
+        next = core.mergeDocs(state, applied)
+        next.writer = WRITER_ID
+        fpBefore = msgFingerprint(state.messages)
+        core.sweep(next, now(), sweepOpts(next))
+      } else {
+        // 「我的」= 盘上 ∪ 本实例的副本（半格 join）。首次写盘时副本为空 ⇒ 与旧行为逐字相同。
+        const mine = replica ? core.mergeDocs(state, replica) : core.normalizeDoc(state)
+        // 盖上**本次写者**的戳：它既是拿出去落盘的 `writer`，也是本事务里分配 id 的写者戳
+        // （`claim`/`post`/`releaseOnLoopEnd` 从 state.writer 取），还是写后验证的判据。
+        mine.writer = WRITER_ID
+        // 跑 op **之前**取留言指纹：sweep() 也会截断留言（条数/字节上限），所以要在它之前取，
+        // 否则"这次只清掉了旧留言"会被判成"留言没变"而丢掉截断结果。
+        fpBefore = msgFingerprint(mine.messages)
+        const swept = core.sweep(mine, now(), sweepOpts(mine))
+        // 把"盘上学到的 ∪ 副本 ∪ 本次 sweep 的确定性清理"立刻留在副本里：即使本次 op 被挡回
+        // （错误分支与 not-found 都不写盘），下一次也能看见这次的清理结果 —— 否则一块已到期的
+        // 墓碑会把某条路径永久卡在"盘上有、副本以为没有"的状态里。
+        replica = core.normalizeDoc(mine)
+        let out: OpResult | undefined
         try {
-          await writeState(next, version, target, sidecar, sideVersion, messagesInMain, fpBefore)
-          return { ok: true, data: out.changed === false ? data : out.data }
+          out = fn(mine)
         } catch (e) {
-          if (stale(e) && i < 4) continue
+          if (e && e.collabConflict) return { ok: false, error: 'conflict', conflicts: e.conflicts }
           throw e
         }
+        if (!out || out.changed === false) {
+          if (!out) return { ok: false, error: 'not-found', message: 'nothing to change' }
+          const data = out.data || {}
+          // 统一错误信封：ok:false 时 error/message 提升到顶层，调用方无需再挖 data。
+          // **错误分支绝不写盘**：被挡回的 op 没有产生任何该持久化的状态。
+          if (out.ok === false) return { ok: false, error: data.error || 'bad-request', message: data.message, ...data }
+          // 本次 op 自己什么都没改时，过去会直接返回、不写盘。但 `sweep()` 已经在**这个事务里**
+          // 清掉了过期声明 / 超限留言 / 死名册行 —— 丢掉它们意味着：读路径只 sweep 内存、不写盘，
+          // 只要写操作一直返回 changed:false（反复 release 不存在的路径、reap dry-run、reader 已登记），
+          // 磁盘就会长期留着已清理的内容，**视图与磁盘长期不一致**。
+          // 所以只要本次确实有清理，就把它写回；返回值形状保持不变（仍 `{ok:true, data}`）。
+          const cleaned = swept.expiredClaims > 0 || swept.droppedMessages > 0 || swept.prunedHolders > 0
+          if (out.changed === false && !cleaned) return { ok: true, data }
+          if (out.changed !== false && (swept.droppedMessages > 0 || swept.prunedHolders > 0)) {
+            out.data = Object.assign({}, out.data, { swept })
+          }
+          resultData = out.changed === false ? data : out.data
+        } else {
+          // 「截断发生了」必须在返回值里可见（本模块两形态同源 ⇒ 这一条对两个形态同时成立）：
+          // 留言被条数/字节预算丢掉、或名册行被回收时，把 swept 附到 data 上如实报数。
+          if (swept.droppedMessages > 0 || swept.prunedHolders > 0) {
+            out.data = Object.assign({}, out.data, { swept })
+          }
+          resultData = out.data
+        }
+        // changed:false 的 op 可能不带 state（如 registerReader 的幂等分支）；此时本地 `mine`
+        // 就是唯一事实（fn 在 changed:false 语义下不改它，sweep 已经改过它）。
+        next = out.state || mine
       }
-      // 「截断发生了」必须在返回值里可见（本模块两形态同源 ⇒ 这一条对两个形态同时成立）：
-      // 留言被条数/字节预算丢掉、或名册行被回收时，把 swept 附到 data 上如实报数。
-      if (swept.droppedMessages > 0 || swept.prunedHolders > 0) {
-        out.data = Object.assign({}, out.data, { swept })
-      }
+      // 失败重试都从这里继续：`applied` 已带上本次 op 的结果，下一轮只重读重合并重写。
+      applied = next
+      next.writer = WRITER_ID
       try {
-        await writeState(out.state, version, target, sidecar, sideVersion, messagesInMain, fpBefore)
-        return { ok: true, data: out.data }
+        await writeState(next, version, target, sidecar, sideVersion, messagesInMain, fpBefore)
       } catch (e) {
         if (stale(e) && i < 4) continue
         throw e
       }
+      // 先把本次结果留在副本里，再验证：验证失败（被别人覆盖）时下一轮就是
+      // merge(新盘, 我的结果) —— 我的改动不会被丢掉。
+      replica = core.normalizeDoc(next)
+      // **写后验证**：落盘成功不等于这份内容还在盘上（replaceIfVersion 是 probe → rename，
+      // 两个写者可以同时 probe 成功、各自 rename 成功）。重读主文件确认写者戳还是我自己；
+      // 不是（被别人覆盖了）⇒ 重读 + 重合并 + 重试。观测不到时不判定（见 writeLanded）。
+      if (await writeLanded(target)) return { ok: true, data: resultData || {} }
     }
     return { ok: false, error: 'concurrent-modification', message: 'state busy, retry later' }
   }

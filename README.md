@@ -127,6 +127,8 @@ DSH 自带一套实验性的 `Agent Teams`（`dsh-experimental-agent-team*`）�
 └── tests/
     ├── _harness.mjs                 # 共用断言脚手架（ok / skip / 汇总 / 退出码）
     ├── collab-pure-logic.mjs        # 纯逻辑回归 + hostCode 内联副本漂移守护
+    ├── collab-convergence.mjs       # 单元 C：merge 的代数律（交换/结合/幂等）+ id 唯一 + 游标无损 + 终态化
+    ├── collab-write-merge.mjs       # 单元 C：两个写者并发写盘不丢更新（含"后写覆盖"负向对照）+ release 终态化
     ├── collab-integration.mjs       # Cordis 插件端到端（fake ctx）
     ├── collab-hostcode-parity.mjs   # 动态宿主形态**行为**对拍（路径 + 三态语义 + holder 回收）
     ├── collab-inline-parity.mjs     # 两形态**源码同源**守护（核心 + 状态层两段内联区逐字节一致，外壳不复刻）
@@ -746,6 +748,8 @@ pnpm run build          # 测试与发布均针对 lib/ 产物
 npm test                # 依次运行下列全部测试
 
 node tests/collab-pure-logic.mjs       # 纯逻辑 + hostCode 漂移守护
+node tests/collab-convergence.mjs      # merge 的代数律（交换/结合/幂等）+ id 唯一 + 游标无损 + 终态化
+node tests/collab-write-merge.mjs      # 两个写者并发写盘不丢更新（含负向对照）+ release 终态化
 node tests/collab-integration.mjs      # Cordis 插件端到端（fake ctx）
 node tests/collab-hostcode-parity.mjs  # 动态宿主形态**行为**对拍
 node tests/collab-inline-parity.mjs    # 两形态**同名函数**逐输出对拍（30 个 + 集合回归守护）
@@ -792,16 +796,17 @@ cargo test --manifest-path crates/collab-cli/Cargo.toml
 
 ### 状态文件的磁盘布局（0.15.0）
 
-内存里的状态文档**没变**（仍是 `{schemaVersion, seq, claims, messages, holders}`，SSOT 见 `src/schema/collab.schema.json`）；变的只是它摊到磁盘上的方式 —— 拆成两半，让锁操作不必重写留言那条大尾巴（实测一份 82 KB 的状态里 97% 是留言）：
+状态文档是 `{schemaVersion, seq, writer, claims, messages, holders, released}`（SSOT 见 `src/schema/collab.schema.json`）；它摊到磁盘上时拆成两半，让锁操作不必重写留言那条大尾巴（实测一份 82 KB 的状态里 97% 是留言）：
 
 | 文件 | 内容 |
 | --- | --- |
-| `<name>.json` | `{schemaVersion, seq, claims, holders}` —— 锁状态（KB 级） |
-| `<name>.messages.json` | `{schemaVersion, seq, messages}` —— 留言旁挂 |
+| `<name>.json` | `{schemaVersion, seq, writer, claims, holders, released}` —— 锁状态（KB 级） |
+| `<name>.messages.json` | `{schemaVersion, seq, writer, messages}` —— 留言旁挂 |
 
-- **加载期合并**：主文件 + 旁挂合并成一个逻辑文档；`seq` 取两边的较大值（它是 `claimId` 与 `msgId` 共用的计数器）。
+- **加载期合并**：主文件 + 旁挂合并成一个逻辑文档；`seq` 取两边的较大值（Lamport 逻辑时钟，`claimId` 与 `msgId` 都从它分配）。
 - **写盘**：`claim` / `release` / `heartbeat` 只写主文件；旁挂**只在留言真的变了**时才写（判据是"条数 + 首条 msgId + 末条 msgId"指纹，留言只有尾部追加与头部截断两种变化）。迁移那一次**先写旁挂再写主文件**，保证任何一步失败时留言都还在磁盘上。
-- **迁移**：主文件里仍有 `messages`（旧布局）时与旁挂按 `msgId` 求**并集**（同 `msgId` 以主文件那份为准、按 `seq` 升序），**首次写盘**把并集搬进旁挂并从主文件里去掉这个键；**只搬不删**，`collab_board op=read` 迁移前后返回一致。求并集而不是"以主文件为准"的理由：滚动升级期间同一份状态会被新旧两个版本交替写（旧版写主文件、新版写旁挂），任何"以某一边为准"都会在下次写盘时把另一边整批覆盖掉。
+- **迁移**：主文件里仍有 `messages`（旧布局）时与旁挂按 `msgId` 求**并集**（同 `msgId` 取 `(seq, writer)` 较大者，按 `(seq, writer)` 升序），**首次写盘**把并集搬进旁挂并从主文件里去掉这个键；**只搬不删**，`collab_board op=read` 迁移前后返回一致。求并集而不是"以主文件为准"的理由：滚动升级期间同一份状态会被新旧两个版本交替写（旧版写主文件、新版写旁挂），任何"以某一边为准"都会在下次写盘时把另一边整批覆盖掉。
+- **跨进程收敛（单元 C）**：状态文件用 `replaceIfVersion` 写，而它是 probe → rename —— 两个进程可以同时 probe 到同一个 version、各自 rename 都成功，后写者静默覆盖先写者。所以写入不靠"版本守卫一定拦住"，靠状态本身**可合并**：每个写者有稳定唯一的写者戳（记录 id 是 `c_<seq>@<writer>` / `m_<seq>@<writer>`），写路径是 读 → `mergeDocs(盘上, 我的副本)` → 应用本次 op → 写 → **写后验证**（重读主文件、确认写者戳还是自己；不是就重读重合并重试）。`mergeDocs` 是半格 join（交换/结合/幂等）；`release` 不删记录而是留终态墓碑（`released`：claimId → 原 expiresAt），由 `sweep` 按"原租约到点"确定性回收。
 - `overview` 的 `otherProjects` 扫状态目录时排除 `*.messages.json`，不会把旁挂当成一个项目。
 
 ---

@@ -136,6 +136,14 @@
   环境面）才碰 `src/host-shell.js`，改完必须重新 build。
 - **契约只有一份**：`src/schema/collab.schema.json` 是 SSOT，TS / Python / Rust 三份派生物由
   `tests/collab-contract-derivation.mjs` 逐字段核对。
+- **状态必须可收敛（单元 C）**：跨进程并发**不靠锁** —— 状态文件的 `replaceIfVersion` 是
+  probe → rename，两个进程可同时 probe 成功、各自 rename 都成功（`dsh-fs-local` 的串行化锁是
+  实例字段，只在本进程排队）。硬规则：写路径必须是 读 → `mergeDocs(盘上, 本实例副本)` →
+  应用 op → 写 → **写后验证**（重读主文件确认写者戳是自己）；`mergeDocs` 必须是半格 join
+  （交换/结合/幂等，逐字段取大/取小/求并）；把声明从 `claims` 里拿掉的每条路径都必须立
+  **终态墓碑**（`released`），其 GC 只能按确定性规则（原租约到点），留言截断只能在**合并之后**。
+  守卫：`tests/collab-convergence.mjs`（代数律 + 游标无损 + 终态化）、
+  `tests/collab-write-merge.mjs`（两写者不丢更新，含负向对照）。
 - **不验证不许说"没问题"**：区分「没测出问题」与「没有问题」；用户可见文案改动要配负向对照。
 - **使用上的已知别扭之处**（含实测统计）见 `docs/collab-ux-backlog.md`，改之前先看有没有人已经记过。
 - **与官方 `Agent Teams` 的分工是已核实的结论，别再重新论证**：判据、边界与三条接缝（家族豁免、

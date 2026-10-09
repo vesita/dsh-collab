@@ -476,7 +476,7 @@ Holder = {
 | 设计点 | 实现结论 | 原因 |
 | --- | --- | --- |
 | 状态文件位置（当时） | 会话**工作区根** `.dsh-collab.json`（经 `fs.resolve(FILE, {cwd: session.header.cwd})`）。**现行落点**是 `${DSH_HOME:-$HOME/.dsh}/collab/projects/<项目名>-<哈希>.json`（见 `src/paths.ts`）；`.dsh-collab.json` 已降级为**只读迁移源** | fs 服务无 mkdir；`.dsh-collab/` 子目录留待有 mkdir 手段后迁移 |
-| 持久化后端 | **文件后端**（fs `writeText` + `replaceIfVersion` 版本守卫做乐观并发，陈旧写自动重试 ≤5 次） | storageDomain 有单开约束、动态插件按会话隔离、且本部署未挂 kv 后端——storageDomain 推迟到 host 组合化形态 |
+| 持久化后端 | **文件后端**（fs `writeText` + `replaceIfVersion` 版本守卫做乐观并发，陈旧写自动重试 ≤5 次；单元 C 起写路径额外做 `mergeDocs(盘上, 本实例副本)` + **写后验证**，因为版本守卫跨进程并不成立：两个进程可同时 probe 成功、各自 rename 都成功） | storageDomain 有单开约束、动态插件按会话隔离、且本部署未挂 kv 后端——storageDomain 推迟到 host 组合化形态 |
 | 跨会话同步 | **pull 式**：每次操作读最新文件即见他人变更 | 会话级动态插件 ctx 互不可达，`ctx.emit` 无法跨会话广播；事件/推送留给 M3 面板与正式化 |
 | 身份 | `exec.agent.id` → `sessions.get(id).header.cwd`（状态路径）与 `sessionTitle.get(session)`（显示名） | 工具内部不可传 holder 参数，防冒充 |
 
