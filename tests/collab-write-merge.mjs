@@ -278,4 +278,64 @@ console.log('# 5. 写后验证：盘上的写者戳被人换掉 ⇒ 重读重合
   ok(doc.writer === 'wA', '盘上的写者戳最终是 A 自己（写后验证会一直纠到这一点）', show(doc.writer))
 }
 
+// ════════════════════════════════════════════════════════════════════════
+// 6. CLI ↔ 插件互相不丢更新（单元 D："CLI 先写、插件再写"这一半；
+//    "插件先写、CLI 再写"那一半在 Rust 侧 test_cli_merge_keeps_plugin_update）
+// ════════════════════════════════════════════════════════════════════════
+console.log('# 6. CLI 先写、插件再写：插件的正常写必须把 CLI 的记录并回来')
+{
+  const disk = makeDisk()
+  const A = makeStore(disk, 'wA')
+  await A.mutate((s) => pure.claim(s, holder('A'), { paths: ['src/a/'] }, now), null)
+  ok(claimIds(disk).length === 1, '插件先写了 src/a/', show(claimIds(disk)))
+
+  // CLI 的一次整份原子替换（它先读、再改、再写：此刻盘上只剩 CLI 自己的记录）。
+  const cliWriter = 'cli-7788'
+  const cliDoc = {
+    schemaVersion: 1,
+    seq: 1,
+    writer: cliWriter,
+    claims: [{
+      claimId: 'c_1@' + cliWriter, holderId: 'cli:user', holderName: 'CLI User', paths: ['src/cli/'],
+      mode: 'exclusive', ttlSec: 1800, expiresAt: 9999999999999, createdAt: 1,
+      note: '', readable: true, readers: [], seq: 1, writer: cliWriter
+    }],
+    messages: [],
+    holders: [],
+    released: {}
+  }
+  disk.write(TARGET, JSON.stringify(cliDoc))
+  ok(claimIds(disk).length === 1 && claimIds(disk)[0] === 'c_1@' + cliWriter,
+    '病根复现：CLI 的整份写覆盖了插件的记录（此刻盘上只有 CLI 的）', show(claimIds(disk)))
+
+  // 插件做一次**正常写**：读盘（含 CLI 的记录）∪ 自己的副本 ⇒ 两边都并在盘上。
+  const r = await A.mutate((s) => pure.claim(s, holder('A'), { paths: ['src/b/'] }, now), null)
+  ok(r.ok === true, '插件的后续写成功', show(r))
+  const after = onDisk(disk)
+  const writers = new Set(after.claims.map((c) => c.writer))
+  ok(after.claims.some((c) => c.writer === cliWriter), 'CLI 的记录被并回来（插件的写没有覆盖它）', show(after.claims.map((c) => [c.claimId, c.writer])))
+  ok(writers.has('wA') && writers.has(cliWriter), '最终状态里插件与 CLI 的记录都在', show([...writers]))
+}
+
+console.log('# 6b. 负向对照（RED）：插件写路径不合并（整份取自己的副本）⇒ CLI 的记录丢')
+{
+  const disk = makeDisk()
+  const A2 = makeStore(disk, 'wA2', { core: { ...pure, mergeDocs: (a, b) => b } })
+  await A2.mutate((s) => pure.claim(s, holder('A2'), { paths: ['src/a/'] }, now), null)
+  const cliWriter = 'cli-7788'
+  disk.write(TARGET, JSON.stringify({
+    schemaVersion: 1, seq: 1, writer: cliWriter,
+    claims: [{
+      claimId: 'c_1@' + cliWriter, holderId: 'cli:user', holderName: 'CLI User', paths: ['src/cli/'],
+      mode: 'exclusive', ttlSec: 1800, expiresAt: 9999999999999, createdAt: 1,
+      note: '', readable: true, readers: [], seq: 1, writer: cliWriter
+    }],
+    messages: [], holders: [], released: {}
+  }))
+  await A2.mutate((s) => pure.claim(s, holder('A2'), { paths: ['src/b/'] }, now), null)
+  const after = onDisk(disk)
+  ok(!after.claims.some((c) => c.writer === cliWriter),
+    '负向对照（RED）成立：不合并的插件写把 CLI 的记录静默丢掉了', show(after.claims.map((c) => [c.claimId, c.writer])))
+}
+
 h.finish()

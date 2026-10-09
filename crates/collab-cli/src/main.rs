@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -23,18 +23,22 @@ pub enum Mode {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
+// 字段顺序是**判据的一部分**：Rust 结构体序列化的键顺序必须与 TS `normalizeDoc` / `joinClaim`
+// 的插入顺序一致（claimId, holderId, paths, mode, ttlSec, expiresAt, createdAt, holderName,
+// note, readable, readers, seq, writer），否则黄金语料 `tests/fixtures/merge-golden.json` 的
+// 逐字节比较会红（见下面的 merge 层注释）。
 pub struct Claim {
     pub claim_id: String,
     pub holder_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub holder_name: Option<String>,
     pub paths: Vec<String>,
     pub mode: Mode,
     pub ttl_sec: i64,
     pub expires_at: i64,
+    pub created_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub holder_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
-    pub created_at: i64,
     /// 可读性（0.8.0 功能 C）：true = 他人可读（默认），false = 他人读取也要先协商。
     /// `default` 让 0.7.0 之前的状态文件照常解析成"可读"。
     #[serde(default = "default_readable")]
@@ -91,19 +95,21 @@ pub struct Holder {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
+// 顶层字段顺序同样与 TS `normalizeDoc` 的输出顺序一致，见上（writer 在 claims 之前）。
 pub struct StateDocument {
     pub schema_version: i32,
     pub seq: i64,
-    pub claims: Vec<Claim>,
-    pub messages: Vec<Message>,
-    pub holders: Vec<Holder>,
     /// 单元 C：最后一次落盘这份文档的写者戳（写后验证用）。老状态文件缺省空串。
     #[serde(default)]
     pub writer: String,
-    /// 单元 C：终态墓碑表（claimId -> 原租约 expiresAt）。release / 自动释放 / reap 走这里，
-    /// 而不是把声明从数组里删掉 —— 删除在 join 下不单调，墓碑才单调。
+    pub claims: Vec<Claim>,
+    pub messages: Vec<Message>,
+    pub holders: Vec<Holder>,
+    /// 单元 C：终态墓碑表（claimId -> 墓碑值：原租约到期与"释放时刻 + ttl"的上界，取大者）。
+    /// release / 自动释放 / reap 走这里，而不是把声明从数组里删掉 —— 删除在 join 下不单调，
+    /// 墓碑才单调。BTreeMap（而不是 HashMap）：序列化时按键升序，与 TS 的规范序一致。
     #[serde(default)]
-    pub released: HashMap<String, i64>,
+    pub released: BTreeMap<String, i64>,
 }
 
 impl Default for StateDocument {
@@ -115,7 +121,7 @@ impl Default for StateDocument {
             messages: vec![],
             holders: vec![],
             writer: String::new(),
-            released: HashMap::new(),
+            released: BTreeMap::new(),
         }
     }
 }
@@ -561,21 +567,361 @@ fn save_state(path: &Path, doc: &StateDocument, expected: Option<&[u8]>) -> Resu
     })
 }
 
+// ---- 收敛层（单元 C，CLI 侧）：与 src/collab-core.ts 的 mergeDocs 逐字段同源 ----
+//
+// 为什么 CLI 也要合并：插件的写路径是 读 → `mergeDocs(盘上, 副本)` → 应用 op → 写 →
+// **写后验证**；CLI 若还是 读 → 改 → `save_state`，它就会把插件刚写的整份覆盖掉
+// （反过来也是），只能靠对方"下次再写"自愈。这里把同一个半格 join 移植过来，两条写路径
+// 因此说同一种语言。
+//
+// **这是同一算法的第二份实现，靠黄金语料防漂移**：`tests/fixtures/merge-golden.json` 由
+// `tests/gen-merge-golden.mjs` 从 TS 的 `mergeDocs` 现算生成；TS 侧
+// `tests/collab-merge-golden.mjs` 与 Rust 侧 `test_merge_golden_corpus_matches_ts` 都断言
+// 自己的输出与语料**逐字节相同**。TS 改了而语料没重跑 ⇒ TS 红；重跑了而 Rust 没跟上 ⇒ Rust 红。
+// 结构体字段顺序也是判据：Rust 的键顺序必须与 TS `normalizeDoc` 的插入顺序一致，否则字节不等。
+//
+// 分量语义：`seq` 取 max（Lamport）；`writer` 取字典序 max（写盘前由写路径盖上本次写者戳）；
+// `released` 求并（同键取大）；claims/messages/holders 按 id **逐字段** join（不是整条二选一，
+// 否则并发续租的 expiresAt、并发登记的 readers 会丢）。输出是规范序，可直接逐字节比较。
+
+fn mode_str(m: &Mode) -> &'static str {
+    match m {
+        Mode::Exclusive => "exclusive",
+        Mode::Shared => "shared",
+        Mode::Read => "read",
+    }
+}
+
+/// `(seq, writer)` 全序，与 TS `compareSeqWriter` 同一条判据（游标与记录排序共用）。
+fn compare_seq_writer(a_seq: i64, a_writer: &str, b_seq: i64, b_writer: &str) -> std::cmp::Ordering {
+    a_seq.cmp(&b_seq).then_with(|| a_writer.cmp(b_writer))
+}
+
+/// 字符串集合求并 + 规范序（字典序去重）。顺序不能带进结果，否则交换律被数组顺序破坏。
+fn join_str_set(a: &[String], b: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for x in a.iter().chain(b.iter()) {
+        if !out.contains(x) {
+            out.push(x.clone());
+        }
+    }
+    out.sort();
+    out
+}
+
+/// 可选字符串取大；`None` 是底，有值的一方胜出。
+fn join_max_str(a: &Option<String>, b: &Option<String>) -> Option<String> {
+    match (a, b) {
+        (None, None) => None,
+        (None, Some(y)) => Some(y.clone()),
+        (Some(x), None) => Some(x.clone()),
+        (Some(x), Some(y)) => Some(if x >= y { x.clone() } else { y.clone() }),
+    }
+}
+
+fn join_claim(a: &Claim, b: &Claim) -> Claim {
+    Claim {
+        claim_id: a.claim_id.clone(),
+        holder_id: if a.holder_id >= b.holder_id {
+            a.holder_id.clone()
+        } else {
+            b.holder_id.clone()
+        },
+        paths: join_str_set(&a.paths, &b.paths),
+        mode: if mode_str(&a.mode) >= mode_str(&b.mode) {
+            a.mode.clone()
+        } else {
+            b.mode.clone()
+        },
+        ttl_sec: a.ttl_sec.max(b.ttl_sec),
+        expires_at: a.expires_at.max(b.expires_at),
+        // createdAt 取小：创建时刻只能"更早"，不能被后到的副本推后。
+        created_at: a.created_at.min(b.created_at),
+        holder_name: join_max_str(&a.holder_name, &b.holder_name),
+        note: join_max_str(&a.note, &b.note),
+        // readable 取"与"（false 优先 = 更严格的可见性不会被翻松）。
+        readable: a.readable && b.readable,
+        readers: join_str_set(&a.readers, &b.readers),
+        seq: a.seq.max(b.seq),
+        writer: if a.writer >= b.writer {
+            a.writer.clone()
+        } else {
+            b.writer.clone()
+        },
+    }
+}
+
+fn join_message(a: &Message, b: &Message) -> Message {
+    let channel = if a.channel >= b.channel {
+        a.channel.clone()
+    } else {
+        b.channel.clone()
+    };
+    let author = if a.author >= b.author {
+        a.author.clone()
+    } else {
+        b.author.clone()
+    };
+    let body = if a.body >= b.body {
+        a.body.clone()
+    } else {
+        b.body.clone()
+    };
+    Message {
+        msg_id: a.msg_id.clone(),
+        seq: a.seq.max(b.seq),
+        channel: if channel.is_empty() {
+            "general".to_string()
+        } else {
+            channel
+        },
+        author,
+        ts: a.ts.max(b.ts),
+        body,
+        reply_to: join_max_str(&a.reply_to, &b.reply_to),
+        writer: if a.writer >= b.writer {
+            a.writer.clone()
+        } else {
+            b.writer.clone()
+        },
+    }
+}
+
+fn join_holder(a: &Holder, b: &Holder) -> Holder {
+    Holder {
+        holder_id: a.holder_id.clone(),
+        name: if a.name >= b.name {
+            a.name.clone()
+        } else {
+            b.name.clone()
+        },
+        kind: if a.kind >= b.kind {
+            a.kind.clone()
+        } else {
+            b.kind.clone()
+        },
+        session_id: join_max_str(&a.session_id, &b.session_id),
+        last_seen_at: a.last_seen_at.max(b.last_seen_at),
+        proc: join_max_str(&a.proc, &b.proc),
+    }
+}
+
+/// 按 id 把一组记录折叠成逐字段 join（同一 id 的多份全部并进来，不是二选一）。
+fn fold_by<T: Clone>(
+    rows: &[T],
+    id_of: impl Fn(&T) -> String,
+    join: impl Fn(&T, &T) -> T,
+) -> Vec<T> {
+    let mut at: HashMap<String, usize> = HashMap::new();
+    let mut out: Vec<T> = Vec::new();
+    for x in rows {
+        let id = id_of(x);
+        if id.is_empty() {
+            continue;
+        }
+        match at.get(&id) {
+            Some(&i) => out[i] = join(&out[i], x),
+            None => {
+                at.insert(id, out.len());
+                out.push(join(x, x));
+            }
+        }
+    }
+    out
+}
+
+/// 规范形：补默认、同 id 逐字段折叠、剔除墓碑表里那些 id 的声明、全部数组排成确定性顺序。
+/// 它就是幂等律里的"规范形"：`merge_docs(a, a)` 逐字段等于 `normalize_doc(a)`。
+fn normalize_doc(s: &StateDocument) -> StateDocument {
+    let mut released: BTreeMap<String, i64> = BTreeMap::new();
+    for (k, v) in s.released.iter() {
+        if !k.is_empty() {
+            released.insert(k.clone(), *v);
+        }
+    }
+    let mut claims: Vec<Claim> = fold_by(&s.claims, |c| c.claim_id.clone(), join_claim)
+        .into_iter()
+        .filter(|c| !released.contains_key(&c.claim_id))
+        .collect();
+    claims.sort_by(|x, y| {
+        compare_seq_writer(x.seq, &x.writer, y.seq, &y.writer)
+            .then_with(|| x.claim_id.cmp(&y.claim_id))
+    });
+    let mut messages: Vec<Message> = fold_by(&s.messages, |m| m.msg_id.clone(), join_message);
+    messages.sort_by(|x, y| {
+        compare_seq_writer(x.seq, &x.writer, y.seq, &y.writer)
+            .then_with(|| x.msg_id.cmp(&y.msg_id))
+    });
+    let mut holders: Vec<Holder> = fold_by(&s.holders, |h| h.holder_id.clone(), join_holder);
+    holders.sort_by(|x, y| x.holder_id.cmp(&y.holder_id));
+    StateDocument {
+        schema_version: 1,
+        seq: s.seq,
+        writer: s.writer.clone(),
+        claims,
+        messages,
+        holders,
+        released,
+    }
+}
+
+/// **半格 join**：`merge_docs(a, b)` = a 与 b 的最小上界。两步：两边的记录直接拼接，
+/// 再交给 `normalize_doc`（按 id 逐字段 join 折叠、剔除墓碑、排成规范序）。
+fn merge_docs(a: &StateDocument, b: &StateDocument) -> StateDocument {
+    let a = normalize_doc(a);
+    let b = normalize_doc(b);
+    let mut released = a.released.clone();
+    for (k, v) in b.released.iter() {
+        match released.get(k) {
+            Some(cur) if *cur >= *v => {}
+            _ => {
+                released.insert(k.clone(), *v);
+            }
+        }
+    }
+    normalize_doc(&StateDocument {
+        schema_version: 1,
+        seq: a.seq.max(b.seq),
+        writer: if a.writer >= b.writer {
+            a.writer.clone()
+        } else {
+            b.writer.clone()
+        },
+        claims: a.claims.iter().chain(b.claims.iter()).cloned().collect(),
+        messages: a.messages.iter().chain(b.messages.iter()).cloned().collect(),
+        holders: a.holders.iter().chain(b.holders.iter()).cloned().collect(),
+        released,
+    })
+}
+
+/// 给若干条声明立墓碑：墓碑值 = `max(现有值, claim.expiresAt)`。
+fn bury(s: &mut StateDocument, claims: &[Claim]) {
+    for c in claims {
+        if c.claim_id.is_empty() {
+            continue;
+        }
+        let exp = c.expires_at;
+        let cur = s.released.get(&c.claim_id).copied();
+        let v = match cur {
+            Some(cur) => cur.max(exp),
+            None => exp,
+        };
+        s.released.insert(c.claim_id.clone(), v);
+    }
+}
+
+/// 惰性清理（与 TS `sweep` 的确定性规则同源）：过期声明、按值到期的墓碑。
+/// 判据只看数据与传入的 t，不看本地计数/插入顺序 —— 同一份数据在任何副本上得到同一结果。
+fn sweep_state(s: &mut StateDocument, t: i64) {
+    s.claims.retain(|c| c.expires_at > t);
+    s.released.retain(|_, exp| *exp > t);
+}
+
+/// 一次写命令的结果（打印在事务**之外**：重试会多次执行 apply，不能重复打印）。
+enum WriteOutcome {
+    Claim { claim: Claim, paths: Vec<String> },
+    Release { released: usize },
+    Posted { msg_id: String, channel: String },
+    Conflict(Vec<ConflictInfo>),
+    None,
+}
+
+/// 写入失败是否属于"读之后文件被别人改过"，值得重读后重试（`save_state` 的守卫文案）。
+fn is_stale(e: &anyhow::Error) -> bool {
+    let m = format!("{e:#}");
+    m.contains("modified by another process") || m.contains("lost-update guard")
+}
+
+/// **写后验证**：落盘成功不等于这份内容还在盘上。重读主文件，确认写者戳还是自己；
+/// 是别人（非空且不同）⇒ 被覆盖了（false）⇒ 重读重合并重试；观测不到 ⇒ 不判定（true）。
+fn write_landed(path: &Path, writer: &str) -> bool {
+    if writer.is_empty() {
+        return true;
+    }
+    let Ok(text) = fs::read_to_string(path) else {
+        return true;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return true;
+    };
+    match v.get("writer").and_then(|w| w.as_str()) {
+        Some(w) if !w.is_empty() => w == writer,
+        _ => true,
+    }
+}
+
+/// 读改写事务（与 TS `state-core.mutate()` 同一个形状）：
+/// 读盘 → `merge_docs(盘上, 我的副本)` → sweep → 应用本次命令 → 写 → **写后验证**；
+/// 写失败（乐观并发冲突）或验证发现被覆盖时，重读 + 重合并 + 重试（最多 5 轮）。
+///
+/// 重试**不重跑 apply**：命令的效果已经留在 `applied` 里，下一轮只把它与新盘 join 起来再写
+/// （对 claim 重跑只是幂等，但对 post 会多出一条 seq 不同的留言 = 同一条消息落两条）。
+fn commit<F>(
+    state_file: &Path,
+    writer: &str,
+    seed: StateDocument,
+    mut apply: F,
+) -> Result<WriteOutcome>
+where
+    F: FnMut(&mut StateDocument) -> Result<WriteOutcome>,
+{
+    let mut replica = normalize_doc(&seed);
+    let mut applied: Option<StateDocument> = None;
+    let mut outcome: Option<WriteOutcome> = None;
+    for attempt in 0..5 {
+        let loaded = load_state(state_file)?;
+        let mut next: StateDocument;
+        if let Some(prev) = applied.as_ref() {
+            next = merge_docs(&loaded.doc, prev);
+            next.writer = writer.to_string();
+            sweep_state(&mut next, now_ms());
+        } else {
+            // 「我的」= 盘上 ∪ 本实例的副本（半格 join）；盖上本次写者戳（apply 里的 id 从它取，
+            // 它同时是写后验证的判据）。
+            let mut mine = merge_docs(&loaded.doc, &replica);
+            mine.writer = writer.to_string();
+            sweep_state(&mut mine, now_ms());
+            replica = normalize_doc(&mine);
+            let out = apply(&mut mine)?;
+            if let WriteOutcome::Conflict(_) = out {
+                // 冲突分支**绝不写盘**：被挡回的命令没有产生任何该持久化的状态。
+                return Ok(out);
+            }
+            outcome = Some(out);
+            next = mine;
+        }
+        next.writer = writer.to_string();
+        applied = Some(next.clone());
+        match save_state(state_file, &next, loaded.raw.as_deref()) {
+            Ok(()) => {}
+            Err(e) if is_stale(&e) && attempt < 4 => continue,
+            Err(e) => return Err(e),
+        }
+        // 先把本次结果留在 applied（已在上方），再验证：验证失败时下一轮就是
+        // merge(新盘, 我的结果) —— 我的改动不会被丢掉。
+        if write_landed(state_file, writer) {
+            return Ok(outcome.unwrap_or(WriteOutcome::None));
+        }
+    }
+    anyhow::bail!(
+        "State file {} is busy: could not land a merged write after 5 attempts. No partial state \
+         was left behind; re-run the command.",
+        state_file.display()
+    )
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let state_file = cli.file.unwrap_or_else(resolve_default_state_file);
-    // 加载时的原始字节必须一路带到保存点，作为丢失更新守卫的基准。
-    let LoadedState {
-        doc: mut state,
-        raw: loaded_raw,
-    } = load_state(&state_file)?;
+    // 初始快照：读命令直接用它；写命令把它当「我的副本」的起点交给 commit（commit 内部会重读）。
+    let LoadedState { doc: mut state, raw: _ } = load_state(&state_file)?;
     let now = now_ms();
     // 本进程的写者戳（单元 C）：所有 id 都带它，写盘前也把它盖在文档上（写后验证的判据）。
     let writer = writer_id();
 
-    // 惰性过期
+    // 惰性过期（读路径用；写路径由 commit 内的 sweep_state 再跑一遍）
     state.claims.retain(|c| c.expires_at > now);
-    // 墓碑的**确定性** GC（与 TS 侧 sweep 同一条规则）：原租约已过期 ⇒ 丢掉墓碑。
+    // 墓碑的**确定性** GC（与 TS 侧 sweep 同一条规则）。
     state.released.retain(|_, exp| *exp > now);
 
     match cli.command {
@@ -630,98 +976,117 @@ fn main() -> Result<()> {
                 Mode::Exclusive
             };
 
-            // 冲突检测。与 src/collab-core.ts 的 claim() 同源：
+            // 冲突检测 + 立声明，整段在 commit 的**合并基**上执行：重试用合并后的状态重新判，
+            // 所以不会因为盘上刚多出一条别人的声明而漏判。
+            // 与 src/collab-core.ts 的 claim() 同源：
             //   - read 是纯观测：他人 mode=read 的声明不排他（跳过），自己 mode=read 时整段跳过（不被挡）；
             //   - shared 同样跳过（会被独占挡，但不挡别人）。
-            let mut conflicts: Vec<ConflictInfo> = Vec::new();
-            if mode != Mode::Read {
-                for c in &state.claims {
-                    if c.holder_id == holder
-                        || c.expires_at <= now
-                        || c.mode == Mode::Shared
-                        || c.mode == Mode::Read
-                    {
-                        continue;
-                    }
-                    for p in &norm_paths {
-                        for cp in &c.paths {
-                            if overlaps(p, cp) {
-                                let remaining_sec = ((c.expires_at - now) / 1000).max(0);
-                                conflicts.push(ConflictInfo {
-                                    claim_id: c.claim_id.clone(),
-                                    holder_id: c.holder_id.clone(),
-                                    holder_name: Some(
-                                        c.holder_name.clone().unwrap_or_else(|| c.holder_id.clone()),
-                                    ),
-                                    path: p.clone(),
-                                    overlaps_with: cp.clone(),
-                                    mode: c.mode.clone(),
-                                    expires_at: c.expires_at,
-                                    remaining_sec: Some(remaining_sec),
-                                    // 与 TS conflictError() 同阈值：<=30s 建议等待，否则协商。
-                                    suggested_action: Some(if remaining_sec <= 30 {
-                                        SuggestedAction::Wait
-                                    } else {
-                                        SuggestedAction::Negotiate
-                                    }),
-                                });
-                                break;
+            let outcome = commit(&state_file, &writer, state, |s| {
+                let mut conflicts: Vec<ConflictInfo> = Vec::new();
+                if mode != Mode::Read {
+                    for c in &s.claims {
+                        if c.holder_id == holder
+                            || c.expires_at <= now
+                            || c.mode == Mode::Shared
+                            || c.mode == Mode::Read
+                        {
+                            continue;
+                        }
+                        for p in &norm_paths {
+                            for cp in &c.paths {
+                                if overlaps(p, cp) {
+                                    let remaining_sec = ((c.expires_at - now) / 1000).max(0);
+                                    conflicts.push(ConflictInfo {
+                                        claim_id: c.claim_id.clone(),
+                                        holder_id: c.holder_id.clone(),
+                                        holder_name: Some(
+                                            c.holder_name
+                                                .clone()
+                                                .unwrap_or_else(|| c.holder_id.clone()),
+                                        ),
+                                        path: p.clone(),
+                                        overlaps_with: cp.clone(),
+                                        mode: c.mode.clone(),
+                                        expires_at: c.expires_at,
+                                        remaining_sec: Some(remaining_sec),
+                                        // 与 TS conflictError() 同阈值：<=30s 建议等待，否则协商。
+                                        suggested_action: Some(if remaining_sec <= 30 {
+                                            SuggestedAction::Wait
+                                        } else {
+                                            SuggestedAction::Negotiate
+                                        }),
+                                    });
+                                    break;
+                                }
                             }
                         }
                     }
                 }
-            }
+                if !conflicts.is_empty() {
+                    return Ok(WriteOutcome::Conflict(conflicts));
+                }
 
-            if !conflicts.is_empty() {
-                if cli.json {
-                    let err = serde_json::json!({
-                        "ok": false,
-                        "error": "conflict",
-                        "conflicts": conflicts
-                    });
-                    println!("{}", serde_json::to_string_pretty(&err)?);
-                } else {
-                    eprintln!("❌ Claim Conflict detected!");
-                    for cf in &conflicts {
-                        eprintln!(
-                            "  - Path '{}' overlaps with '{}' held by {} (expires in {}s)",
-                            cf.path,
-                            cf.overlaps_with,
-                            cf.holder_id,
-                            cf.remaining_sec.unwrap_or(0)
+                // s.writer 已由 commit 盖成本次写者戳；Lamport：seq 是「盘上 ∪ 我的副本」的最大值 +1。
+                // seq 可能与另一个写者相撞，id 因 `@<writer>` 而仍然唯一。
+                s.seq += 1;
+                let claim_id = format!("c_{}@{}", s.seq, writer);
+                let claim = Claim {
+                    claim_id: claim_id.clone(),
+                    holder_id: holder.clone(),
+                    holder_name: Some(name.clone()),
+                    paths: norm_paths.clone(),
+                    mode: mode.clone(),
+                    ttl_sec: ttl,
+                    expires_at: now + ttl * 1000,
+                    note: note.clone(),
+                    created_at: now,
+                    readable: true,
+                    readers: Vec::new(),
+                    seq: s.seq,
+                    writer: writer.clone(),
+                };
+                s.claims.push(claim.clone());
+                Ok(WriteOutcome::Claim {
+                    claim,
+                    paths: norm_paths.clone(),
+                })
+            })?;
+
+            match outcome {
+                WriteOutcome::Conflict(conflicts) => {
+                    if cli.json {
+                        let err = serde_json::json!({
+                            "ok": false,
+                            "error": "conflict",
+                            "conflicts": conflicts
+                        });
+                        println!("{}", serde_json::to_string_pretty(&err)?);
+                    } else {
+                        eprintln!("❌ Claim Conflict detected!");
+                        for cf in &conflicts {
+                            eprintln!(
+                                "  - Path '{}' overlaps with '{}' held by {} (expires in {}s)",
+                                cf.path,
+                                cf.overlaps_with,
+                                cf.holder_id,
+                                cf.remaining_sec.unwrap_or(0)
+                            );
+                        }
+                        eprintln!("💡 Suggestion: wait for lease expiration or negotiate via collab_board");
+                    }
+                    std::process::exit(1);
+                }
+                WriteOutcome::Claim { claim, paths } => {
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&claim)?);
+                    } else {
+                        println!(
+                            "✅ Successfully claimed [{}] for paths: {:?}",
+                            claim.claim_id, paths
                         );
                     }
-                    eprintln!("💡 Suggestion: wait for lease expiration or negotiate via collab_board");
                 }
-                std::process::exit(1);
-            }
-
-            state.seq += 1;
-            state.writer = writer.clone();
-            // Lamport + 写者戳：seq 可能与另一个写者相撞，id 因 `@<writer>` 而仍然唯一。
-            let claim_id = format!("c_{}@{}", state.seq, writer);
-            let claim = Claim {
-                claim_id: claim_id.clone(),
-                holder_id: holder.clone(),
-                holder_name: Some(name.clone()),
-                paths: norm_paths.clone(),
-                mode,
-                ttl_sec: ttl,
-                expires_at: now + ttl * 1000,
-                note,
-                created_at: now,
-                readable: true,
-                readers: Vec::new(),
-                seq: state.seq,
-                writer: writer.clone(),
-            };
-            state.claims.push(claim.clone());
-            save_state(&state_file, &state, loaded_raw.as_deref())?;
-
-            if cli.json {
-                println!("{}", serde_json::to_string_pretty(&claim)?);
-            } else {
-                println!("✅ Successfully claimed [{}] for paths: {:?}", claim_id, norm_paths);
+                _ => unreachable!("claim commit returns Claim or Conflict"),
             }
         }
         Commands::Release {
@@ -729,40 +1094,42 @@ fn main() -> Result<()> {
             paths,
             holder,
         } => {
-            let before = state.claims.len();
-            // 单元 C：release 不再"从数组里删掉就完事"，而是**立墓碑**（claimId -> 原 expiresAt）。
-            // 删除在 join 下不单调：另一份还握着旧副本的写者会把这条声明并回盘上；墓碑才单调。
-            let mut buried: Vec<(String, i64)> = Vec::new();
-            if let Some(cid) = claim_id {
-                for c in state.claims.iter().filter(|c| c.claim_id == cid && c.holder_id == holder) {
-                    buried.push((c.claim_id.clone(), c.expires_at));
+            let outcome = commit(&state_file, &writer, state, |s| {
+                // 单元 C：release 不再"从数组里删掉就完事"，而是**立墓碑**。
+                // 删除在 join 下不单调：另一份还握着旧副本的写者会把这条声明并回盘上；墓碑才单调。
+                let mut buried: Vec<Claim> = Vec::new();
+                if let Some(cid) = claim_id.as_deref() {
+                    for c in s
+                        .claims
+                        .iter()
+                        .filter(|c| c.claim_id == cid && c.holder_id == holder)
+                    {
+                        buried.push(c.clone());
+                    }
+                    s.claims
+                        .retain(|c| !(c.claim_id == cid && c.holder_id == holder));
+                } else if !paths.is_empty() {
+                    let npaths: Vec<String> = paths.iter().filter_map(|p| norm_path(p)).collect();
+                    for c in s.claims.iter().filter(|c| {
+                        c.holder_id == holder
+                            && c.paths.iter().any(|cp| npaths.iter().any(|p| overlaps(p, cp)))
+                    }) {
+                        buried.push(c.clone());
+                    }
+                    s.claims.retain(|c| {
+                        !(c.holder_id == holder
+                            && c.paths.iter().any(|cp| npaths.iter().any(|p| overlaps(p, cp))))
+                    });
+                } else {
+                    anyhow::bail!("claim_id or paths required for release");
                 }
-                state.claims.retain(|c| !(c.claim_id == cid && c.holder_id == holder));
-            } else if !paths.is_empty() {
-                let npaths: Vec<String> = paths.iter().filter_map(|p| norm_path(p)).collect();
-                for c in state.claims.iter().filter(|c| {
-                    c.holder_id == holder
-                        && c.paths.iter().any(|cp| npaths.iter().any(|p| overlaps(p, cp)))
-                }) {
-                    buried.push((c.claim_id.clone(), c.expires_at));
-                }
-                state.claims.retain(|c| {
-                    !(c.holder_id == holder
-                        && c.paths.iter().any(|cp| npaths.iter().any(|p| overlaps(p, cp))))
-                });
-            } else {
-                anyhow::bail!("claim_id or paths required for release");
+                let released = buried.len();
+                bury(s, &buried);
+                Ok(WriteOutcome::Release { released })
+            })?;
+            if let WriteOutcome::Release { released } = outcome {
+                println!("Released {} claim(s)", released);
             }
-            let released = before - state.claims.len();
-            state.writer = writer.clone();
-            for (id, exp) in &buried {
-                let cur = state.released.get(id).copied();
-                if cur.is_none() || *exp > cur.unwrap_or(i64::MIN) {
-                    state.released.insert(id.clone(), *exp);
-                }
-            }
-            save_state(&state_file, &state, loaded_raw.as_deref())?;
-            println!("Released {} claim(s)", released);
         }
         Commands::Board {
             post,
@@ -772,21 +1139,27 @@ fn main() -> Result<()> {
             limit,
         } => {
             if let Some(body) = post {
-                state.seq += 1;
-                state.writer = writer.clone();
-                let msg = Message {
-                    msg_id: format!("m_{}@{}", state.seq, writer),
-                    seq: state.seq,
-                    channel: channel.clone(),
-                    author,
-                    ts: now,
-                    body,
-                    reply_to: None,
-                    writer: writer.clone(),
-                };
-                state.messages.push(msg.clone());
-                save_state(&state_file, &state, loaded_raw.as_deref())?;
-                println!("Posted message [{}] to #{}", msg.msg_id, channel);
+                let outcome = commit(&state_file, &writer, state, |s| {
+                    s.seq += 1;
+                    let msg = Message {
+                        msg_id: format!("m_{}@{}", s.seq, writer),
+                        seq: s.seq,
+                        channel: channel.clone(),
+                        author: author.clone(),
+                        ts: now,
+                        body: body.clone(),
+                        reply_to: None,
+                        writer: writer.clone(),
+                    };
+                    s.messages.push(msg.clone());
+                    Ok(WriteOutcome::Posted {
+                        msg_id: msg.msg_id,
+                        channel: channel.clone(),
+                    })
+                })?;
+                if let WriteOutcome::Posted { msg_id, channel } = outcome {
+                    println!("Posted message [{}] to #{}", msg_id, channel);
+                }
             } else {
                 // 游标是复合值 (seq, writer)：数字 --since 解释为 (since, "")，与 TS 侧同一条判据
                 // （不漏；seq 恰好等于 since 且带写者戳的记录会被再送一遍）。
@@ -1230,6 +1603,183 @@ mod tests {
         assert!(lock_is_stale(&lock_path), "a dead holder's lock is stale");
         fs::write(&lock_path, "not-a-pid").unwrap();
         assert!(lock_is_stale(&lock_path), "an unparsable lock is stale");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- 单元 D：黄金语料（TS ↔ Rust 防漂移）与 CLI 合并写路径 ----
+
+    /// 测试用通用声明构造。
+    fn full_claim(id: &str, holder: &str, paths: &[&str], writer: &str, seq: i64, exp: i64) -> Claim {
+        Claim {
+            claim_id: id.into(),
+            holder_id: holder.into(),
+            paths: paths.iter().map(|s| s.to_string()).collect(),
+            mode: Mode::Exclusive,
+            ttl_sec: 1800,
+            expires_at: exp,
+            created_at: 1,
+            holder_name: Some(holder.into()),
+            note: None,
+            readable: true,
+            readers: vec![],
+            seq,
+            writer: writer.into(),
+        }
+    }
+
+    #[derive(Deserialize)]
+    struct GoldenCase {
+        name: String,
+        a: StateDocument,
+        b: StateDocument,
+        expected: String,
+    }
+
+    #[derive(Deserialize)]
+    struct Golden {
+        cases: Vec<GoldenCase>,
+    }
+
+    /// 黄金语料（单元 D）：Rust 的 `merge_docs` 必须与 TS 现算的 `expected` **逐字节相同**。
+    /// 这是同一算法两份实现的防漂移机制：改了 TS 不重跑语料 ⇒ TS 测试红；重跑了 Rust 没跟上 ⇒ 这里红。
+    /// 逐字节比较把**字段顺序**也钉住了（Rust 结构体的键顺序必须与 TS normalizeDoc 的插入顺序一致）。
+    #[test]
+    fn test_merge_golden_corpus_matches_ts() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/merge-golden.json");
+        let raw = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let g: Golden = serde_json::from_str(&raw).expect("parse merge-golden.json");
+        assert!(g.cases.len() >= 12, "corpus too small: {}", g.cases.len());
+        for c in &g.cases {
+            let got = serde_json::to_string(&merge_docs(&c.a, &c.b)).expect("serialize merged");
+            assert_eq!(got, c.expected, "case {}: merged bytes differ from the TS corpus", c.name);
+            let swapped = serde_json::to_string(&merge_docs(&c.b, &c.a)).expect("serialize swapped");
+            assert_eq!(swapped, c.expected, "case {}: commutativity bytes differ", c.name);
+            let idem = serde_json::to_string(&normalize_doc(&c.a)).expect("serialize normalized");
+            let idem2 = serde_json::to_string(&merge_docs(&c.a, &c.a)).expect("serialize idempotent");
+            assert_eq!(idem2, idem, "case {}: idempotence", c.name);
+        }
+    }
+
+    /// 「插件先写、CLI 再写」：CLI 的写必须把盘上插件的记录并进来。
+    /// 负向对照见 `test_negative_control_whole_file_overwrite_loses_plugin_update`。
+    #[test]
+    fn test_cli_merge_keeps_plugin_update() {
+        let dir = unique_tmp_dir("cli-merge-plugin");
+        let path = dir.join("state.json");
+        // 盘上：插件已经写好的文档（含它的一条声明），写者戳是 plugin-1。
+        let plugin_doc = StateDocument {
+            seq: 1,
+            writer: "plugin-1".into(),
+            claims: vec![full_claim("c_1@plugin-1", "agent:P", &["src/p/"], "plugin-1", 1, 9_999_999_999_999)],
+            ..Default::default()
+        };
+        fs::write(&path, serde_json::to_string(&plugin_doc).unwrap()).unwrap();
+
+        // CLI 进程在插件写之前就把盘读成了空（seed 为空），随后才写自己的声明。
+        let out = commit(&path, "cli-w", StateDocument::default(), |s| {
+            s.seq += 1;
+            let c = full_claim(
+                &format!("c_{}@cli-w", s.seq),
+                "cli:user",
+                &["src/c/"],
+                "cli-w",
+                s.seq,
+                9_999_999_999_999,
+            );
+            s.claims.push(c.clone());
+            Ok(WriteOutcome::Claim { claim: c, paths: vec!["src/c/".into()] })
+        })
+        .expect("commit must succeed");
+        assert!(matches!(out, WriteOutcome::Claim { .. }));
+
+        let back: StateDocument = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let ids: Vec<&str> = back.claims.iter().map(|c| c.claim_id.as_str()).collect();
+        assert!(ids.contains(&"c_1@plugin-1"), "plugin record must survive the CLI write: {ids:?}");
+        assert!(ids.iter().any(|i| i.ends_with("@cli-w")), "CLI record must be present: {ids:?}");
+        assert_eq!(back.writer, "cli-w", "the landed writer stamp is the CLI's own");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 负向对照（RED）：退回"读 → 改 → 整份覆盖"（不 merge）⇒ 插件的记录确实被覆盖掉。
+    /// 这正是单元 D 要堵的那条旧 CLI 写路径。
+    #[test]
+    fn test_negative_control_whole_file_overwrite_loses_plugin_update() {
+        let dir = unique_tmp_dir("cli-neg-overwrite");
+        let path = dir.join("state.json");
+        let plugin_doc = StateDocument {
+            seq: 1,
+            writer: "plugin-1".into(),
+            claims: vec![full_claim("c_1@plugin-1", "agent:P", &["src/p/"], "plugin-1", 1, 9_999_999_999_999)],
+            ..Default::default()
+        };
+        fs::write(&path, serde_json::to_string(&plugin_doc).unwrap()).unwrap();
+
+        // 旧写路径：拿 CLI 自己那份（空 seed + 自己的声明）整份替换。
+        let doc = StateDocument {
+            seq: 1,
+            writer: "cli-w".into(),
+            claims: vec![full_claim("c_1@cli-w", "cli:user", &["src/c/"], "cli-w", 1, 9_999_999_999_999)],
+            ..Default::default()
+        };
+        fs::write(&path, serde_json::to_string(&doc).unwrap()).unwrap();
+
+        let back: StateDocument = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(back.claims.len(), 1, "RED: the overwrite leaves only the CLI's record");
+        assert_eq!(back.claims[0].claim_id, "c_1@cli-w");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 「CLI 先写、插件再写」：插件做一次 **merge(盘上, 自己的副本)** 的正常写 ⇒ 两边都在；
+    /// 负向对照（同一测试内）：插件整份覆盖自己的副本 ⇒ CLI 的记录丢。
+    #[test]
+    fn test_cli_first_then_plugin_merge_keeps_both() {
+        let dir = unique_tmp_dir("cli-first-plugin-second");
+        let path = dir.join("state.json");
+        // CLI 先写（走 commit）。
+        commit(&path, "cli-w", StateDocument::default(), |s| {
+            s.seq += 1;
+            let c = full_claim(
+                &format!("c_{}@cli-w", s.seq),
+                "cli:user",
+                &["src/c/"],
+                "cli-w",
+                s.seq,
+                9_999_999_999_999,
+            );
+            s.claims.push(c.clone());
+            Ok(WriteOutcome::Claim { claim: c, paths: vec!["src/c/".into()] })
+        })
+        .expect("CLI commit must succeed");
+
+        // 插件随后写：副本是它在 CLI 写之前读到的空盘，但它会先 merge(盘上, 副本)。
+        let plugin_replica = StateDocument::default();
+        let loaded: StateDocument = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let mut next = merge_docs(&loaded, &plugin_replica);
+        next.writer = "plugin-1".into();
+        next.seq += 1;
+        next.claims.push(full_claim(
+            &format!("c_{}@plugin-1", next.seq),
+            "agent:P",
+            &["src/p/"],
+            "plugin-1",
+            next.seq,
+            9_999_999_999_999,
+        ));
+        fs::write(&path, serde_json::to_string(&next).unwrap()).unwrap();
+        let back: StateDocument = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let writers: Vec<&str> = back.claims.iter().map(|c| c.writer.as_str()).collect();
+        assert!(writers.contains(&"cli-w") && writers.contains(&"plugin-1"), "both must survive: {writers:?}");
+
+        // 负向对照（RED）：插件不合并、拿自己的副本整份覆盖 ⇒ CLI 的记录丢。
+        let neg = dir.join("neg.json");
+        let mut own = StateDocument::default();
+        own.writer = "plugin-1".into();
+        own.seq = 1;
+        own.claims.push(full_claim("c_1@plugin-1", "agent:P", &["src/p/"], "plugin-1", 1, 9_999_999_999_999));
+        fs::write(&neg, serde_json::to_string(&own).unwrap()).unwrap();
+        let neg_back: StateDocument = serde_json::from_str(&fs::read_to_string(&neg).unwrap()).unwrap();
+        assert_eq!(neg_back.claims.len(), 1, "RED: whole-file overwrite loses the CLI record");
+        assert_eq!(neg_back.claims[0].writer, "plugin-1");
         fs::remove_dir_all(&dir).ok();
     }
 }

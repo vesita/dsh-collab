@@ -1,0 +1,883 @@
+{
+  "note": "黄金语料（单元 D）：由 tests/gen-merge-golden.mjs 从 lib/collab-core.js 的 mergeDocs 现算生成，勿手改。expected 是 TS JSON.stringify 的**逐字节**输出；TS 与 Rust 两侧都断言 自己产出与它相同。重跑：npm run build && node tests/gen-merge-golden.mjs",
+  "cases": [
+    {
+      "name": "empty-both",
+      "a": {
+        "schemaVersion": 1,
+        "seq": 0,
+        "writer": "",
+        "claims": [],
+        "messages": [],
+        "holders": [],
+        "released": {}
+      },
+      "b": {
+        "schemaVersion": 1,
+        "seq": 0,
+        "writer": "",
+        "claims": [],
+        "messages": [],
+        "holders": [],
+        "released": {}
+      },
+      "expected": "{\"schemaVersion\":1,\"seq\":0,\"writer\":\"\",\"claims\":[],\"messages\":[],\"holders\":[],\"released\":{}}"
+    },
+    {
+      "name": "duplicate-id-half-update-expiresAt",
+      "a": {
+        "schemaVersion": 1,
+        "seq": 0,
+        "writer": "",
+        "claims": [
+          {
+            "claimId": "c_1@wA",
+            "holderId": "agent:A",
+            "holderName": "A",
+            "paths": [
+              "src/a/"
+            ],
+            "mode": "exclusive",
+            "ttlSec": 1800,
+            "expiresAt": 12000,
+            "createdAt": 9000,
+            "note": "",
+            "readable": true,
+            "readers": [],
+            "seq": 1,
+            "writer": "wA"
+          }
+        ],
+        "messages": [],
+        "holders": [],
+        "released": {}
+      },
+      "b": {
+        "schemaVersion": 1,
+        "seq": 1,
+        "writer": "wB",
+        "claims": [
+          {
+            "claimId": "c_1@wA",
+            "holderId": "agent:A",
+            "holderName": "A",
+            "paths": [
+              "src/a/"
+            ],
+            "mode": "exclusive",
+            "ttlSec": 1800,
+            "expiresAt": 10000,
+            "createdAt": 9000,
+            "note": "",
+            "readable": true,
+            "readers": [
+              "agent:B"
+            ],
+            "seq": 1,
+            "writer": "wA"
+          }
+        ],
+        "messages": [],
+        "holders": [],
+        "released": {}
+      },
+      "expected": "{\"schemaVersion\":1,\"seq\":1,\"writer\":\"wB\",\"claims\":[{\"claimId\":\"c_1@wA\",\"holderId\":\"agent:A\",\"paths\":[\"src/a/\"],\"mode\":\"exclusive\",\"ttlSec\":1800,\"expiresAt\":12000,\"createdAt\":9000,\"holderName\":\"A\",\"note\":\"\",\"readable\":true,\"readers\":[\"agent:B\"],\"seq\":1,\"writer\":\"wA\"}],\"messages\":[],\"holders\":[],\"released\":{}}"
+    },
+    {
+      "name": "half-update-paths-readers-union",
+      "a": {
+        "schemaVersion": 1,
+        "seq": 0,
+        "writer": "",
+        "claims": [
+          {
+            "claimId": "c_1@wA",
+            "holderId": "agent:A",
+            "holderName": "A",
+            "paths": [
+              "src/a/"
+            ],
+            "mode": "exclusive",
+            "ttlSec": 1800,
+            "expiresAt": 10000,
+            "createdAt": 9000,
+            "note": "",
+            "readable": true,
+            "readers": [
+              "agent:X"
+            ],
+            "seq": 1,
+            "writer": "wA"
+          }
+        ],
+        "messages": [],
+        "holders": [],
+        "released": {}
+      },
+      "b": {
+        "schemaVersion": 1,
+        "seq": 0,
+        "writer": "",
+        "claims": [
+          {
+            "claimId": "c_1@wA",
+            "holderId": "agent:A",
+            "holderName": "A",
+            "paths": [
+              "src/b/"
+            ],
+            "mode": "exclusive",
+            "ttlSec": 1800,
+            "expiresAt": 10000,
+            "createdAt": 9000,
+            "note": "",
+            "readable": true,
+            "readers": [
+              "agent:Y"
+            ],
+            "seq": 1,
+            "writer": "wA"
+          }
+        ],
+        "messages": [],
+        "holders": [],
+        "released": {}
+      },
+      "expected": "{\"schemaVersion\":1,\"seq\":0,\"writer\":\"\",\"claims\":[{\"claimId\":\"c_1@wA\",\"holderId\":\"agent:A\",\"paths\":[\"src/a/\",\"src/b/\"],\"mode\":\"exclusive\",\"ttlSec\":1800,\"expiresAt\":10000,\"createdAt\":9000,\"holderName\":\"A\",\"note\":\"\",\"readable\":true,\"readers\":[\"agent:X\",\"agent:Y\"],\"seq\":1,\"writer\":\"wA\"}],\"messages\":[],\"holders\":[],\"released\":{}}"
+    },
+    {
+      "name": "createdAt-takes-min",
+      "a": {
+        "schemaVersion": 1,
+        "seq": 0,
+        "writer": "",
+        "claims": [
+          {
+            "claimId": "c_1@wA",
+            "holderId": "agent:A",
+            "holderName": "A",
+            "paths": [
+              "src/a/"
+            ],
+            "mode": "exclusive",
+            "ttlSec": 1800,
+            "expiresAt": 10000,
+            "createdAt": 9000,
+            "note": "",
+            "readable": true,
+            "readers": [],
+            "seq": 1,
+            "writer": "wA"
+          }
+        ],
+        "messages": [],
+        "holders": [],
+        "released": {}
+      },
+      "b": {
+        "schemaVersion": 1,
+        "seq": 0,
+        "writer": "",
+        "claims": [
+          {
+            "claimId": "c_1@wA",
+            "holderId": "agent:A",
+            "holderName": "A",
+            "paths": [
+              "src/a/"
+            ],
+            "mode": "exclusive",
+            "ttlSec": 1800,
+            "expiresAt": 10000,
+            "createdAt": 8000,
+            "note": "",
+            "readable": true,
+            "readers": [],
+            "seq": 1,
+            "writer": "wA"
+          }
+        ],
+        "messages": [],
+        "holders": [],
+        "released": {}
+      },
+      "expected": "{\"schemaVersion\":1,\"seq\":0,\"writer\":\"\",\"claims\":[{\"claimId\":\"c_1@wA\",\"holderId\":\"agent:A\",\"paths\":[\"src/a/\"],\"mode\":\"exclusive\",\"ttlSec\":1800,\"expiresAt\":10000,\"createdAt\":8000,\"holderName\":\"A\",\"note\":\"\",\"readable\":true,\"readers\":[],\"seq\":1,\"writer\":\"wA\"}],\"messages\":[],\"holders\":[],\"released\":{}}"
+    },
+    {
+      "name": "tombstone-beats-claim",
+      "a": {
+        "schemaVersion": 1,
+        "seq": 0,
+        "writer": "",
+        "claims": [],
+        "messages": [],
+        "holders": [],
+        "released": {
+          "c_1@wA": 12000
+        }
+      },
+      "b": {
+        "schemaVersion": 1,
+        "seq": 0,
+        "writer": "",
+        "claims": [
+          {
+            "claimId": "c_1@wA",
+            "holderId": "agent:A",
+            "holderName": "A",
+            "paths": [
+              "src/a/"
+            ],
+            "mode": "exclusive",
+            "ttlSec": 1800,
+            "expiresAt": 10000,
+            "createdAt": 9000,
+            "note": "",
+            "readable": true,
+            "readers": [],
+            "seq": 1,
+            "writer": "wA"
+          }
+        ],
+        "messages": [],
+        "holders": [],
+        "released": {}
+      },
+      "expected": "{\"schemaVersion\":1,\"seq\":0,\"writer\":\"\",\"claims\":[],\"messages\":[],\"holders\":[],\"released\":{\"c_1@wA\":12000}}"
+    },
+    {
+      "name": "tombstone-value-takes-max",
+      "a": {
+        "schemaVersion": 1,
+        "seq": 0,
+        "writer": "",
+        "claims": [],
+        "messages": [],
+        "holders": [],
+        "released": {
+          "c_1@wA": 12000,
+          "c_2@wA": 5000
+        }
+      },
+      "b": {
+        "schemaVersion": 1,
+        "seq": 0,
+        "writer": "",
+        "claims": [],
+        "messages": [],
+        "holders": [],
+        "released": {
+          "c_1@wA": 15000,
+          "c_3@wA": 8000
+        }
+      },
+      "expected": "{\"schemaVersion\":1,\"seq\":0,\"writer\":\"\",\"claims\":[],\"messages\":[],\"holders\":[],\"released\":{\"c_1@wA\":15000,\"c_2@wA\":5000,\"c_3@wA\":8000}}"
+    },
+    {
+      "name": "tombstone-filters-claims-in-same-doc",
+      "a": {
+        "schemaVersion": 1,
+        "seq": 0,
+        "writer": "",
+        "claims": [
+          {
+            "claimId": "c_1@wA",
+            "holderId": "agent:A",
+            "holderName": "A",
+            "paths": [
+              "src/a/"
+            ],
+            "mode": "exclusive",
+            "ttlSec": 1800,
+            "expiresAt": 10000,
+            "createdAt": 9000,
+            "note": "",
+            "readable": true,
+            "readers": [],
+            "seq": 1,
+            "writer": "wA"
+          }
+        ],
+        "messages": [],
+        "holders": [],
+        "released": {
+          "c_1@wA": 12000
+        }
+      },
+      "b": {
+        "schemaVersion": 1,
+        "seq": 0,
+        "writer": "",
+        "claims": [],
+        "messages": [],
+        "holders": [],
+        "released": {}
+      },
+      "expected": "{\"schemaVersion\":1,\"seq\":0,\"writer\":\"\",\"claims\":[],\"messages\":[],\"holders\":[],\"released\":{\"c_1@wA\":12000}}"
+    },
+    {
+      "name": "seq-collision-two-writers",
+      "a": {
+        "schemaVersion": 1,
+        "seq": 5,
+        "writer": "",
+        "claims": [
+          {
+            "claimId": "c_5@wA",
+            "holderId": "agent:A",
+            "holderName": "A",
+            "paths": [
+              "src/a/"
+            ],
+            "mode": "exclusive",
+            "ttlSec": 1800,
+            "expiresAt": 10000,
+            "createdAt": 9000,
+            "note": "",
+            "readable": true,
+            "readers": [],
+            "seq": 5,
+            "writer": "wA"
+          }
+        ],
+        "messages": [],
+        "holders": [],
+        "released": {}
+      },
+      "b": {
+        "schemaVersion": 1,
+        "seq": 5,
+        "writer": "",
+        "claims": [
+          {
+            "claimId": "c_5@wB",
+            "holderId": "agent:A",
+            "holderName": "A",
+            "paths": [
+              "src/b/"
+            ],
+            "mode": "exclusive",
+            "ttlSec": 1800,
+            "expiresAt": 10000,
+            "createdAt": 9000,
+            "note": "",
+            "readable": true,
+            "readers": [],
+            "seq": 5,
+            "writer": "wB"
+          }
+        ],
+        "messages": [],
+        "holders": [],
+        "released": {}
+      },
+      "expected": "{\"schemaVersion\":1,\"seq\":5,\"writer\":\"\",\"claims\":[{\"claimId\":\"c_5@wA\",\"holderId\":\"agent:A\",\"paths\":[\"src/a/\"],\"mode\":\"exclusive\",\"ttlSec\":1800,\"expiresAt\":10000,\"createdAt\":9000,\"holderName\":\"A\",\"note\":\"\",\"readable\":true,\"readers\":[],\"seq\":5,\"writer\":\"wA\"},{\"claimId\":\"c_5@wB\",\"holderId\":\"agent:A\",\"paths\":[\"src/b/\"],\"mode\":\"exclusive\",\"ttlSec\":1800,\"expiresAt\":10000,\"createdAt\":9000,\"holderName\":\"A\",\"note\":\"\",\"readable\":true,\"readers\":[],\"seq\":5,\"writer\":\"wB\"}],\"messages\":[],\"holders\":[],\"released\":{}}"
+    },
+    {
+      "name": "readable-false-wins",
+      "a": {
+        "schemaVersion": 1,
+        "seq": 0,
+        "writer": "",
+        "claims": [
+          {
+            "claimId": "c_1@wA",
+            "holderId": "agent:A",
+            "holderName": "A",
+            "paths": [
+              "src/a/"
+            ],
+            "mode": "exclusive",
+            "ttlSec": 1800,
+            "expiresAt": 10000,
+            "createdAt": 9000,
+            "note": "",
+            "readable": true,
+            "readers": [],
+            "seq": 1,
+            "writer": "wA"
+          }
+        ],
+        "messages": [],
+        "holders": [],
+        "released": {}
+      },
+      "b": {
+        "schemaVersion": 1,
+        "seq": 0,
+        "writer": "",
+        "claims": [
+          {
+            "claimId": "c_1@wA",
+            "holderId": "agent:A",
+            "holderName": "A",
+            "paths": [
+              "src/a/"
+            ],
+            "mode": "exclusive",
+            "ttlSec": 1800,
+            "expiresAt": 10000,
+            "createdAt": 9000,
+            "note": "",
+            "readable": false,
+            "readers": [],
+            "seq": 1,
+            "writer": "wA"
+          }
+        ],
+        "messages": [],
+        "holders": [],
+        "released": {}
+      },
+      "expected": "{\"schemaVersion\":1,\"seq\":0,\"writer\":\"\",\"claims\":[{\"claimId\":\"c_1@wA\",\"holderId\":\"agent:A\",\"paths\":[\"src/a/\"],\"mode\":\"exclusive\",\"ttlSec\":1800,\"expiresAt\":10000,\"createdAt\":9000,\"holderName\":\"A\",\"note\":\"\",\"readable\":false,\"readers\":[],\"seq\":1,\"writer\":\"wA\"}],\"messages\":[],\"holders\":[],\"released\":{}}"
+    },
+    {
+      "name": "mode-takes-string-max",
+      "a": {
+        "schemaVersion": 1,
+        "seq": 0,
+        "writer": "",
+        "claims": [
+          {
+            "claimId": "c_1@wA",
+            "holderId": "agent:A",
+            "holderName": "A",
+            "paths": [
+              "src/a/"
+            ],
+            "mode": "exclusive",
+            "ttlSec": 1800,
+            "expiresAt": 10000,
+            "createdAt": 9000,
+            "note": "",
+            "readable": true,
+            "readers": [],
+            "seq": 1,
+            "writer": "wA"
+          }
+        ],
+        "messages": [],
+        "holders": [],
+        "released": {}
+      },
+      "b": {
+        "schemaVersion": 1,
+        "seq": 0,
+        "writer": "",
+        "claims": [
+          {
+            "claimId": "c_1@wA",
+            "holderId": "agent:A",
+            "holderName": "A",
+            "paths": [
+              "src/a/"
+            ],
+            "mode": "shared",
+            "ttlSec": 1800,
+            "expiresAt": 10000,
+            "createdAt": 9000,
+            "note": "",
+            "readable": true,
+            "readers": [],
+            "seq": 1,
+            "writer": "wA"
+          }
+        ],
+        "messages": [],
+        "holders": [],
+        "released": {}
+      },
+      "expected": "{\"schemaVersion\":1,\"seq\":0,\"writer\":\"\",\"claims\":[{\"claimId\":\"c_1@wA\",\"holderId\":\"agent:A\",\"paths\":[\"src/a/\"],\"mode\":\"shared\",\"ttlSec\":1800,\"expiresAt\":10000,\"createdAt\":9000,\"holderName\":\"A\",\"note\":\"\",\"readable\":true,\"readers\":[],\"seq\":1,\"writer\":\"wA\"}],\"messages\":[],\"holders\":[],\"released\":{}}"
+    },
+    {
+      "name": "unsorted-input-normalized",
+      "a": {
+        "schemaVersion": 1,
+        "seq": 3,
+        "writer": "",
+        "claims": [
+          {
+            "claimId": "c_3@wA",
+            "holderId": "agent:A",
+            "holderName": "A",
+            "paths": [
+              "src/c/"
+            ],
+            "mode": "exclusive",
+            "ttlSec": 1800,
+            "expiresAt": 10000,
+            "createdAt": 9000,
+            "note": "",
+            "readable": true,
+            "readers": [],
+            "seq": 3,
+            "writer": "wA"
+          },
+          {
+            "claimId": "c_1@wA",
+            "holderId": "agent:A",
+            "holderName": "A",
+            "paths": [
+              "src/a/"
+            ],
+            "mode": "exclusive",
+            "ttlSec": 1800,
+            "expiresAt": 10000,
+            "createdAt": 9000,
+            "note": "",
+            "readable": true,
+            "readers": [],
+            "seq": 1,
+            "writer": "wA"
+          },
+          {
+            "claimId": "c_2@wB",
+            "holderId": "agent:A",
+            "holderName": "A",
+            "paths": [
+              "src/b/"
+            ],
+            "mode": "exclusive",
+            "ttlSec": 1800,
+            "expiresAt": 10000,
+            "createdAt": 9000,
+            "note": "",
+            "readable": true,
+            "readers": [],
+            "seq": 2,
+            "writer": "wB"
+          }
+        ],
+        "messages": [
+          {
+            "msgId": "m_3@wA",
+            "seq": 3,
+            "channel": "general",
+            "author": "agent:A",
+            "ts": 1000,
+            "body": "third",
+            "writer": "wA"
+          },
+          {
+            "msgId": "m_1@wA",
+            "seq": 1,
+            "channel": "general",
+            "author": "agent:A",
+            "ts": 1000,
+            "body": "first",
+            "writer": "wA"
+          }
+        ],
+        "holders": [
+          {
+            "holderId": "agent:C",
+            "name": "A",
+            "kind": "agent"
+          },
+          {
+            "holderId": "agent:A",
+            "name": "A",
+            "kind": "agent"
+          }
+        ],
+        "released": {}
+      },
+      "b": {
+        "schemaVersion": 1,
+        "seq": 0,
+        "writer": "",
+        "claims": [],
+        "messages": [],
+        "holders": [],
+        "released": {}
+      },
+      "expected": "{\"schemaVersion\":1,\"seq\":3,\"writer\":\"\",\"claims\":[{\"claimId\":\"c_1@wA\",\"holderId\":\"agent:A\",\"paths\":[\"src/a/\"],\"mode\":\"exclusive\",\"ttlSec\":1800,\"expiresAt\":10000,\"createdAt\":9000,\"holderName\":\"A\",\"note\":\"\",\"readable\":true,\"readers\":[],\"seq\":1,\"writer\":\"wA\"},{\"claimId\":\"c_2@wB\",\"holderId\":\"agent:A\",\"paths\":[\"src/b/\"],\"mode\":\"exclusive\",\"ttlSec\":1800,\"expiresAt\":10000,\"createdAt\":9000,\"holderName\":\"A\",\"note\":\"\",\"readable\":true,\"readers\":[],\"seq\":2,\"writer\":\"wB\"},{\"claimId\":\"c_3@wA\",\"holderId\":\"agent:A\",\"paths\":[\"src/c/\"],\"mode\":\"exclusive\",\"ttlSec\":1800,\"expiresAt\":10000,\"createdAt\":9000,\"holderName\":\"A\",\"note\":\"\",\"readable\":true,\"readers\":[],\"seq\":3,\"writer\":\"wA\"}],\"messages\":[{\"msgId\":\"m_1@wA\",\"seq\":1,\"channel\":\"general\",\"author\":\"agent:A\",\"ts\":1000,\"body\":\"first\",\"writer\":\"wA\"},{\"msgId\":\"m_3@wA\",\"seq\":3,\"channel\":\"general\",\"author\":\"agent:A\",\"ts\":1000,\"body\":\"third\",\"writer\":\"wA\"}],\"holders\":[{\"holderId\":\"agent:A\",\"name\":\"A\",\"kind\":\"agent\"},{\"holderId\":\"agent:C\",\"name\":\"A\",\"kind\":\"agent\"}],\"released\":{}}"
+    },
+    {
+      "name": "holders-join-lastSeen-proc",
+      "a": {
+        "schemaVersion": 1,
+        "seq": 0,
+        "writer": "",
+        "claims": [],
+        "messages": [],
+        "holders": [
+          {
+            "holderId": "agent:A",
+            "name": "A",
+            "kind": "agent",
+            "lastSeenAt": 100
+          }
+        ],
+        "released": {}
+      },
+      "b": {
+        "schemaVersion": 1,
+        "seq": 0,
+        "writer": "",
+        "claims": [],
+        "messages": [],
+        "holders": [
+          {
+            "holderId": "agent:A",
+            "name": "Z",
+            "kind": "agent",
+            "lastSeenAt": 200,
+            "sessionId": "s1",
+            "proc": "p1"
+          }
+        ],
+        "released": {}
+      },
+      "expected": "{\"schemaVersion\":1,\"seq\":0,\"writer\":\"\",\"claims\":[],\"messages\":[],\"holders\":[{\"holderId\":\"agent:A\",\"name\":\"Z\",\"kind\":\"agent\",\"sessionId\":\"s1\",\"lastSeenAt\":200,\"proc\":\"p1\"}],\"released\":{}}"
+    },
+    {
+      "name": "holders-different-ids-sorted",
+      "a": {
+        "schemaVersion": 1,
+        "seq": 0,
+        "writer": "",
+        "claims": [],
+        "messages": [],
+        "holders": [
+          {
+            "holderId": "agent:B",
+            "name": "B",
+            "kind": "agent"
+          }
+        ],
+        "released": {}
+      },
+      "b": {
+        "schemaVersion": 1,
+        "seq": 0,
+        "writer": "",
+        "claims": [],
+        "messages": [],
+        "holders": [
+          {
+            "holderId": "agent:A",
+            "name": "A",
+            "kind": "agent"
+          }
+        ],
+        "released": {}
+      },
+      "expected": "{\"schemaVersion\":1,\"seq\":0,\"writer\":\"\",\"claims\":[],\"messages\":[],\"holders\":[{\"holderId\":\"agent:A\",\"name\":\"A\",\"kind\":\"agent\"},{\"holderId\":\"agent:B\",\"name\":\"B\",\"kind\":\"agent\"}],\"released\":{}}"
+    },
+    {
+      "name": "messages-collision-and-distinct",
+      "a": {
+        "schemaVersion": 1,
+        "seq": 2,
+        "writer": "",
+        "claims": [],
+        "messages": [
+          {
+            "msgId": "m_1@wA",
+            "seq": 1,
+            "channel": "general",
+            "author": "agent:A",
+            "ts": 1000,
+            "body": "aa",
+            "writer": "wA"
+          },
+          {
+            "msgId": "m_2@wA",
+            "seq": 2,
+            "channel": "general",
+            "author": "agent:A",
+            "ts": 1000,
+            "body": "a2",
+            "writer": "wA"
+          }
+        ],
+        "holders": [],
+        "released": {}
+      },
+      "b": {
+        "schemaVersion": 1,
+        "seq": 2,
+        "writer": "",
+        "claims": [],
+        "messages": [
+          {
+            "msgId": "m_1@wA",
+            "seq": 1,
+            "channel": "general",
+            "author": "agent:A",
+            "ts": 1000,
+            "body": "zz",
+            "writer": "wA"
+          },
+          {
+            "msgId": "m_2@wB",
+            "seq": 2,
+            "channel": "general",
+            "author": "agent:A",
+            "ts": 1000,
+            "body": "b2",
+            "writer": "wB"
+          }
+        ],
+        "holders": [],
+        "released": {}
+      },
+      "expected": "{\"schemaVersion\":1,\"seq\":2,\"writer\":\"\",\"claims\":[],\"messages\":[{\"msgId\":\"m_1@wA\",\"seq\":1,\"channel\":\"general\",\"author\":\"agent:A\",\"ts\":1000,\"body\":\"zz\",\"writer\":\"wA\"},{\"msgId\":\"m_2@wA\",\"seq\":2,\"channel\":\"general\",\"author\":\"agent:A\",\"ts\":1000,\"body\":\"a2\",\"writer\":\"wA\"},{\"msgId\":\"m_2@wB\",\"seq\":2,\"channel\":\"general\",\"author\":\"agent:A\",\"ts\":1000,\"body\":\"b2\",\"writer\":\"wB\"}],\"holders\":[],\"released\":{}}"
+    },
+    {
+      "name": "top-level-seq-writer-take-max",
+      "a": {
+        "schemaVersion": 1,
+        "seq": 3,
+        "writer": "wA",
+        "claims": [],
+        "messages": [],
+        "holders": [],
+        "released": {}
+      },
+      "b": {
+        "schemaVersion": 1,
+        "seq": 7,
+        "writer": "wB",
+        "claims": [],
+        "messages": [],
+        "holders": [],
+        "released": {}
+      },
+      "expected": "{\"schemaVersion\":1,\"seq\":7,\"writer\":\"wB\",\"claims\":[],\"messages\":[],\"holders\":[],\"released\":{}}"
+    },
+    {
+      "name": "mixed-everything",
+      "a": {
+        "schemaVersion": 1,
+        "seq": 9,
+        "writer": "wA",
+        "claims": [
+          {
+            "claimId": "c_9@wA",
+            "holderId": "agent:A",
+            "holderName": "A",
+            "paths": [
+              "src/z/"
+            ],
+            "mode": "exclusive",
+            "ttlSec": 1800,
+            "expiresAt": 10000,
+            "createdAt": 9000,
+            "note": "",
+            "readable": true,
+            "readers": [],
+            "seq": 9,
+            "writer": "wA"
+          },
+          {
+            "claimId": "c_4@wA",
+            "holderId": "agent:A",
+            "holderName": "A",
+            "paths": [
+              "src/a/"
+            ],
+            "mode": "exclusive",
+            "ttlSec": 1800,
+            "expiresAt": 10000,
+            "createdAt": 9000,
+            "note": "",
+            "readable": true,
+            "readers": [],
+            "seq": 4,
+            "writer": "wA"
+          }
+        ],
+        "messages": [
+          {
+            "msgId": "m_9@wA",
+            "seq": 9,
+            "channel": "general",
+            "author": "agent:A",
+            "ts": 1000,
+            "body": "nine",
+            "writer": "wA"
+          }
+        ],
+        "holders": [
+          {
+            "holderId": "agent:A",
+            "name": "A",
+            "kind": "agent",
+            "lastSeenAt": 10
+          }
+        ],
+        "released": {
+          "c_7@wB": 30000
+        }
+      },
+      "b": {
+        "schemaVersion": 1,
+        "seq": 8,
+        "writer": "wB",
+        "claims": [
+          {
+            "claimId": "c_4@wA",
+            "holderId": "agent:A",
+            "holderName": "A",
+            "paths": [
+              "src/b/"
+            ],
+            "mode": "exclusive",
+            "ttlSec": 1800,
+            "expiresAt": 10000,
+            "createdAt": 9000,
+            "note": "",
+            "readable": false,
+            "readers": [
+              "agent:X"
+            ],
+            "seq": 4,
+            "writer": "wA"
+          },
+          {
+            "claimId": "c_8@wB",
+            "holderId": "agent:A",
+            "holderName": "A",
+            "paths": [
+              "src/y/"
+            ],
+            "mode": "exclusive",
+            "ttlSec": 1800,
+            "expiresAt": 10000,
+            "createdAt": 9000,
+            "note": "",
+            "readable": true,
+            "readers": [],
+            "seq": 8,
+            "writer": "wB"
+          }
+        ],
+        "messages": [
+          {
+            "msgId": "m_9@wA",
+            "seq": 9,
+            "channel": "general",
+            "author": "agent:A",
+            "ts": 1000,
+            "body": "nine",
+            "writer": "wA"
+          }
+        ],
+        "holders": [
+          {
+            "holderId": "agent:A",
+            "name": "Z",
+            "kind": "agent",
+            "lastSeenAt": 20
+          }
+        ],
+        "released": {
+          "c_7@wB": 25000
+        }
+      },
+      "expected": "{\"schemaVersion\":1,\"seq\":9,\"writer\":\"wB\",\"claims\":[{\"claimId\":\"c_4@wA\",\"holderId\":\"agent:A\",\"paths\":[\"src/a/\",\"src/b/\"],\"mode\":\"exclusive\",\"ttlSec\":1800,\"expiresAt\":10000,\"createdAt\":9000,\"holderName\":\"A\",\"note\":\"\",\"readable\":false,\"readers\":[\"agent:X\"],\"seq\":4,\"writer\":\"wA\"},{\"claimId\":\"c_8@wB\",\"holderId\":\"agent:A\",\"paths\":[\"src/y/\"],\"mode\":\"exclusive\",\"ttlSec\":1800,\"expiresAt\":10000,\"createdAt\":9000,\"holderName\":\"A\",\"note\":\"\",\"readable\":true,\"readers\":[],\"seq\":8,\"writer\":\"wB\"},{\"claimId\":\"c_9@wA\",\"holderId\":\"agent:A\",\"paths\":[\"src/z/\"],\"mode\":\"exclusive\",\"ttlSec\":1800,\"expiresAt\":10000,\"createdAt\":9000,\"holderName\":\"A\",\"note\":\"\",\"readable\":true,\"readers\":[],\"seq\":9,\"writer\":\"wA\"}],\"messages\":[{\"msgId\":\"m_9@wA\",\"seq\":9,\"channel\":\"general\",\"author\":\"agent:A\",\"ts\":1000,\"body\":\"nine\",\"writer\":\"wA\"}],\"holders\":[{\"holderId\":\"agent:A\",\"name\":\"Z\",\"kind\":\"agent\",\"lastSeenAt\":20}],\"released\":{\"c_7@wB\":30000}}"
+    }
+  ]
+}
