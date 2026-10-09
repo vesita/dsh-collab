@@ -86,6 +86,14 @@ export function installStore(ctx: CollabContext): StateStore {
   //           'cannot overwrite existing "<p>" without reading it first'  (FS_NOT_OBSERVED)
   // 后者正是"并发方抢先创建了状态文件"的竞态：重读一次就能拿到 version 再写。
   // 只认精确文案，不用裸 /stale/i —— 它会命中路径里的 "stale" 字样。
+  //
+  // ⚠ **这个重试只保证同进程串行；跨进程的 CAS 并不成立**（2026-10 审计实测，未修）：
+  //   dsh-fs-local 的串行化锁 `locks` 是 LocalFileSystem **实例**字段（只在本进程内排队），
+  //   而 replaceIfVersion 是 probe → rename：两个进程可以同时 probe 到同一个 version、
+  //   再各自 rename 成功，**后写者静默覆盖先写者**。实测（64MB 内容拉开窗口 + 文件屏障对齐）
+  //   4/4 轮两个写者都返回成功 = 丢更新。所以"并发时重读重试"这条保证**不要**跨进程引用。
+  //   （仓库自带 CLI 早先的 `fs::write` 非原子且零版本守卫，在防线上又开了一个洞；
+  //    已由 R3a 改成原子替换 + 跨进程写锁，见 crates/collab-cli/src/main.rs。）
   const stale = (e: unknown): boolean => {
     const err = e as { message?: string; code?: string } | null | undefined
     const code = err && typeof err.code === 'string' ? err.code : ''
