@@ -142,7 +142,7 @@ export function installTools(ctx: CollabContext, store: StateStore, push: PushAp
         op: { type: 'string', enum: ['claim', 'release', 'list', 'overview', 'status', 'heartbeat', 'wait', 'reap'], description: 'claim 声明 / release 释放 / list 全部 / overview 占用全景 / status 查路径 / heartbeat 续租 / wait 等待路径释放 / reap 显式回收僵尸声明（默认 dry-run）' },
         paths: { type: 'array', items: { type: 'string' }, description: '项目相对路径；claim、status、wait 用；目录以 / 结尾表示整棵子树' },
         claimId: { type: 'string', description: 'claim id，release/heartbeat 用' },
-        mode: { type: 'string', enum: ['exclusive', 'shared', 'read'], description: 'exclusive 独占（默认）；shared 声明共用但被独占挡住；read 只读观测，不排他也不被挡' },
+        mode: { type: 'string', enum: ['exclusive', 'shared', 'read'], description: 'exclusive 独占（默认）：会与已在场的 exclusive 与 shared 都冲突并返回冲突清单（让你协商/等待/换路径，0.14.0 起不再静默抢占共享方）；shared 声明共用：与已在场的 shared 不冲突、被他人的 exclusive 挡住；read 只读观测，不排他也不被挡' },
         readable: { type: 'boolean', description: 'claim 用：他人是否可读这些路径，默认 true；false 表示他人读取也要先协商（写入对非持有者始终要协商）' },
         ttlSec: { type: 'number', description: '租约秒数（5-86400），默认 1800' },
         timeoutMs: { type: 'number', description: 'wait 用，最多等待毫秒，默认 30000' },
@@ -165,7 +165,7 @@ export function installTools(ctx: CollabContext, store: StateStore, push: PushAp
       properties: {
         op: { type: 'string', enum: ['post', 'read'], description: 'post 发消息 / read 增量读取' },
         channel: { type: 'string', description: '频道，默认 general；**精确匹配**的自由字符串（写什么就得按什么读，path: 频道与 claim 用同一套相对路径写法），未命中时返回会列出既有频道' },
-        body: { type: 'string', description: 'post 用，消息正文' },
+        body: { type: 'string', maxLength: 8000, description: 'post 用，消息正文。上限 8000 字符（与 collab-core 的 MESSAGE_BODY_MAX_CHARS 同值）；超限由 post() 以 bad-request 挡回且**整条不写入**，不静默截断' },
         replyTo: { type: 'string', description: '回复的 msgId' },
         since: { type: 'number', description: 'read 用：省略或 0 = 读最新 limit 条（tail）；>0 = 从该 seq 往后读 limit 条（forward，旧→新）。返回的 nextSince 是下一次的游标' },
         limit: { type: 'number', description: 'read 用，最多条数，默认 50，上限 200' }

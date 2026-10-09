@@ -5,6 +5,10 @@
 >
 > **怎么用**：挑选时优先看 §1（按修复性价比排序）。§4 是实测使用统计，§5 是刻意保留的设计取舍
 > （不是缺陷，但使用者应当知道）。§6 明确区分「实测」与「未验证」，不要把后者当结论。
+>
+> **旧文件名的读法（0.14.0）**：下面各条里出现的 `src/collab-plugin.host.ts` 是**当时**的动态形态源码，
+> 它已被删除：现在那份纯逻辑由 `scripts/build-host.mjs` 构建期把 `lib/collab-core.js` 原样内联进
+> `src/host-shell.js`，生成 `lib/collab-plugin.host.js`。行号是**写下当时的**，只作历史锚点。
 
 证据口径：`文件:行` 对应本次清理后的 `0.9.0` 树（`src/index.ts` 的单体在 0.9.0 被拆成 11 个模块，
 行号已随之重映射）。标「实测」的表示有代码路径或运行时输出为凭；标「一手」的是主 AI 在真实协作
@@ -187,6 +191,11 @@
 - **后果**：工具名、description、参数表几乎与包形态一致，但**少了功能 A/C/D 整条链**：
   没有写保护、没有访问通知、没有读者推送、没有随包技能。使用者按同样的文档操作，却得不到任何拦截。
 - **优化方向**：动态形态至少在工具 description 或返回值里标注「受限形态：无写保护 / 无通知」。
+- **0.14.0 复核更新**：写保护**已补** —— 宿主外壳现在接线 `tools/pre-execute`，判据直接调内联核心
+  （与包形态同源，含 0.14.0 的两处修正），两形态的 ask 文案逐字节对拍。**仍未接**：访问通知
+  （`tools/post-execute`）、读者推送、随包技能、官方 Agent Teams 的反向交叉预警 —— 它们要
+  `agent.inject` / `dsh-llm`，受限宿主里没有。另：宿主形态读不到 env/Config ⇒ `enforceWriteLock`
+  恒开、`DSH_COLLAB_NO_PROMPT_HINT` 无效。所以这条现在只剩"通知/技能那半边"成立。
 
 ### 2.16 设置卡片两项开关的影响面比卡片说的大【实测】
 
@@ -441,8 +450,8 @@
   不是锁（锁在 claims）…静默超过 24 小时后由下一次 sweep 回收」，没有 stale 则一个字段都不加
   （与 `otherProjects` / `teamTasks` 同一降级纪律）。负向对照在
   `tests/collab-hostcode-parity.mjs`：空状态 list 断言 `!('holdersNote' in data)`。
-- **仍未做**：名册照旧逐条返回（`STALE-VISIBLE` 那条测试明确要求 stale holder 可见），
-  所以那条返回的量级没变 —— 变的是它不再能被读成锁。
+- **仍未做（已被 0.14.0 做掉，见 §2.27）**：当时名册照旧逐条返回（`STALE-VISIBLE` 那条测试明确
+  要求 stale holder 可见），所以那条返回的量级没变 —— 变的是它不再能被读成锁。
 
 ### 2.26 句柄结束即删：推翻 W7（0.13.0，用户决策）
 
@@ -471,6 +480,69 @@
 - **测试**：`collab-auto-release.mjs` §8（释放 + 留痕 + 通知读者 + 与 idle 武装路径幂等）、
   `collab-integration.mjs` step 5-6、`collab-readers-push.mjs`、
   `collab-hostcode-parity.mjs`（两形态对拍）。
+
+### 2.27 名册行只靠 24h 计时器回收：句柄结束了、进程被杀了，行都还在（0.14.0 修）
+
+- **一手（用户提出）**：「为什么现在还是会有这么多锁？之前不是针对性修过这个 bug 吗？」
+  现场返回：`claims` 3 条（未过期 **2**，都是正当占用）、`holders` **56** 行 / 其中 52 行 `stale: true`。
+  —— 真锁一把都没多；用户看的是**名册**。但"这 52 行不该在"这个判断是**对的**，而且确实从没修过：
+  此前四次修复（0.9.8 reap / 0.9.10 循环终止 / 0.12.2 `holderRosterNote` / 0.13.0 句柄结束即删）
+  **动的都是声明（claim），一次也没碰过名册行**。
+- **根因**：名册行的生死挂在 `HOLDER_TTL_MS = 24h` 这个**计时器**上，不挂在会话句柄上。
+  三条证据：
+  1. 代码：唯一的删行口是 `sweep()` 的 `active || holderFresh(24h)`；`holder()` 只被 `claim`/`post` 调用，
+     `release`/`heartbeat` 都不刷 `lastSeenAt`；
+  2. 探针（跑在运行中的已安装副本上）：`dropHolder()` 执行后 holders 行 **1 → 1**，一行没删；
+  3. 现场反证：状态文件里 9 条「会话句柄已结束（agent/disposed）」留言，对回名册行 ——
+     **5/5 条超过 24h 的行都被 TTL 收走了，4/4 条 24h 内的行都还在**（且每次 dispose 都晚于该行 `lastSeenAt`）。
+     即 0.13.0 的"句柄结束即删"只删了声明，名册行照样躺满 24h。
+- **处置（0.14.0，五条一起做）**：
+  - **A**：`dropHolder()` 连名册行一起摘（调用点上 `releaseOnLoopEnd('disposed')` 已在**同一事务**里
+    删光未过期声明 ⇒ 摘行不可能藏住活锁）。不变量：**还有未过期声明就绝不摘行**
+    （否则出现"claims 有人、holders 没人"）。
+  - **B2**：名册行盖**进程身份章** `proc = <pid>:<开机节拍>`（`src/proc-id.ts`，读 `/proc/<pid>/stat` 第 22 字段；
+    带节拍是为了防 pid 复用）。`sweep()` 只保留"写它的那个进程还活着"的行 ⇒ **被杀的进程**
+    （本机 harness 重启就是 SIGKILL 整条 cgroup，既无 `status` 也无 `disposed`）留下的行，下一次
+    有人碰这个项目时就消失，不必等 24h。**判据不可用时一个也不收**（fail-closed，与 reap 同纪律）。
+  - **B**：`procStamping: true` 的形态里，没有章的行一律作废（升级前的旧行；下一次操作自动重新登记）。
+  - **C**：`list` 的名册**有界**返回（`HOLDER_VIEW_LIMIT = 12`）+ 恒带 `holdersTotal`，截断可察觉。
+  - **D**：留言正文加**字符**上限 `MESSAGE_BODY_MAX_CHARS = 8000`（SSOT 的 `Message.body.maxLength` 同值）；
+    超限由 `post()` 以 `bad-request` 挡回，**不静默截断**。只封条数（`MAX_MESSAGES`）会让状态"任意大"——
+    实测一条 5MB 的 body 原样落盘，`sweep()` 也不会缩小它。
+- **证据**：`tests/collab-proc-id.mjs`（真实 `/proc` 对拍 + 同 pid 两令牌的顺序无关性）、
+  `collab-inline-parity.mjs` 的 proc 语料（两形态逐输出）、`collab-e2e.mjs` T11/T12（**接线**端到端，
+  带负向对照：拿掉盖章/上界即红）、`collab-hostcode-parity.mjs` 的 12 行 / `holdersTotal` / `expiredCount` 断言；
+  D 由 `collab-pure-logic.mjs`（边界含 + SSOT 同值）与 `collab-integration.mjs`（超限不落盘）覆盖。
+- **残留（如实记，未做）**：
+  1. **TTL 是惰性的** ⇒ 没人碰的项目里死行能躺很久。实测本机 `arch-canvas` 8 行 @398–399h
+     （16.6 天）、`nanoSeek` 1 行 @406h —— 也就是说"24h 有界"在**墙钟**意义上不成立，B2 只在
+     下一次有人读写该项目时才生效。
+  2. **跨进程 CAS 不成立**：`mutate()` 的乐观并发依赖 `replaceIfVersion`，而 dsh-fs-local 的写锁是
+     **每实例**的、"probe → rename"两个进程可同时成功（实测 4/4 轮双 OK = 丢更新）。
+  3. **仓库自带的 Rust CLI** `save_state` 是 `fs::write`（`O_TRUNC` + write，**非原子**）且**零版本守卫**，
+     与插件共享同一状态文件：实测 6 个并发 CLI claim 只剩 1 条；一次大文件写入期间并发读者观测到
+     文件长度 **0**（随后 `load` 的 JSON.parse 失败 → 自愈分支把活状态覆盖成 `init()`）。
+
+### 2.28 后来的 exclusive 静默压掉已在场的 shared（0.14.0 改为「允许协商」，用户决策）
+
+- **一手（审计发现）**：A 先 `claim shared` 占住 `src/`，B 随后 `claim exclusive` 同一路径 ——
+  `claim()` 的冲突扫描里有一句无条件 `c.mode === 'shared' → continue`，于是 B **静默获准**。
+  代价：B 的独占一生效，A 的写入立刻被门控硬拒（本部署 `ask` 即 `deny`），而"冲突"这件事
+  **双方都没看见** —— 后来者反客为主。
+- **当时的理由（成文在 `src/gate.ts`）**：shared 按定义是"声明共用"，两个共享方不该互相挡死。
+  这句对**执行层**成立，对**取得层**不成立：允许 B 拿 exclusive 恰恰会让 A 被挡死。
+- **决策（用户）**：「按照更合理的方式实现，变成允许协商的模式」。判据改成**由本请求的意图决定**：
+  - 请求 `exclusive` ⇒ 与已在场的 `exclusive` **和 `shared`** 都冲突；
+  - 请求 `shared` ⇒ 只与已在场的 `exclusive` 冲突（与 shared 不冲突，0.9.x 语义保持）；
+  - `read` ⇒ 一律不冲突。
+  冲突不是硬失败：返回的 `ConflictInfo` 已带 `suggestedAction(wait|negotiate)`、`holderName`、
+  `remainingSec`、`overlapsWith` —— 协商所需的全部信息。
+- **一处刻意的不对称（别再当漂移修掉）**：`tests/collab-access-gate.mjs` 里原本有一条
+  「writeGate 阻塞 ≡ claim() 冲突」的**逐例等价**断言，它把旧策略写成了等价式。现在改成：
+  对 exclusive 声明仍断言等价，对已在场的 shared 声明**显式断言 `gate=放行 且 claim=冲突`** ——
+  **取得层比执行层严一档**。理由：执行层回答"我能不能写"，取得层回答"我能不能把这块变成我的"。
+- **证据**：`tests/collab-pure-logic.mjs` 的四种组合（exclusive/shared/read × shared/exclusive）+
+  `collab-access-gate.mjs` 的一致性组；负向对照：把取得层改回无条件跳过 shared ⇒ 7 条断言红。
 
 ### 2.25 留言板「写了没人读、@ 了没人知道」（0.13.0 部分修）
 
@@ -524,6 +596,42 @@
    没有"体量"提示。
 5. **`release` 无参默认释放自己的全部声明**（现场 10 次缺参报错）、**`not-found` 不算失败**
    （现场 13 次）：都会改变锁语义，未动。
+
+---
+
+### 2.29 一次 claim 重写整份状态文件（97% 的字节是留言）（0.15.0 修）
+
+- **一手（实测盘面）**：状态文件是**一份 JSON、每次操作整份重写**。实测 `my-16d6093f0d1330.json`
+  共 82,248 B，其中**留言 79,815 B（97%）**、声明 1,313 B、名册 1,058 B —— 一次 `claim` 要写
+  82 KB，只为改 1.3 KB 的锁状态。留言上限当时只有**条数**（`MAX_MESSAGES = 2000`），
+  最坏可到约 2 MB。
+- **处置（0.15.0，R2：只改磁盘布局，不停用任何功能）**：
+  - 主文件 `<name>.json` = `{schemaVersion, seq, claims, holders}`；
+    留言旁挂 `<name>.messages.json` = `{schemaVersion, seq, messages}`。
+  - **内存里的 `StateDocument` 一个字不改**（SSOT `src/schema/collab.schema.json` 与三份派生物零改动），
+    只在**加载期合并**、**落盘时拆分**。
+  - 旧布局（主文件里仍有 `messages`）以主文件为准，**首次写盘搬进旁挂**并去掉主文件里那个键；
+    **只搬不删**，`collab_board op=read` 迁移前后返回一致。
+  - 写盘**先旁挂后主文件**（迁移那一次主文件里的键会被去掉，反过来一旦旁挂写失败就只剩内存里的留言）。
+  - **只在留言变化时才写旁挂**：判据是 `条数 | 首条 msgId | 末条 msgId` 指纹 —— 留言只有
+    "尾部追加"（`post`，msgId 唯一递增）与"头部截断"（`sweep`）两种变化，两者都必然改变条数或首条 msgId。
+  - `sweep()` 加**字节预算** `MAX_MESSAGES_BYTES = 256 KiB`，与条数上限**取先到者**、同丢最旧，
+    口径 = 每条留言 JSON 序列化的 UTF-8 字节之和（超限由 `swept.droppedMessages` 如实报数）。
+  - `otherProjects()` 排除 `*.messages.json`，不把旁挂当成一个项目。
+  - **两形态都改**：`src/store.ts`（包形态）与 `src/host-shell.js`（动态外壳）各自实现同一布局。
+- **实测（强，同一支探针 `/tmp/r2-probe.mjs` 跑改前/改后构建）**：留言 118 条 / 245,932 B 时，
+  一次 `claim` 的写盘字节数 **246,454 B（改前，1 次写）→ 391 B（改后稳态，1 次写，旁挂 0 次）**，
+  降幅 99.8%；升级后第一次操作含一次性迁移 246,092 B（旁挂）+ 391 B（主文件）。
+- **证据**：`tests/collab-state-split.mjs`（迁移不丢 / 写放大 / 字节预算 / 两形态同构 / `otherProjects`
+  排除，含把"只在变化时写旁挂"改成"每次都写"的负向对照 ⇒ 写放大断言变红）；
+  `collab-integration.mjs` 的留言截断断言已改为读**主文件 + 旁挂合并**的逻辑状态。
+- **残留（如实记，未做）**：
+  1. **两形态仍是两份存储层**（`src/store.ts` 与 `src/host-shell.js` 各一份 load/mutate），
+     本单元只保证布局同构，抽公共源仍是待办。
+  2. **混合版本并存**时（旧版本往主文件写 `messages`、新版本往旁挂写），加载期以主文件为准 ⇒
+     旁挂那一份会被下次写盘覆盖。单版本部署下不成立，跨版本滚动升级未处理。
+  3. 仓库自带的 Rust CLI `save_state` 仍是整份覆盖写（见 §2.27 残留 3），且它读的是主文件
+     —— 声明/名册仍读得到，留言它本来就只做备份，未改。
 
 ---
 

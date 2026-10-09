@@ -4,7 +4,9 @@ const { Context } = cordis
 import collabPlugin from '../lib/index.js'
 import os from 'node:os'
 import path from 'node:path'
+import fsp from 'node:fs/promises'
 import { projectStateFile, collabDir } from '../lib/paths.js'
+import { readStateMerged, sidecarPathOf } from './_harness.mjs'
 
 // 隔离：把状态目录指到临时 DSH_HOME，避免测试污染真实 ~/.dsh。
 // paths.ts 在**调用时**读取 process.env，所以在 import 之后设置依然生效。
@@ -145,7 +147,7 @@ const ok = (label, cond, extra) => {
   newFailures.push(label + (extra ? '  <-- ' + extra : ''))
   console.log('  FAIL ' + label + (extra ? '  <-- ' + extra : ''))
 }
-const bootWithFs = async (fsImpl, cwd) => {
+const bootStoreTools = async (fsImpl, cwd) => {
   const c = new Context()
   for (const serviceName of ['tools', 'timer', 'fs', 'sessions', 'sessionTitle']) c.provide(serviceName)
   const tools = []
@@ -155,8 +157,9 @@ const bootWithFs = async (fsImpl, cwd) => {
   c.set('sessions', { get: () => ({ header: { cwd } }) })
   c.set('sessionTitle', { get: () => ({ title: 'Heal Worker' }) })
   await c.plugin(collabPlugin)
-  return tools.find((t) => t.name === 'collab_lock')
+  return tools
 }
+const bootWithFs = async (fsImpl, cwd) => (await bootStoreTools(fsImpl, cwd)).find((t) => t.name === 'collab_lock')
 const healFs = (map, opts = {}) => ({
   resolve: async (p) => ({ displayPath: p, path: p }),
   stat: async (t) => (map.has(t.path) ? { version: 1 } : null),
@@ -242,10 +245,108 @@ const listWarning = async (lock, agentId) => {
   ok('item 3/B: 迁移失败不得动到旧文件本身', map.get(legacyPath) === legacyDoc)
 }
 
+// ════════════════════════════════════════════════════════════════════════
+// M2b：四条审计项的回归（每条都有能独立失败的断言 + 负向对照）
+// ════════════════════════════════════════════════════════════════════════
+
+// 11. item 1：只剩清理可做的一次 changed:false mutate 之后，**磁盘**上的
+//     过期声明 / 超限留言 / 死名册行确实降下来了（不能只看返回值）。
+{
+  const cwd = '/test/m2b/sweep-persist'
+  const key = projectStateFile(cwd)
+  const t = Date.now()
+  const doc = {
+    schemaVersion: 1,
+    seq: 2002,
+    claims: [{ claimId: 'c_expired', holderId: 'agent:ghost', paths: ['src/'], mode: 'read', ttlSec: 60, expiresAt: t - 1000, createdAt: t - 61000, note: '', readable: true, readers: [] }],
+    messages: Array.from({ length: 2001 }, (_, i) => ({ msgId: 'm_' + (i + 1), seq: i + 1, channel: 'general', author: 'agent:ghost', ts: t - 1000, body: 'x' })),
+    holders: [{ holderId: 'agent:ghost', name: 'Ghost', kind: 'agent', lastSeenAt: t - 30 * 3600 * 1000 }]
+  }
+  const map = new Map([[key, JSON.stringify(doc)]])
+  const lock = await bootWithFs(healFs(map), cwd)
+  // release 一个**不存在的路径**：op 自己 changed:false，这个事务里只剩 sweep 的清理可做。
+  const r = await lock.execute({ op: 'release', paths: ['nothing/'] }, { agent: { id: 'agent-m2b-sweep' } })
+  ok('item 1: 返回值形状不变（ok:true + data.released=[]）',
+    r.ok === true && Array.isArray(r.data && r.data.released) && r.data.released.length === 0, JSON.stringify(r))
+  const disk = readStateMerged((p) => map.get(p), key)
+  ok('item 1: 磁盘上的过期声明确实降下来（1 → 0）', disk.claims.length === 0, JSON.stringify(disk.claims))
+  ok('item 1: 磁盘上的留言确实压到 MAX_MESSAGES（2001 → 2000）', disk.messages.length === 2000, String(disk.messages.length))
+  // 0.15.0（R2）起这一条还要证明"压下来的结果落在**旁挂**那一半，而不是又写回主文件"。
+  ok('item 1: 主文件里没有 messages 键（留言已归旁挂）', !('messages' in JSON.parse(map.get(key))), Object.keys(JSON.parse(map.get(key))).join(','))
+  ok('item 1: 留言旁挂文件真的存在且装着 2000 条', (map.get(sidecarPathOf(key)) ? JSON.parse(map.get(sidecarPathOf(key))).messages.length : -1) === 2000, String(map.get(sidecarPathOf(key)) ? JSON.parse(map.get(sidecarPathOf(key))).messages.length : -1))
+  ok('item 1: 磁盘上的死名册行确实被清（1 → 0）', disk.holders.length === 0, JSON.stringify(disk.holders))
+  ok('item 1: 保留下来的正是最新一条', disk.messages[disk.messages.length - 1].msgId === 'm_2001', JSON.stringify(disk.messages[disk.messages.length - 1]))
+}
+
+// 12. item 2（落盘面）：超限 body 被 bad-request 挡回，**磁盘上什么都没有**；
+//     恰好等于上限的 body 通过并原文落盘。
+{
+  const { MESSAGE_BODY_MAX_CHARS } = await import('../lib/collab-core.js')
+  const cwd = '/test/m2b/body-limit'
+  const key = projectStateFile(cwd)
+  const map = new Map()
+  const tools = await bootStoreTools(healFs(map), cwd)
+  const board = tools.find((t) => t.name === 'collab_board')
+  const over = await board.execute({ op: 'post', body: 'x'.repeat(MESSAGE_BODY_MAX_CHARS + 1) }, { agent: { id: 'agent-m2b-body' } })
+  ok('item 2:「超限 body」被挡回且错误码是 bad-request', over.ok === false && over.error === 'bad-request', JSON.stringify(over))
+  ok('item 2:「超限 body」没有落盘（状态文件都没建）', !map.has(key), JSON.stringify([...map.keys()]))
+  const exact = await board.execute({ op: 'post', body: 'y'.repeat(MESSAGE_BODY_MAX_CHARS) }, { agent: { id: 'agent-m2b-body' } })
+  ok('item 2:「恰好等于上限」的 body 通过', exact.ok === true, JSON.stringify(exact))
+  const disk = readStateMerged((p) => map.get(p), key)
+  ok('item 2: 边界内的 body 原文落盘（长度 == 上限，未被截断）',
+    disk.messages.length === 1 && disk.messages[0].body.length === MESSAGE_BODY_MAX_CHARS, String(disk.messages[0].body.length))
+}
+
+// 13. item 3：损坏自愈只保留最近 3 份备份，且只删**自己命名规则**的文件。
+//     这一条走**真实文件系统**（清理是真的 unlink），不是假 map —— 假 map 看不见 node:fs 的删除。
+{
+  const cwd = '/test/m2b/backup-prune'
+  const key = projectStateFile(cwd)
+  const dir = path.dirname(key)
+  const base = path.basename(key)
+  const prefix = base + '.corrupt-'
+  await fsp.rm(dir, { recursive: true, force: true })
+  await fsp.mkdir(dir, { recursive: true })
+  await fsp.writeFile(key, 'not-json{{{')
+  for (const stamp of [1000, 2000, 3000, 4000]) await fsp.writeFile(path.join(dir, prefix + stamp), 'old-' + stamp)
+  const decoys = [
+    path.join(dir, 'someone-else.json.corrupt-9999'),   // 别人的备份：命名规则不同
+    path.join(dir, prefix + 'abc'),                     // 自己前缀、但后缀不是数字
+    path.join(dir, base + '.bak-123')                   // 非本插件命名（现场残留过的那类）
+  ]
+  for (const p of decoys) await fsp.writeFile(p, 'keep me')
+  const fsImpl = {
+    resolve: async (p) => ({ displayPath: p, path: p }),
+    stat: async (x) => { try { await fsp.stat(x.path); return { version: 1 } } catch (e) { return null } },
+    readText: async (x) => fsp.readFile(x.path, 'utf8'),
+    writeText: async (x, c) => { await fsp.mkdir(path.dirname(x.path), { recursive: true }); await fsp.writeFile(x.path, c) },
+    listDir: async (d) => {
+      const dp = typeof d === 'string' ? d : d.path
+      const names = await fsp.readdir(dp)
+      return names.map((n) => ({ name: n, type: 'file', target: { displayPath: path.join(dp, n), path: path.join(dp, n) } }))
+    },
+    processPath: (x) => x.path
+  }
+  const lock = await bootWithFs(fsImpl, cwd)
+  const w = await listWarning(lock, 'agent-m2b-prune')
+  ok('item 3: 清理是旁路 —— 自愈结果与 warning 不受影响', w.includes('状态文件损坏'), JSON.stringify(w))
+  const names = await fsp.readdir(dir)
+  const mine = names.filter((n) => n.startsWith(prefix) && /^\d+$/.test(n.slice(prefix.length)))
+  ok('item 3: 自己命名规则的备份被清到 ≤ 3 份', mine.length <= 3, JSON.stringify(mine))
+  const stamps = mine.map((n) => Number(n.slice(prefix.length))).sort((a, b) => b - a)
+  ok('item 3: 本次自愈写的最新备份被保留', stamps.length > 0 && stamps[0] > 4000, JSON.stringify(stamps))
+  ok('item 3: 被清掉的正是最旧的两份（1000 / 2000）', !names.includes(prefix + '1000') && !names.includes(prefix + '2000'), JSON.stringify(names))
+  ok('item 3: 保留的是最近三份（本次 + 4000 + 3000）', names.includes(prefix + '3000') && names.includes(prefix + '4000'), JSON.stringify(names))
+  for (const p of decoys) {
+    const exists = await fsp.stat(p).then(() => true, () => false)
+    ok('item 3: 不删不符合命名规则的文件（' + path.basename(p) + '）', exists)
+  }
+  await fsp.rm(dir, { recursive: true, force: true })
+}
+
 if (newFailures.length) {
   console.log('')
   for (const f of newFailures) console.log('NEW ASSERTION FAILED: ' + f)
   throw new Error(newFailures.length + ' new assertion(s) failed')
 }
-
 console.log('PASS: Cordis plugin integration test passed (0.1.5-rc.1 runtime)')

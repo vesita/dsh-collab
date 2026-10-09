@@ -38,6 +38,15 @@ import type {
 } from './contract.js'
 import type { StateStore } from './store.js'
 
+/**
+ * M1：释放/通知结果的诚实口径扩展 —— `NotifyOutcome` 的既有字段（`pushed` / `pushedVia` / …）
+ * 语义一字不动，**只补一条**机读 caveat `pushedNote`：`pushed` 仅保证消息进了读者的
+ * next-step 收件箱，不保证读者会看到（依据与后果见安装处闭包里的 `PUSHED_NOTE`）。
+ * contract.ts 不在本单元的改动范围，故扩展类型就地声明；运行时它真的挂在工具结果的
+ * `data.notify` 上（tools.ts 直接赋值，不重建对象）。
+ */
+export type NotifyOutcomeWithNote = NotifyOutcome & { pushedNote: string }
+
 /** 推送面：installPush() 对外暴露的东西（tools.ts 用它挂 release 后的通知）。 */
 export interface PushApi {
   /** 向受影响的读者推送"锁已释放"（或 op=reap 的"占用已被回收"），并把结果带回来（绝不抛）。 */
@@ -48,7 +57,7 @@ export interface PushApi {
     releaserAgent?: AgentLike,
     action?: 'release' | 'reap' | 'auto',
     graceSec?: number
-  ): Promise<NotifyOutcome>
+  ): Promise<NotifyOutcomeWithNote>
   /**
    * 循环终止自动释放（0.9.10）的告知：**两个群体分别投递**（见 contract 的 LoopEndReleaseOutcome）：
    *   1. 读者（正等这些路径的会话）—— 与 release 同一条投递面，只是文案说"自动释放"；
@@ -67,6 +76,11 @@ export interface PushApi {
    * 不新造通道、绝不冒充用户。**绝不抛**：拿不到 agent / 没有 inject 面 / inject 抛错都如实返回。
    */
   pushNotice(agent: AgentLike | undefined, text: string, label: string): PushOutcome
+  /**
+   * **仅供测试**：循环终止通知去重表的当前条目数。生产路径不消费它；它的存在只是为了
+   * 让"M1 第 3 条：size 不超过上限"能是一条**直接**断言，而不是只靠行为旁证。
+   */
+  debugLoopEndNoticeSize(): number
 }
 
 export function installPush(ctx: CollabContext, store: StateStore): PushApi {
@@ -76,6 +90,23 @@ export function installPush(ctx: CollabContext, store: StateStore): PushApi {
 
   // 通道名（notify.pushedVia[].channel 用）：**只剩一个**，投递面就是 agent.inject。
   const CHANNEL_INJECT: PushChannel = 'inject'
+
+  /**
+   * M1 第 1 条：投递口径的诚实说明（挂在结果 `notify.pushedNote` 上）。
+   *
+   * `pushed` 的既有含义**不变**（成功调用了 `agent.inject` 的 sessionId），但它被读成
+   * "已通知"是不诚实的：`agent.inject` 的契约是 `send(input, 'next-step', wakeup=false)`
+   * （实现 `dsh-agent-loop/lib/index.js:812-813`；对照 `:810` 的 `wake(input)` 才传 `true`），
+   * 消息只是**进了 next-step 收件箱**。只有下一次 step 检查 `this.inbox.hasPending`
+   * （`:1037`）时才取走并送进模型上下文；读者 idle 且此后无人唤醒它 ⇒ 消息一直停在收件箱，
+   * 可能永远不被模型看到；被 `cancel()` / `dispose()` 时 `this.inbox.clear()`（`:817`）
+   * 会把还没取走的整批直接丢弃。
+   *
+   * 本单元**不改投递通道、也不去唤醒读者**（那会打断对方回合，超出范围）：只把这条口径
+   * 如实标在每次推送结果上，供释放者与读者自己判断"到底通知到了没有"。
+   */
+  const PUSHED_NOTE = '收件箱口径：agent.inject 的契约是 wakeup=false，pushed 只表示消息已进入读者的 next-step 收件箱；读者 idle 且此后无人唤醒时不会被模型看到，cancel/dispose 会清空收件箱。'
+
 
   // 同一 (claimId, reader) 只推一次。
   // 用 claimId -> Set<reader> 的两级结构，**不**把两者拼成一个字符串：claimId 由插件生成、
@@ -89,16 +120,65 @@ export function installPush(ctx: CollabContext, store: StateStore): PushApi {
 
   // 0.9.11 降噪：循环终止自动释放**发给本人的**那条通知的合并窗口（见 notifyLoopEndRelease）。
   // 与上面的 pushedPairs 分工不同：那个按 (claimId, reader) 去重，重新 claim 会得到新的
-  // claimId 于是照发；这里按 holderId 在**时间窗口**内合并，专治"claim→release→claim"抖动。
+  // claimId 于是照发；这里按"holder + 本次释放的 claim 集合指纹"在**时间窗口**内合并，
+  // 专治"claim→release→claim"抖动。
+  // M1 第 4 条：**键必须带上本次释放的集合指纹**。旧实现只看 holderId+时间窗，于是同一 holder
+  // 在窗口内释放了两组**不同**的 claim 时，第二条提及另一些路径的告知被静默丢弃 ——
+  // 而旧注释却声称"内容一字不差"。现在只有"同一 holder 且本次释放的路径集合相同"才合并。
   // 本 map 住在 installPush 的闭包里 ⇒ 每个插件实例一份，测试之间天然隔离。
   const LOOP_END_NOTICE_DEDUP_MS = 60_000
   const LOOP_END_NOTICE_MAX_KEYS = 500
   const loopEndNoticeAt = new Map<string, number>()
 
-  /** 标记"这一对已推过"；返回 false 表示已经推过，跳过。 */
-  function markPushed(claimId: string, reader: string): boolean {
+  /**
+   * 发给本人的通知的**内容指纹**（M1 第 4 条）：同一 holder 在窗口内是否算"内容一字不差"，
+   * 取决于 `loopEndHolderNoticeParts` 实际用到的输入 —— holder 本人（holderId 已进外层键）、
+   * 宽限秒数、以及去重后的路径集合。所以指纹取"排序后的路径集合 + 宽限秒数"。
+   * re-claim 同一条路径会拿到新 claimId，但路径集合没变 ⇒ 仍然合并（保留 0.9.11 的抖动降噪）；
+   * 释放到**另一些**路径 ⇒ 指纹变 ⇒ 不再合并（修掉被静默丢弃的第二条）。
+   */
+  function releaseSetFingerprint(released: PublishedClaim[], graceSec: number): string {
+    const paths: string[] = []
+    for (const c of released) {
+      for (const p of (Array.isArray(c.paths) ? c.paths : [])) {
+        if (typeof p === 'string' && p && !paths.includes(p)) paths.push(p)
+      }
+    }
+    paths.sort()
+    return graceSec + '\u0000' + JSON.stringify(paths)
+  }
+
+  /**
+   * M1 第 3 条：让"有界"为真 —— 超过上限时**淘汰最旧的一条**（按记录的时间戳），
+   * 使 `loopEndNoticeAt.size` 恒 ≤ `LOOP_END_NOTICE_MAX_KEYS`。
+   * 旧实现在 `set` 之后才清理、且只删"已过 60s 窗口"的条目：触发那一刻刚 set 的整批 age=0
+   * 全保留，窗口内持续有 >500 个不同 holder 时该 map 无界增长，与"有界"的注释相反。
+   */
+  function trimLoopEndNotice(): void {
+    while (loopEndNoticeAt.size > LOOP_END_NOTICE_MAX_KEYS) {
+      let oldestKey: string | undefined
+      let oldestAt = Number.POSITIVE_INFINITY
+      for (const [k, ts] of loopEndNoticeAt) {
+        if (ts < oldestAt) { oldestAt = ts; oldestKey = k }
+      }
+      // 空 map 时 size 不可能 > 上限，这里只是防御（不给 `delete(undefined)` 之类留缝）。
+      if (oldestKey === undefined) break
+      loopEndNoticeAt.delete(oldestKey)
+    }
+  }
+
+  /** 只读判据：这一对是否**已经成功投递过**（用于跳过，绝不改变任何状态）。 */
+  function alreadyPushed(claimId: string, reader: string): boolean {
     const seen = pushedPairs.get(claimId)
-    if (seen && seen.has(reader)) return false
+    return !!(seen && seen.has(reader))
+  }
+
+  /**
+   * 记账"这一对已成功推过"（M1 第 5 条：**在投递成功之后**才调用）。
+   * 有界：**总对数**超过 PUSH_DEDUPE_MAX 时按插入顺序淘汰最旧的一对（与拆分前等价）。
+   */
+  function markPushed(claimId: string, reader: string): void {
+    const seen = pushedPairs.get(claimId)
     const group = seen || new Set<string>()
     if (!seen) pushedPairs.set(claimId, group)
     group.add(reader)
@@ -113,7 +193,6 @@ export function installPush(ctx: CollabContext, store: StateStore): PushApi {
         }
       }
     }
-    return true
   }
 
   /**
@@ -259,8 +338,8 @@ export function installPush(ctx: CollabContext, store: StateStore): PushApi {
     releaserAgent?: AgentLike,
     action: 'release' | 'reap' | 'auto' = 'release',
     graceSec: number = LOOP_END_GRACE_SEC_DEFAULT
-  ): Promise<NotifyOutcome> {
-    const out: NotifyOutcome = { readers: 0, pushed: [], skipped: [], pushedVia: [] }
+  ): Promise<NotifyOutcomeWithNote> {
+    const out: NotifyOutcomeWithNote = { readers: 0, pushed: [], skipped: [], pushedVia: [], pushedNote: PUSHED_NOTE }
     // 候选读者 = released 各 claim 上、能解析出 sessionId 且不是释放者的 (claim, reader)。
     // readersOf 已做归一（去重保序 + 过滤非字符串）。
     // 这三个变量**声明在 try 之外**：整体兜底 catch 要用它们把"尚未记账的候选"逐条补记进 skipped。
@@ -304,14 +383,18 @@ export function installPush(ctx: CollabContext, store: StateStore): PushApi {
           out.skipped.push({ sessionId: job.sessionId, reason: 'liveness-check-failed', error: liveness.error })
           continue
         }
-        // 幂等键 (claimId, reader) 仍然**先**记账：投递成功/失败都不再重投。
-        if (!markPushed(job.claim.claimId, job.reader)) {
+        // 幂等键 (claimId, reader)：先查、**投递成功之后才记账**（M1 第 5 条）。
+        // 旧实现在 pushOne 之前就记账，于是 `inject` 抛错后这一对已被记下 ⇒ 同 claimId 的后续
+        // 释放不再重试，而且重推会误报 'already-pushed'，把上次的真实失败原因（inject-failed）
+        // 抹掉。现在失败的那一对不记账，第二次释放会真的重试并如实报本次的原因。
+        if (alreadyPushed(job.claim.claimId, job.reader)) {
           out.skipped.push({ sessionId: job.sessionId, reason: 'already-pushed' })
           continue
         }
         const parts = releaseNoticeParts(job.claim, releaserName, action, graceSec)
         const r = pushOne(agents as AgentsLookupService, job.sessionId, parts)
         if (r.ok) {
+          markPushed(job.claim.claimId, job.reader)
           out.pushed.push(job.sessionId)
           out.pushedVia.push({ sessionId: job.sessionId, channel: CHANNEL_INJECT })
           continue
@@ -364,8 +447,11 @@ export function installPush(ctx: CollabContext, store: StateStore): PushApi {
    * 0.9.11 降噪：同一 holder 在 `LOOP_END_NOTICE_DEDUP_MS` 窗口内**反复**被自动释放时，
    * 发给本人的注入通知只发第一条，其余记 `error: 'deduped'`。**只合并通知，不合并证据** ——
    * 状态文件里的 `[自动释放]` 审计留言一条不少（那是取证用的账）。窗口存在的前提是：
-   * 收件人此刻多半还 idle，`agent.inject` 不唤醒 driver，所以它**还没读到**上一条，
-   * 内容又一字不差，重复注入只是往它的上下文里塞噪声。
+   * 收件人此刻多半还 idle，`agent.inject` 不唤醒 driver，所以它**还没读到**上一条，重复注入
+   * 只是往它的上下文里塞噪声。
+   * M1 第 4 条修正了这里原来不成立的断言：合并的条件不是"同一 holder"就够，而是"同一 holder
+   * **且本次释放的路径集合与宽限期相同**"（见 releaseSetFingerprint）—— 否则释放到另一些路径的
+   * 第二条会被静默丢弃，而正文其实并不"一字不差"。
    */
   async function notifyLoopEndRelease(
     released: PublishedClaim[],
@@ -381,20 +467,55 @@ export function installPush(ctx: CollabContext, store: StateStore): PushApi {
       const agents = ctx.get('agents') as AgentsLookupService | undefined
       if (!agents || typeof agents.get !== 'function') return { readers, holder: { ok: false, error: 'no-agents-service' } }
       const at = store.now()
-      const last = loopEndNoticeAt.get(holderId) || 0
+      // M1 第 4 条：键 = holder + 本次释放集合的指纹（内容相近才合并）。
+      const key = holderId + '\u0000' + releaseSetFingerprint(released, graceSec)
+      const last = loopEndNoticeAt.get(key) || 0
       if (last && at - last < LOOP_END_NOTICE_DEDUP_MS) {
         return { readers, holder: { ok: false, error: 'deduped' } }
       }
-      loopEndNoticeAt.set(holderId, at)
-      // 有界：只保留窗口内的条目，避免长跑进程里无界增长。
-      if (loopEndNoticeAt.size > LOOP_END_NOTICE_MAX_KEYS) {
-        for (const [k, ts] of loopEndNoticeAt) if (at - ts >= LOOP_END_NOTICE_DEDUP_MS) loopEndNoticeAt.delete(k)
-      }
+      loopEndNoticeAt.set(key, at)
+      // M1 第 3 条：真淘汰（超过上限逐出最旧），size 恒 ≤ LOOP_END_NOTICE_MAX_KEYS。
+      trimLoopEndNotice()
       holder = pushOne(agents, sessionId, loopEndHolderNoticeParts(holderName, released, graceSec))
     } catch (e) {
       holder = { ok: false, error: describeError(e) }
     }
     return { readers, holder }
+  }
+
+  /**
+   * M1 第 2 条：`agent/disposed` 路径的**如实记账**通道。
+   *
+   * 这条路径没有调用方 —— 它是事件回调，返回值无人接收，所以失败只能走日志。优先用注册进来的
+   * `logger` 服务（本插件的 `CollabContext` 契约没有声明它，故现场活取）；没有就用 cordis
+   * Context 自带的 `ctx.logger`（每个 Context 都有一个 LoggerService，实测
+   * `@deepseek-ai/cordis` 的实例带 `warn`/`info`/`error`）。两者都取不到时退化为**无害的空操作**：
+   * 那是宿主能力缺失，**不是"成功"** —— 这里绝不把失败伪装成成功。
+   *
+   * 记账内容带真实原因（写失败的错误文本 / mutate 返回的 ok:false 取值），便于从宿主日志回溯。
+   */
+  function reportInternal(scope: string, detail: string): void {
+    const line = '[dsh-collab] ' + scope + ': ' + detail
+    try {
+      const reg = ctx.get('logger') as { warn?: (m: string) => void } | undefined
+      if (reg && typeof reg.warn === 'function') { reg.warn(line); return }
+      const native = (ctx as unknown as { logger?: unknown }).logger
+      const warn = native && typeof (native as { warn?: unknown }).warn === 'function'
+        ? (native as { warn(m: string): void }).warn.bind(native)
+        : (typeof native === 'function' ? (native as (m: string) => void) : undefined)
+      if (warn) warn(line)
+    } catch (e) {}
+  }
+
+  /** mutate() 未返回可投递结果时，把它的真实状态压成一行（reportInternal 用）。 */
+  function describeMutateResult(res: unknown): string {
+    const r = res as { ok?: unknown; error?: unknown; message?: unknown } | null | undefined
+    if (!r || typeof r !== 'object') return 'result=' + String(r)
+    const parts = ['ok=' + String(r.ok)]
+    if (r.error !== undefined) parts.push('error=' + String(r.error))
+    if (r.message !== undefined) parts.push('message=' + String(r.message))
+    parts.push('released=' + (Array.isArray((r as { data?: { released?: unknown } }).data && (r as { data?: { released?: unknown } }).data!.released) ? 'array' : 'missing'))
+    return parts.join(' ')
   }
 
   ctx.on('agent/disposed', (payload: { agent?: { id?: string } }) => {
@@ -426,17 +547,24 @@ export function installPush(ctx: CollabContext, store: StateStore): PushApi {
             // 0.9.6：这条路径**不需要**"活 Agent 当 sender"了（子代理回退通道已删）——
             // 投递面是进程内解析每个读者自己的 agent 再 inject，与释放者是否还在无关。
             // 新通道下这里**照常如实投递**；解析不到的读者由 notifyReaders 自己记
-            // skipped.reason='agent-not-resolvable'（不是靠下面的兜底 catch 保证）。
+            // skipped.reason='agent-not-resolvable'。
             return notifyReaders(res.data.released as PublishedClaim[], holderId, releaserName)
           }
+          // M1 第 2 条：mutate **没报成功**（写冲突 / not-found / data 形状不对）同样是失败，
+          // 旧实现只用 `if (…ok===true…)` 接住成功分支、失败分支无声滑过 ⇒ 必须留痕。
+          reportInternal('agent/disposed', 'mutate 未返回可投递的 released：' + describeMutateResult(res))
         })
-        // 本路径**刻意保持静默**：dropHolder 写失败、或 notifyReaders 的异步拒绝，都不新增
-        // "内部错误上报"通道（那是一条新特性，不在本次清理范围）。原实现这里套着一个空的
-        // `try/catch`，紧挨着上面那句断言"读者会如实落到 skipped"的注释 —— 注释讲的是记账，
-        // 实现却是一个空 catch（而且是死代码：notifyReaders 是 async 函数，调用它本身不会同步抛，
-        // 异步拒绝走的是下面这个 .catch）。现在删掉死 catch，注释只保留为真的部分，矛盾消失。
-        .catch(() => {})
-    } catch (e) {}
+        // M1 第 2 条：把原来的空 `.catch(() => {})` 换成**如实记账**。
+        // 覆盖两类否则完全无痕的失败：mutate 的写盘拒绝（fs 写失败 / 乐观并发重试用尽），
+        // 以及 notifyReaders 的异步拒绝。没有 logger 面时 reportInternal 退化为空操作 ——
+        // 宿主能力缺失，不是"成功"。
+        .catch(e => {
+          reportInternal('agent/disposed', '异步链路失败（状态释放或读者通知）：' + describeError(e))
+        })
+    } catch (e) {
+      // 同步段（取 hname / 调 mutate）的意外：同样留痕，不再静默吞掉。
+      reportInternal('agent/disposed', '处理器同步段抛出：' + describeError(e))
+    }
   }, { global: true })
 
   /**
@@ -455,5 +583,5 @@ export function installPush(ctx: CollabContext, store: StateStore): PushApi {
     }
   }
 
-  return { notifyReaders, notifyLoopEndRelease, pushNotice }
+  return { notifyReaders, notifyLoopEndRelease, pushNotice, debugLoopEndNoticeSize: () => loopEndNoticeAt.size }
 }

@@ -1,13 +1,14 @@
 // src/paths.ts
 // 协作状态文件的**唯一路径事实源**：任何形态（包形态 index.ts / 动态宿主形态
-// collab-plugin.host.ts / CLI）都必须从这里（或其纯 JS 复刻）取绝对路径。
+// host-shell.js / CLI）都必须从这里（或其纯 JS 复刻）取绝对路径。
 //
 // 背景（实测，勿重新怀疑）：
 //   1. ctx.fs.resolve(p) 对**相对路径**的基址是**进程 cwd**，不是 HOME。
 //   2. `~` 完全不展开：fs.resolve('~/.dsh/...') 会在 HOME 下造一个名为 `~` 的目录。
 //   3. 绝对路径原样通过；fs.resolve(p, { cwd }) 的 cwd 选项有效。
 // 历史两处错误落点因此产生：
-//   - src/collab-plugin.host.ts 用字面量 '~/.dsh/collab/projects'
+//   - 动态宿主形态（当年的 src/collab-plugin.host.ts，0.14.0 起改为构建期生成的
+//     lib/collab-plugin.host.js）用字面量 '~/.dsh/collab/projects'
 //     ⇒ 真实数据被写进 <HOME>/~/.dsh/collab/projects/。
 //   - src/index.ts 用相对路径 '.dsh/collab/projects'（依赖进程 cwd）
 //     ⇒ dsh 从不同目录启动时，同一项目会写到互不相干的文件，跨会话可见性静默失效。

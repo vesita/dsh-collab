@@ -47,8 +47,8 @@
 // 它，声明只能等租约到期或 `op=reap`。
 //
 // 依赖：状态存取面（store）、推送面（push）、偏好读取面（prefs，来自 delegation）。
-// 接线在 src/index.ts；动态宿主形态在 src/collab-plugin.host.ts 内联了一份**只释放不投递**
-// 的等价实现（受限环境里没有 @deepseek-ai/dsh-llm，构造不出诚实来源的消息）。
+// 接线在 src/index.ts；动态宿主形态（src/host-shell.js，构建时内联同一份 collab-core）
+// 保留了**只释放不投递**的等价接线（受限环境里没有 @deepseek-ai/dsh-llm，构造不出诚实来源的消息）。
 
 import { releaseOnLoopEnd } from './collab-core.js'
 import type { AgentLike, AgentsLookupService, CollabContext } from './contract.js'

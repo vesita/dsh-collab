@@ -1,18 +1,20 @@
-// collab-plugin.host.ts
-// 自包含的 Cordis Host 插件源码（等价于动态插件 coll-1/pkg-9，当前运行版本）。
+// src/host-shell.js
+// 受限动态宿主形态的**外壳模板**（唯一事实源）。构建产物 lib/collab-plugin.host.js 由
+// scripts/build-host.mjs 从本文件 + lib/collab-core.js 生成；不要手改构建产物。
 //
-// 用法：
-//   import { hostCode } from './lib/collab-plugin.host.js'        // ESM（构建产物）
-//   cordis_define(code: { host: hostCode })                       // 作为 code.host
+// 这里只放**外壳**：inject/apply 接线、状态文件定位与读写（resolveStateDir /
+// targetFor / load / mutate）、会话血缘、工具注册、态势摘要接线、agent/status 与 agent/disposed 接线。
+// **纯逻辑一行都不写**：state 变换与渲染由 collab-core 提供，构建时在核心内联标记处
+// 内联 lib/collab-core.js（唯一事实源 src/collab-core.ts）—— 剥掉顶层 `export ` 后的
+// 整份源码，两形态因此逐字节同源。
 //
-// 注意：Cordis 动态插件的 code.host 不接受 import/打包，因此本文件内联了
-// 与 src/collab-core.ts 逻辑一致的纯逻辑部分。纯逻辑唯一事实源见 collab-core.ts；
-// 正式化进 host 组合后可直接 import 该核心模块消除重复。
-// 工具参数契约见 src/schema/collab.schema.json（JSON Schema v1）。
+// 为什么内联而不是 import：Cordis 动态插件的 code.host 是纯文本，不接受 import/打包。
+// 为什么内联得进来：lib/collab-core.js 完全自包含（0 个 import/require），也不引用 process/os。
+//
+// 注意：本文件是 JS 模板字面量，外壳里凡是要生成转义序列的地方，反斜杠必须写两个
+// （模板先吃掉一层）。内联进来的核心源码由 JSON.stringify 序列化，不受这一层影响。
 
-// hostCode 是纯 JavaScript 源码文本，直接作为 Cordis 动态插件的 code.host 使用，
-// 不参与 TypeScript 类型检查；只导出它的本模块是 TypeScript。
-export const hostCode: string = `
+export const hostShell = `
 return {
   inject: ['fs', 'timer'],
   apply(ctx) {
@@ -46,41 +48,6 @@ return {
       } catch (e) { stateDirCache = null }
       return stateDirCache
     }
-    const init = () => ({ schemaVersion: 1, seq: 0, claims: [], messages: [], holders: [] })
-    const seg = p => p.split('/').filter(Boolean)
-    const ov = (a, b) => { if (typeof a !== 'string' || typeof b !== 'string' || !a || !b) return false; const sa = seg(a), sb = seg(b), n = Math.min(sa.length, sb.length); for (let i = 0; i < n; i++) if (sa[i] !== sb[i]) return false; return true }
-    const norm = (p) => {
-      if (typeof p !== 'string' || !p.trim()) return null
-      let s = p.trim().replace(/\\\\/g, '/')
-      while (s.startsWith('./')) s = s.slice(2)
-      s = s.replace(/\\/{2,}/g, '/').replace(/^\\/+/, '')
-      const out = []
-      for (const x of s.split('/')) { if (!x || x === '.') continue; if (x === '..') out.pop(); else out.push(x) }
-      return out.length ? out.join('/') + (s.endsWith('/') ? '/' : '') : null
-    }
-    function hashProjectKey(str) {
-      let h1 = 0xdeadbeef ^ 0, h2 = 0x41c64e6d ^ 0
-      for (let i = 0, ch; i < str.length; i++) {
-        ch = str.charCodeAt(i)
-        h1 = Math.imul(h1 ^ ch, 2654435761)
-        h2 = Math.imul(h2 ^ ch, 1597334677)
-      }
-      h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909)
-      h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909)
-      return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(16).padStart(12, '0')
-    }
-    function storageNameFor(cwd) {
-      const normRoot = (cwd || '').trim().replace(/\\\\/g, '/').replace(/\\/+$/, '')
-      const parts = normRoot.split('/').filter(Boolean)
-      const base = (parts.length ? parts[parts.length - 1] : 'default').replace(/[^a-zA-Z0-9_-]/g, '_')
-      const hash = hashProjectKey(normRoot || 'default')
-      return base + '-' + hash + '.json'
-    }
-    // 与 collab-core 的 publish() 同形：readable / readers 归一后输出（缺字段 = true / []）。
-    // 动态宿主形态没有 pre/post-execute 接线（受限环境不注册事件），所以这两个字段在这里
-    // 只保证**形状对拍**，不承担门控/推送语义。
-    const hostReaders = c => { const raw = Array.isArray(c.readers) ? c.readers : []; const out = []; for (const x of raw) if (typeof x === 'string' && x && !out.includes(x)) out.push(x); return out }
-    const pub = c => ({ claimId: c.claimId, holderId: c.holderId, holderName: c.holderName, paths: c.paths, mode: c.mode, ttlSec: c.ttlSec, expiresAt: c.expiresAt, note: c.note, createdAt: c.createdAt, readable: c.readable !== false, readers: hostReaders(c) })
     // 写入失败是否属于"乐观并发冲突，值得重读后重试"。
     // 真实 ctx.fs 抛 FsError：code 是独立字段，message 里不含 code（实测文案见下），
     // 所以必须按 code 精确判定，且不要用裸 /stale/i（会命中路径里的 stale 字样）。
@@ -90,10 +57,9 @@ return {
       const m = String((e && e.message) || e)
       return /FS_STALE_VERSION|FS_NOT_OBSERVED|file changed since it was read|without reading it first|already exists/i.test(m)
     }
-    const conflict = cs => { const e = new Error('conflict'); e.collabConflict = true; e.conflicts = cs; return e }
     const withWarn = (data, warn) => (warn ? Object.assign({}, data, { warning: warn }) : data)
     // 把任意抛出物转成一行可读文本（warning 里要带真实原因，不能只写「失败了」）。
-    // 与包形态 store.ts 的 describeError 同语义（两形态各写一份，见 inline-parity 的说明）。
+    // 与包形态 store.ts 的 describeError 同语义（外壳层的小工具，受限宿主不能 import）。
     const describeError = e => {
       try {
         const m = e && typeof e === 'object' ? e.message : undefined
@@ -112,24 +78,44 @@ return {
       } catch (e) {}
       return null
     }
+    // ---- 磁盘布局（0.15.0，R2）：主文件 + 留言旁挂 ----
+    // 与包形态（src/store.ts）**同构**：内存里的 StateDocument 一个字不改，只是摊到磁盘上时分成
+    //   <name>.json          {schemaVersion, seq, claims, holders}  主文件（锁状态）
+    //   <name>.messages.json {schemaVersion, seq, messages}         旁挂（留言）
+    // 这样"锁操作只写 KB 级的主文件"在两种形态里都成立（实测 82,248 B 里 79,815 B 是留言）。
+    // seq 两边都写（claimId 与 msgId 共用），加载时取较大值。
+    const SIDECAR_EXT = '.messages.json'
+    const sidecarNameOf = fileName => (fileName.slice(-5) === '.json' ? fileName.slice(0, -5) + SIDECAR_EXT : fileName + SIDECAR_EXT)
+    const mainDocOf = s => ({ schemaVersion: s.schemaVersion, seq: s.seq, claims: s.claims, holders: s.holders })
+    const sideDocOf = s => ({ schemaVersion: s.schemaVersion, seq: s.seq, messages: s.messages })
+    // 留言指纹（判"这次要不要写旁挂"）：条数 | 首条 msgId | 末条 msgId。
+    // 判据可靠的理由**与包形态逐字同源**（见 src/store.ts 的 msgFingerprint）：留言只有
+    // "尾部追加"（post，msgId 递增唯一）与"头部截断"（sweep 的条数/字节上限）两种变化，
+    // 两者都必然改变条数或首条 msgId；指纹相同 ⇒ 条数与首尾 msgId 相同 ⇒ 中间条目也必然相同。
+    const msgFingerprint = msgs => msgs.length + '|' + (msgs.length ? msgs[0].msgId : '') + '|' + (msgs.length ? msgs[msgs.length - 1].msgId : '')
     async function targetFor(agentId, agent) {
       const cwd = await cwdOf(agentId, agent)
-      const fileName = storageNameFor(cwd)
+      // 文件名**只认核心的 projectStorageFileName**（唯一事实源 src/collab-core.ts，构建时内联）：
+      // 外壳曾经自带一份 storageNameFor，与核心异名同义、恰好落在对拍之外 —— 已删除。
+      const fileName = projectStorageFileName(cwd || 'default')
+      const sideName = sidecarNameOf(fileName)
       const dir = await resolveStateDir()
       if (dir) {
         // 绝对目录 + 绝对文件路径；fs.resolve 对绝对路径原样通过（实测）。
-        return { cwd: cwd, fileName: fileName, stateDir: dir, degraded: false, target: await fs.resolve(dir + '/' + fileName) }
+        return { cwd: cwd, fileName: fileName, stateDir: dir, degraded: false, target: await fs.resolve(dir + '/' + fileName), sidecar: await fs.resolve(dir + '/' + sideName) }
       }
       // 退化路径：解析不到 DSH 用户目录时，落到**会话 cwd** 下的项目内 .dsh-collab/。
       // 仅当连会话 cwd 都没有（控制台调用）时不存在任何绝对锚点，才省略 cwd（退回进程 cwd）。
       const opts = cwd ? { cwd: cwd } : undefined
       const target = await fs.resolve('.dsh-collab/' + fileName, opts)
+      // 旁挂与主文件用**同一套基址**解析（退化路径下 target 可能是相对路径，不能靠字符串拼绝对路径）。
+      const sidecar = await fs.resolve('.dsh-collab/' + sideName, opts)
       let stateDir = '.dsh-collab'
       try { stateDir = fs.processPath(await fs.resolve('.dsh-collab', opts)) } catch (e) {}
-      return { cwd: cwd, fileName: fileName, stateDir: stateDir, degraded: true, target: target }
+      return { cwd: cwd, fileName: fileName, stateDir: stateDir, degraded: true, target: target, sidecar: sidecar }
     }
     async function load(agentId, agent) {
-      const { cwd, target, stateDir, degraded } = await targetFor(agentId, agent)
+      const { cwd, target, sidecar, stateDir, degraded } = await targetFor(agentId, agent)
       let warn = cwd ? null : '状态文件落在默认位置（本会话没有 cwd），按项目隔离已失效'
       if (degraded) {
         const degradedWarn = '无法解析 DSH 用户目录（settings.prepareDocument 不可用或无效）；状态文件落在项目本地的 .dsh-collab/ 下，且不与其他启动形态共享'
@@ -159,10 +145,48 @@ return {
           migrateNotes.push('旧落点迁移失败：' + describeError(e))
         }
       }
-      if (!info) return { state: init(), version: null, target: target, stateDir: stateDir, warn: mergeWarn(null) }
+      // ---- 旁挂留言文件：**主文件在不在都读**（与包形态 store.ts 同构）----
+      let sideMessages = null
+      let sideVersion = null
+      let sideSeq = 0
+      try {
+        const sideInfo = await fs.stat(sidecar)
+        if (sideInfo) {
+          sideVersion = sideInfo.version
+          const sideRaw = await fs.readText(sidecar)
+          try {
+            const sd = JSON.parse(sideRaw)
+            if (sd && Array.isArray(sd.messages)) { sideMessages = sd.messages; sideSeq = Number(sd.seq) || 0 }
+            else migrateNotes.push('留言旁挂文件结构无效（messages 不是数组）：本次按无留言处理，原文件未改动')
+          } catch (e) {
+            // 解析失败**不删不覆盖**：先原样备份成 <side>.corrupt-<ms>，再按无留言继续。
+            // 不备份的话，下一次"留言变了"的写盘会把它整份换掉 —— 那就是静默丢留言。
+            let note = '留言旁挂文件损坏：' + describeError(e)
+            try {
+              const backupTarget = await fs.resolve(sidecar.displayPath + '.corrupt-' + now())
+              await fs.writeText(backupTarget, sideRaw, { kind: 'createIfAbsent' })
+              note += '；备份：' + fs.processPath(backupTarget)
+            } catch (be) { note += '；备份失败：' + describeError(be) }
+            migrateNotes.push(note)
+          }
+        }
+      } catch (e) {
+        // 读不到：**故意**把 sideVersion 留在 null ⇒ 后续写盘走 createIfAbsent，
+        // 真实 fs 对"已存在但没读过"的目标会拒写，宁可让 op 失败也不用读不到的内容去覆盖。
+        migrateNotes.push('留言旁挂文件读取失败：' + describeError(e))
+      }
+      if (!info) {
+        const empty = init()
+        if (sideMessages) { empty.messages = sideMessages; empty.seq = sideSeq }
+        return { state: empty, version: null, target: target, sidecar: sidecar, sideVersion: sideVersion, messagesInMain: false, stateDir: stateDir, warn: mergeWarn(null) }
+      }
       const raw = await fs.readText(target)
       let s
-      try { s = Object.assign(init(), JSON.parse(raw)) } catch (e) {
+      let parsed = null
+      try {
+        parsed = JSON.parse(raw)
+        s = Object.assign(init(), parsed)
+      } catch (e) {
         // **不许谎报**：备份/重置各自是否成功必须如实写进 warning（与包形态 store.ts 逐字对齐）。
         // 原实现在两处 catch 都吞掉失败，却照旧写 'reinitialized' / 'backup: <路径>'。
         let backupPath = null
@@ -175,7 +199,8 @@ return {
         let resetOk = false
         let resetFailure = null
         try {
-          await fs.writeText(target, JSON.stringify(init()), { kind: 'replaceIfVersion', version: info.version })
+          // 重置写的是**主文件那一半**（不含 messages）：旧布局的 messages 键不能借着重置复活。
+          await fs.writeText(target, JSON.stringify(mainDocOf(init())), { kind: 'replaceIfVersion', version: info.version })
           resetOk = true
         } catch (resetError) { resetFailure = describeError(resetError) }
         // 证据链：如实交代原始损坏内容此刻的下落。
@@ -185,44 +210,139 @@ return {
           + (backupFailure ? '；备份失败：' + backupFailure : '')
           + (resetOk ? '' : '；原始损坏内容仍留在磁盘上')
           + (backupFailure && resetOk ? '；原始损坏内容已被重置覆盖' : '')
-        return { state: init(), version: null, target: target, stateDir: stateDir, warn: mergeWarn(corruptWarn) }
+        // 主文件重置了，但旁挂留言还在：并进返回值，别让"主文件坏了"看起来像"板也空了"。
+        const empty = init()
+        if (sideMessages) { empty.messages = sideMessages; empty.seq = sideSeq }
+        return { state: empty, version: null, target: target, sidecar: sidecar, sideVersion: sideVersion, messagesInMain: false, stateDir: stateDir, warn: mergeWarn(corruptWarn) }
       }
+      // 旧布局（主文件里**仍有** messages）以**主文件**为准；否则以旁挂为准。
+      const messagesInMain = !!(parsed && Array.isArray(parsed.messages))
+      if (messagesInMain) s.messages = parsed.messages
+      else if (sideMessages) s.messages = sideMessages
+      else s.messages = []
+      // seq 是 claimId 与 msgId 共用的计数器：取两边的较大值，避免复用已发过的 id。
+      s.seq = Math.max(Number(parsed && parsed.seq) || 0, sideSeq)
       s.claims = Array.isArray(s.claims) ? s.claims : []
       s.messages = Array.isArray(s.messages) ? s.messages : []
       s.holders = Array.isArray(s.holders) ? s.holders : []
-      return { state: s, version: info.version, target: target, stateDir: stateDir, warn: warn }
+      return { state: s, version: info.version, target: target, sidecar: sidecar, sideVersion: sideVersion, messagesInMain: messagesInMain, stateDir: stateDir, warn: mergeWarn(null) }
     }
-    // holder 是否仍"新鲜"：age 落在 [-SKEW, TTL) 内。sweep 与 holderView 共用同一判据。
-    const holderFresh = (lastSeenAt, t) => { const age = t - (lastSeenAt || 0); return age < 86400000 && age > -300000 }
-    function sweep(s, t, opts) {
-      const b = s.claims.length; s.claims = s.claims.filter(c => c.expiresAt > t); const expiredClaims = b - s.claims.length
-      let droppedMessages = 0
-      if (s.messages.length > 2000) { droppedMessages = s.messages.length - 2000; s.messages = s.messages.slice(-2000) }
-      const active = new Set(s.claims.map(c => c.holderId)); const hb = s.holders.length
-      s.holders = s.holders.filter(h => active.has(h.holderId) || holderFresh(h.lastSeenAt, t))
-      // 与 collab-core 的 sweep 同形：**reader 不在这里清理**（0.8.3 修掉的真缺陷）。
-      // 曾经的 liveHolders 判据（agents.get(sessionId) !== undefined）会把只是空闲、
-      // 并未结束的读者一并删掉 —— 该 claim 释放时已无人可通知。读者只由 dropHolder
-      // （agent/disposed）摘掉，且它**只摘 reader 登记、不回收未过期声明**（W7：
-      // 租约是声明回收的唯一机制）；有界性由 claim 的 release/到期保证。
-      return { expiredClaims, droppedMessages, prunedHolders: hb - s.holders.length }
+    /*__COLLAB_CORE__*/
+    /*__COLLAB_DISCIPLINE_TEXT__*/
+    /*__COLLAB_PATH_SPECS__*/
+    // 下面这一整段（到 __COLLAB_GATE_END__ 为止）是宿主形态的写门控，**只有**它把
+    // tools/pre-execute 接到真事件总线上。tests/collab-hostcode-parity.mjs 会整段切掉再跑一次
+    // 同样的写调用，断言"切掉即放行" —— 这就是"拦写确实来自这个钩子"的负向对照。
+    /*__COLLAB_GATE_BEGIN__*/
+    // ---- 功能 C：写/读的原生审批门控（宿主形态）----
+    // 可行性取证（2026-10，M3）：tools/pre-execute 是 Cordis 的 **ctx waterfall 事件**，不是
+    // 服务方法：契约声明在 dsh-tools/lib/types/index.d.ts:47（@mode waterfall），派发点是
+    // dsh-tools/lib/index.js:3223 this.ctx.waterfall(carrier, 'tools/pre-execute', exec, …)。
+    // 受限宿主的 ctx 门面把 on 列在白名单里（dsh-cordis-host-runner/lib/types/guard.js:569
+    // 的 CTX_VERBS 含 'on'），并由 guardedPlugin 把 on 转发到**真实** host ctx
+    // （guard.js:746 交给 sandboxContext，其 on 分支是 Reflect.apply(ctx[prop], ctx, args)）——
+    // 也就是说监听器落在真事件总线上，与包形态的 ctx.on 同一条缝。
+    // 作用域过滤对**未打标签**的监听器一律放行（dsh-scope/lib/index.js:327 的 scopeTarget：
+    // if (tag === undefined) return true），而动态半边挂在未打标签的 cordis-dynamic 组下
+    // （dsh-cordis-host-runner/lib/index.js:2530 this.rootCtx.plugin({ name: 'cordis-dynamic' })），
+    // 所以这个钩子会收到每个 agent 的工具调用。
+    //
+    // 与包形态（src/gate.ts）的差异只有一处，且是**环境限制**不是设计选择：受限宿主读不到
+    // process.env 与插件 Config，所以 enforceWriteLock / DSH_COLLAB_NO_PROMPT_HINT 两个开关
+    // 在这里都不存在 —— 按"默认拦"实现（= 包形态两个开关的默认值）。
+    // 反向交叉预警（gate.ts 的 teamScopeNotice）**不移植**：它要 agent.inject 投递一条显式来源的
+    // notice，而受限宿主没有 @deepseek-ai/dsh-llm（见本文件 agent/disposed 的注释）；团队写域的
+    // 只读交叉预警仍由 order-130 的态势摘要提供（teamCrossWarnLine）。
+    // 门控自身故障一律放行（插件的问题不该锁死整个工具面），与包形态同。
+    /** 把命中渲染成 ask 的理由（与 src/gate.ts 的 gateReason 逐字一致）。 */
+    function gateReason(c, target, kind) {
+      const start = clockUtc(typeof c.createdAt === 'number' ? c.createdAt : c.expiresAt - (c.ttlSec || 0) * 1000)
+      const who = holderLabel(c.holderId, c.holderName)
+      const what = kind === 'write' ? '写入' : '读取（对方已声明不可读）'
+      return '[dsh-collab] ' + target + ' 由 ' + who + ' 占用（' + modeLabel(c.mode) + '）：非持有者' + what +
+        '需要先协商。租约 ' + start + '–' + clockUtc(c.expiresAt) + '。先 collab_lock op=wait 或 collab_board 协商，或改用其他路径。'
     }
-    function expire(s, t) { return sweep(s, t).expiredClaims }
-    // stale 用 1h 预警阈值（小于 24h 回收阈值），因此在"先 sweep 再取视图"的路径上依然可达。
-    function holderView(s, t) {
-      const activeIds = new Set(s.claims.filter(c => c.expiresAt > t).map(c => c.holderId))
-      const holders = s.holders.map(h => {
-        const lastSeenAt = h.lastSeenAt || 0
-        const ageMs = t - lastSeenAt
-        const ageSec = Math.max(0, Math.floor(ageMs / 1000))
-        const active = activeIds.has(h.holderId)
-        return { holderId: h.holderId, name: h.name, kind: h.kind, sessionId: h.sessionId, lastSeenAt, ageSec, active, stale: !active && (ageMs >= 3600000 || !holderFresh(lastSeenAt, t)) }
-      }).sort((a, b) => b.lastSeenAt - a.lastSeenAt)
-      return { holders, staleHolders: holders.filter(x => x.stale).length }
+    /** 门控判定：返回 ask 决策，或 null 表示放行。判据与 src/gate.ts 的 writeGate 逐条同语义。 */
+    async function writeGate(execCtx) {
+      const toolName = execCtx && typeof execCtx.name === 'string' ? execCtx.name : ''
+      const args = (execCtx && execCtx.arguments) || {}
+      const spec = pathArgsFor(toolName, args)
+      if (!spec.write.length && !spec.read.length) return null
+      const agent = execCtx && execCtx.agent
+      const id = agent && agent.id ? String(agent.id) : null
+      const cwd = await cwdOf(id, agent)
+      // holderOf 顺带把会话家族（血缘）现算出来：父会话 claim 了 src/ 再派子代理改 src/ 时，
+      // 子代理的写不该被自己家的锁拦下（判据与 claim() 的冲突扫描同源，见 collab-core.inFamily）。
+      const me = holderOf(execCtx)
+      const { state } = await load(id, agent)
+      const t = now()
+      const hits = []
+      // mode 过滤与 collab-core 的 claim() 冲突判据**同源**：shared/read 一律不参与门控
+      //（read 是纯观测、既不排他也不被挡；OPEN_HINT 正好推荐只读调研用 mode=read）。
+      const consider = (c, target, kind) => {
+        if (inFamily(me, c.holderId)) return
+        if (c.mode === 'shared' || c.mode === 'read') return
+        hits.push({ claim: c, target: target, kind: kind })
+      }
+      const collect = (fields, kind) => {
+        for (const field of fields) {
+          const raw = args[field]
+          if (typeof raw !== 'string' || !raw) continue
+          const rel = relToProject(raw, cwd)
+          if (rel === '') {
+            // 空串 = **目标就是项目根**（'.' / './' / 绝对 cwd 本身），不是"解析不出来"。
+            // 根的判据取保守侧（0.14.0 修）：任何他人的未过期 exclusive 声明都算冲突 ——
+            // 本部署 ask == deny，指向根的写本来也不可能成功，误拦代价≈0，漏拦才是把门控关掉。
+            for (const c of state.claims) if (c.expiresAt > t) consider(c, '.', kind)
+            continue
+          }
+          for (const c of claimsCovering(state.claims, rel, t)) consider(c, rel, kind)
+        }
+      }
+      collect(spec.write, 'write')
+      collect(spec.read, 'read')
+      if (!hits.length) return null
+      // 走到这里 hits 只剩他人的、未过期的 exclusive 声明。写：非持有者一律拦。
+      // 读：只有持有者显式 readable:false 才拦（可读性默认 true）。
+      const blocking = hits.filter(h => h.kind === 'write' || !isReadable(h.claim))
+      if (!blocking.length) return null
+      const hit = blocking[0]
+      return { kind: 'ask', reason: gateReason(hit.claim, hit.target, hit.kind) }
+    }
+    ctx.on('tools/pre-execute', async (execCtx, next) => {
+      try {
+        const decision = await writeGate(execCtx)
+        if (decision) return decision
+      } catch (e) {
+        // 门控自身故障时放行：插件的问题不该锁死整个工具面。
+      }
+      return next()
+    })
+    /*__COLLAB_GATE_END__*/
+    /**
+     * 落盘：**先写旁挂，再写主文件**（与包形态 store.ts 的 writeState 同构、同理由）。
+     * 顺序不能反：迁移那一次主文件里的 messages 键会被去掉，主文件先写成功而旁挂写失败
+     * 就等于把留言只剩在内存里。messagesInMain 为真时这一次**必须**写旁挂。
+     * 注意：本文件是模板字面量，外壳里的注释**一个反引号都不能有**（会提前结束模板）。
+     */
+    async function writeState(next, version, target, sidecar, sideVersion, messagesInMain, fpBefore) {
+      const writeSide = messagesInMain || msgFingerprint(next.messages) !== fpBefore
+      if (writeSide) {
+        const sideBody = JSON.stringify(sideDocOf(next))
+        if (sideVersion === null) await fs.writeText(sidecar, sideBody, { kind: 'createIfAbsent' })
+        else await fs.writeText(sidecar, sideBody, { kind: 'replaceIfVersion', version: sideVersion })
+      }
+      // 主文件：本形态**每一次**写盘都写它（承载声明/名册/seq，本来就只有 KB 级），内容永不含 messages。
+      const mainBody = JSON.stringify(mainDocOf(next))
+      if (version === null) await fs.writeText(target, mainBody, { kind: 'createIfAbsent' })
+      else await fs.writeText(target, mainBody, { kind: 'replaceIfVersion', version })
     }
     async function mutate(fn, agentId, agent) {
       for (let i = 0; i < 5; i++) {
-        const { state, version, target } = await load(agentId, agent)
+        const { state, version, target, sidecar, sideVersion, messagesInMain } = await load(agentId, agent)
+        // 跑 op **之前**取留言指纹：expire() 也会截断留言（条数/字节上限），所以要在它之前取，
+        // 否则"这次只清掉了旧留言"会被判成"留言没变"而丢掉截断结果。
+        const fpBefore = msgFingerprint(state.messages)
         expire(state, now())
         let out
         try { out = fn(state) } catch (e) { if (e && e.collabConflict) return { ok: false, error: 'conflict', conflicts: e.conflicts }; throw e }
@@ -233,8 +353,7 @@ return {
           return { ok: true, data }
         }
         try {
-          if (version === null) await fs.writeText(target, JSON.stringify(out.state), { kind: 'createIfAbsent' })
-          else await fs.writeText(target, JSON.stringify(out.state), { kind: 'replaceIfVersion', version })
+          await writeState(out.state, version, target, sidecar, sideVersion, messagesInMain, fpBefore)
           return { ok: true, data: out.data }
         } catch (e) { if (stale(e) && i < 4) continue; throw e }
       }
@@ -286,240 +405,25 @@ return {
       for (const id of descendantIds(agentId)) out.push('agent:' + id)
       return out
     }
-    // 家族判据（与 collab-core.inFamily **同名同形**，逐输出对拍见 tests/collab-inline-parity.mjs）。
-    function inFamily(h, holderId) {
-      if (holderId === h.holderId) return true
-      return Array.isArray(h.family) && h.family.indexOf(holderId) >= 0
-    }
     const holderOf = exec => { const agent = exec && exec.agent; const id = agent && agent.id ? String(agent.id) : null; return { agent, holderId: id ? 'agent:' + id : 'human:console', sessionId: id || undefined, family: familyIds(id, agent) } }
-    function cleanName(s) {
-      if (typeof s !== 'string') return s
-      let n = s.replace(/\\s+/g, ' ').trim()
-      if (n.length > 24) n = n.slice(0, 24) + '…'
-      return n
-    }
     function hname(h) {
       let name = null
       if (h.sessionId && (sessions || h.agent) && sessionTitle) { try { const s = (h.agent && h.agent.session) || (sessions && sessions.get(h.sessionId)); if (s) { const t = sessionTitle.get(s); if (t && typeof t.title === 'string' && t.title) name = t.title } } catch (e) {} }
       return cleanName(name || h.holderId)
     }
-    function holder(state, h, name) {
-      let r = state.holders.find(x => x.holderId === h.holderId)
-      if (!r) { r = { holderId: h.holderId, name, kind: h.sessionId ? 'agent' : 'human', sessionId: h.sessionId, lastSeenAt: now() }; state.holders.push(r) } else { r.name = name; r.lastSeenAt = now() }
-      return r
-    }
-    function claim(state, h, name, a) {
-      const paths = (Array.isArray(a.paths) ? a.paths : []).map(norm).filter(Boolean)
-      if (!paths.length) return { ok: false, changed: false, data: { error: 'bad-request', message: 'paths required（目录以 / 结尾）' } }
-      const requested = a.mode === undefined || a.mode === null || a.mode === '' ? 'exclusive' : a.mode
-      if (requested !== 'exclusive' && requested !== 'shared' && requested !== 'read') {
-        return { ok: false, changed: false, data: { error: 'bad-request', message: 'mode must be one of exclusive | shared | read (got ' + String(a.mode) + ')' } }
-      }
-      const mode = requested
-      // 可读性（功能 C 的数据维度）：默认 true，只认显式 false；不参与冲突扫描。
-      const readable = a.readable === undefined || a.readable === null ? true : a.readable !== false
-      const ttl = Math.max(5, Math.min(86400, Number(a.ttlSec) || 1800))
-      const note = typeof a.note === 'string' ? a.note.slice(0, 500) : ''
-      const t = now(), cs = []
-      // read 是纯观测：不阻塞他人，也不被他人阻塞，整段冲突扫描跳过。
-      if (mode !== 'read') {
-      for (const c of state.claims) {
-        if (inFamily(h, c.holderId) || c.expiresAt <= t || c.mode === 'shared' || c.mode === 'read') continue
-        for (const p of paths) for (const cp of c.paths) if (ov(p, cp)) {
-          const remainingSec = Math.max(0, Math.ceil((c.expiresAt - t) / 1000))
-          const suggestedAction = remainingSec <= 30 ? 'wait' : 'negotiate'
-          cs.push({
-            claimId: c.claimId,
-            holderId: c.holderId,
-            holderName: c.holderName || c.holderId,
-            path: p,
-            overlapsWith: cp,
-            mode: c.mode,
-            expiresAt: c.expiresAt,
-            remainingSec,
-            suggestedAction,
-          })
-          break
-        }
-      }
-      }
-      if (cs.length) throw conflict(cs)
-      holder(state, h, name)
-      const expiresAt = t + ttl * 1000
-      // 合并限定在**同一 mode**：跨 mode 合并会把子路径的 exclusive 扩到父路径上，
-      // 连带锁住从未被独占的兄弟路径。
-      const own = state.claims.find(c => c.holderId === h.holderId && c.mode === mode && c.paths.some(cp => paths.some(p => ov(p, cp))))
-      let cl
-      if (own) {
-        for (const p of paths) if (!own.paths.includes(p)) own.paths.push(p)
-        own.ttlSec = ttl; own.note = note || own.note; own.expiresAt = expiresAt
-        // 只在显式给出时改写可读性（缺省不重置）；readers 原样保留。
-        if (a.readable !== undefined && a.readable !== null) own.readable = readable
-        cl = own
-      }
-      else { cl = { claimId: 'c_' + (++state.seq), holderId: h.holderId, holderName: name, paths, mode, ttlSec: ttl, expiresAt, note, createdAt: t, readable, readers: [] }; state.claims.push(cl) }
-      let warn = null
-      if (ttl < 60) warn = 'short-lease: ttl=' + ttl + 's（<60s）; 请按时 heartbeat 续租，避免过期' + (own ? '；已并入你现有声明' : '')
-      return { ok: true, changed: true, state, data: { claim: pub(cl), serverTime: t, merged: !!own, warning: warn } }
-    }
-    function release(state, h, a) {
-      const t = now(); let rel = []
-      if (a.claimId) {
-        const c = state.claims.find(x => x.claimId === a.claimId)
-        if (!c) return { ok: false, changed: false, data: { error: 'not-found', message: 'no claim ' + a.claimId } }
-        if (c.holderId !== h.holderId) return { ok: false, changed: false, data: { error: 'forbidden', message: 'only holder can release' } }
-        state.claims = state.claims.filter(x => x.claimId !== a.claimId); rel = [c]
-      } else {
-        const paths = (Array.isArray(a.paths) ? a.paths : []).map(norm).filter(Boolean)
-        if (!paths.length) return { ok: false, changed: false, data: { error: 'bad-request', message: 'claimId or paths required' } }
-        rel = state.claims.filter(c => c.holderId === h.holderId && c.paths.some(cp => paths.some(p => ov(p, cp))))
-        if (!rel.length) return { ok: true, changed: false, data: { released: [], serverTime: t } }
-        state.claims = state.claims.filter(c => !rel.includes(c))
-      }
-      return { ok: true, changed: true, state, data: { released: rel.map(pub), serverTime: t } }
-    }
-    // 僵尸声明显式回收（0.9.8，op=reap）——与 collab-core.ts 的 reap() **同形同名**，
-    // 由 tests/collab-inline-parity.mjs 逐输出对拍。**只由显式 op 调用，绝不自动触发**：
-    // 判据是「holder 不在 agents.list() 里 + age 超门槛」，而 agents.list() 只含本进程此刻
-    // 加载着的 agent —— 休眠但可唤回的会话同样不在里面（0.8.2 按它清 readers 静默丢通知、
-    // W7 确认 dispose 不得提前释放未过期声明），运行时注册表**无法区分**"休眠可唤回"与"真死"。
-    // 所以默认 dry-run，只把候选交给调用方确认；误杀的代价是持有者恢复后以为自己仍有锁。
-    // liveHolderIds = null 表示活体检查没跑成 ⇒ 一个也不收（拿不到名单时"不在名单里"没有信息量）。
-    function reap(s, h, a, liveHolderIds, t) {
-      const raw = Number(a && a.olderThanSec)
-      const olderThanSec = Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : 600
-      const confirm = !!(a && a.confirm === true)
-      const paths = (Array.isArray(a && a.paths) ? a.paths : []).map(norm).filter(Boolean)
-      const unknown = liveHolderIds === null || liveHolderIds === undefined
-      const live = new Set(Array.isArray(liveHolderIds) ? liveHolderIds : [])
-      const hits = []
-      if (!unknown) {
-        for (const c of s.claims) {
-          if (!(c.expiresAt > t)) continue
-          if (c.holderId === h.holderId) continue
-          if (typeof c.holderId !== 'string' || !c.holderId.startsWith('agent:')) continue
-          if (live.has(c.holderId)) continue
-          const createdAt = typeof c.createdAt === 'number' ? c.createdAt : c.expiresAt - (c.ttlSec || 0) * 1000
-          const ageSec = Math.max(0, Math.floor((t - createdAt) / 1000))
-          if (!(ageSec > olderThanSec)) continue
-          if (paths.length && !c.paths.some(cp => paths.some(p => ov(p, cp)))) continue
-          hits.push(c)
-        }
-      }
-      const entries = hits.map(c => {
-        const createdAt = typeof c.createdAt === 'number' ? c.createdAt : c.expiresAt - (c.ttlSec || 0) * 1000
-        const reasons = ['unexpired', 'agent-holder', 'not-self', 'holder-not-in-agents-list', 'age-over-threshold']
-        if (paths.length) reasons.push('paths-intersect')
-        return Object.assign(pub(c), {
-          ageSec: Math.max(0, Math.floor((t - createdAt) / 1000)),
-          remainingSec: Math.max(0, Math.ceil((c.expiresAt - t) / 1000)),
-          olderThanSec,
-          reasons
-        })
-      })
-      const base = { olderThanSec, serverTime: t, livenessCheck: unknown ? 'unavailable' : 'ok' }
-      // 级联清 holder（0.9.11，与包形态 collab-core.reap 同源）：被回收的 holder 若已无
-      // 未过期声明且不在活体名单里，就从 holders 表里摘掉，不必等 24h 的 sweep 自愈。
-      const gone = new Set(hits.map(c => c.holderId))
-      const stillActive = new Set(s.claims.filter(c => !hits.includes(c)).map(c => c.holderId))
-      if (!confirm) {
-        const candidateHolders = []
-        if (!unknown) for (const hh of s.holders) {
-          if (gone.has(hh.holderId) && !stillActive.has(hh.holderId) && !live.has(hh.holderId)) candidateHolders.push(hh.holderId)
-        }
-        return { ok: true, changed: false, state: s, data: Object.assign({ dryRun: true }, base, { candidates: entries, candidateHolders }) }
-      }
-      if (!hits.length) return { ok: true, changed: false, state: s, data: Object.assign({ dryRun: false }, base, { reaped: [], reapedHolders: [] }) }
-      s.claims = s.claims.filter(c => !hits.includes(c))
-      const reapedHolders = []
-      if (!unknown) {
-        s.holders = s.holders.filter(hh => {
-          if (!gone.has(hh.holderId) || stillActive.has(hh.holderId) || live.has(hh.holderId)) return true
-          reapedHolders.push(hh.holderId)
-          return false
-        })
-      }
-      return { ok: true, changed: true, state: s, data: Object.assign({ dryRun: false }, base, { reaped: entries, reapedHolders }) }
-    }
-    // 与 collab-core/包形态的 dropHolder **同形**（同名同签名，由 tests/collab-inline-parity.mjs
-    // 逐输出对拍）：把这个已消失的 holder 从所有剩余 claim 的 readers 摘掉，并**只回收它已经过期**的
-    // 声明。租约（expiresAt）是声明回收的**唯一**机制 —— dispose 不是释放信号：会话被 dispose 后
-    // 往往会恢复并继续干活，提前删掉声明会让别的会话在 overview 里看到路径空闲（W7 锁安全缺陷）。
-    // t 由调用方显式传入（纯逻辑，不隐式读时钟）。
-    function dropHolder(s, h, t) {
-      const isExpired = c => c.holderId === h && c.expiresAt <= t
-      const rel = s.claims.filter(isExpired)
-      let changed = rel.length > 0
-      if (rel.length) s.claims = s.claims.filter(c => !isExpired(c))
-      for (const c of s.claims) {
-        const list = hostReaders(c)
-        if (!list.includes(h)) continue
-        c.readers = list.filter(x => x !== h); changed = true
-      }
-      if (!changed) return { ok: true, changed: false, data: {} }
-      return { ok: true, changed: true, state: s, data: { released: rel.map(pub) } }
-    }
-    // 循环终止自动释放（0.9.10）：见 src/collab-core.ts 的同名函数与 README「循环终止自动释放」。
-    // 与包形态**同语义**：只释放**未过期**声明（过期的归 sweep），并在留言板留一条审计留言
-    // （channel=agent:<holderId>，author=system:dsh-collab）。释放之后由谁告知读者与本人，
-    // 见下面的 agent/status 接线注释 —— 本形态**不投递**任何通知。
-    // 与包形态的一致性由 tests/collab-inline-parity.mjs 逐输出对拍本函数守护。
-    // cause：'loop-end'（循环停了、空闲超过宽限期）| 'disposed'（句柄结束，见下面的 agent/disposed）。
-    // 正文必须说实话，不能让"句柄结束"被写成"空闲超过 N 秒"。
-    const releaseOnLoopEnd = (s, holderId, holderName, t, graceSec, cause) => {
-      const mine = s.claims.filter(c => c.holderId === holderId && c.expiresAt > t)
-      if (!mine.length) return { ok: true, changed: false, data: { released: [] } }
-      s.claims = s.claims.filter(c => !mine.includes(c))
-      const released = mine.map(pub)
-      const uniq = []
-      for (const c of released) for (const p of c.paths) if (!uniq.includes(p)) uniq.push(p)
-      const shown = uniq.slice(0, 3).join(' ') + (uniq.length > 3 ? ' 等 ' + uniq.length + ' 条' : '')
-      const who = holderLabel(holderId, holderName)
-      const m = {
-        msgId: 'm_' + (++s.seq),
-        seq: s.seq,
-        channel: holderId,
-        author: 'system:dsh-collab',
-        ts: t,
-        body: cause === 'disposed'
-          ? '[自动释放] ' + who + ' 的会话句柄已结束（agent/disposed），其对 ' + shown +
-            ' 的声明已被自动释放。恢复工作前如需写入这些路径，请重新 collab_lock op=claim。'
-          : '[自动释放] ' + who + ' 的会话循环已结束（空闲超过 ' + graceSec + ' 秒），其对 ' + shown +
-            ' 的声明已被自动释放。恢复工作前如需写入这些路径，请重新 collab_lock op=claim。',
-      }
-      s.messages.push(m)
-      return { ok: true, changed: true, state: s, data: { released: released, notice: m } }
-    }
-    function heartbeat(state, h, a) {
-      const c = state.claims.find(x => x.claimId === a.claimId)
-      if (!c) return { ok: false, changed: false, data: { error: 'not-found', message: 'no claim ' + a.claimId } }
-      if (c.holderId !== h.holderId) return { ok: false, changed: false, data: { error: 'forbidden', message: 'only holder can heartbeat' } }
-      c.expiresAt = now() + (c.ttlSec || 1800) * 1000
-      return { ok: true, changed: true, state, data: { claimId: c.claimId, expiresAt: c.expiresAt, serverTime: now() } }
-    }
-    function post(state, h, name, a) {
-      // mentions 已移除（0.13.0）：@ 谁都不等于通知谁；挡回去而不是静默忽略（文案与 collab-core 同源）。
-      if (a && a.mentions !== undefined) {
-        return { ok: false, changed: false, data: { error: 'bad-request', message: 'mentions 已移除：本板没有任何投递面，@ 谁都不等于通知谁。要通知/唤醒某个会话，用它自己的消息工具（以你当时的工具目录为准）；本条消息**没有写入**，请去掉 mentions 重发。' } }
-      }
-      const body = typeof a.body === 'string' ? a.body.trim() : ''
-      if (!body) return { ok: false, changed: false, data: { error: 'bad-request', message: 'body required' } }
-      holder(state, h, name)
-      const m = { msgId: 'm_' + (++state.seq), seq: state.seq, channel: (typeof a.channel === 'string' && a.channel.trim()) ? a.channel.trim() : 'general', author: h.holderId, ts: now(), body }
-      if (typeof a.replyTo === 'string' && a.replyTo) m.replyTo = a.replyTo
-      state.messages.push(m)
-      // delivered/deliveryNote：与 collab-core 的 BOARD_NO_DELIVERY_HINT 同源，字面量漂移由
-      // tests/collab-inline-parity.mjs 的 post 语料逐输出抓到（宿主形态没有 import，只能内联）。
-      return { ok: true, changed: true, state, data: { msgId: m.msgId, seq: state.seq, ts: m.ts, channel: m.channel, delivered: false, deliveryNote: '留言板只写共享状态文件：不投递、不唤醒任何会话；对方只在它自己 collab_board op=read 时才会看到这条。要让某个已停下的会话动起来，用它自己的消息工具（以你当时的工具目录为准）。' } }
-    }
-    async function list(agentId) {
-      const { state, target, stateDir, warn } = await load(agentId); const t = now()
-      // 先 sweep 再取视图：>24h 的废弃 holder 不再出现；stale 用 1h 预警阈值，依然可达。
+    // 读路径必须与写路径**用同一份状态文件**：agent 是 cwdOf 的第一顺位锚点
+    // （agent.session.header.cwd），丢了它就会落到 default-<hash>.json —— claim 与 list 读写不同文件。
+    // 包形态 store.ts 的 6 个 load 调用同理，全都传 agent。下面 5 个只读 op 都不许再漏。
+    async function list(agentId, agent) {
+      const { state, target, stateDir, warn } = await load(agentId, agent); const t = now()
+      // 先 sweep 再取视图：死掉的名册行（句柄结束 / 写它的进程不在了）根本不出现；
+      // stale 用 1h 预警阈值，依然可达。
       const ex = expire(state, t); const hv = holderView(state, t)
       // holdersNote 只在有 stale 条目时出现（与包形态 store.ts 的 list 同形同文案）：
       // 名册被读成"过期锁"的实测现场才有这句话，干净项目一个字都不加。
       const rosterNote = holderRosterNote(hv.staleHolders)
-      const data = { seq: state.seq, serverTime: t, statePath: fs.processPath(target), stateDir: stateDir, schemaVersion: state.schemaVersion, holders: hv.holders, staleHolders: hv.staleHolders, claims: state.claims.map(pub), expiredCount: ex }
+      // 名册**有界**返回（0.14.0，C）：截断不丢事实 —— holdersTotal 恒在，调用方自己看得出被折叠了。
+      const data = { seq: state.seq, serverTime: t, statePath: fs.processPath(target), stateDir: stateDir, schemaVersion: state.schemaVersion, holders: hv.holders.slice(0, HOLDER_VIEW_LIMIT), holdersTotal: hv.holders.length, staleHolders: hv.staleHolders, claims: state.claims.map(publish), expiredCount: ex }
       if (rosterNote) data.holdersNote = rosterNote
       return { ok: true, data: withWarn(data, warn) }
     }
@@ -534,6 +438,9 @@ return {
         const out = []
         for (const e of entries) {
           if (!e || typeof e.name !== 'string' || !/\.json$/.test(e.name) || !e.target) continue
+          // **排除留言旁挂文件**（与包形态 store.otherProjects 同构）：它也以 .json 结尾，
+          // 不排掉就会被当成"另一个项目"去 parse。
+          if (e.name.slice(-SIDECAR_EXT.length) === SIDECAR_EXT) continue
           if (fs.processPath(e.target) === here) continue
           let doc
           try { doc = JSON.parse(await fs.readText(e.target)) } catch (err) { continue }
@@ -547,13 +454,15 @@ return {
         return { otherProjects: out.slice(0, 10) }
       } catch (e) { return { otherProjects: [] } }
     }
-    async function overview(agentId, agent) {
-      const { state, target, stateDir, warn } = await load(agentId); const t = now(); expire(state, t)
+    // op=overview 的 I/O 外壳。**不能叫 overview**：collab-core 导出的纯函数 overview(state)
+    // 会被内联进同一个作用域，同名会互相遮蔽（后者胜），所以外壳这一层改名 overviewOf。
+    async function overviewOf(agentId, agent) {
+      const { state, target, stateDir, warn } = await load(agentId, agent); const t = now(); expire(state, t)
       const byHolder = {}
       for (const c of state.claims) {
         const k = c.holderId
         if (!byHolder[k]) byHolder[k] = { holderId: k, holderName: c.holderName || k, claims: [] }
-        byHolder[k].claims.push(pub(c))
+        byHolder[k].claims.push(publish(c))
       }
       const holders = Object.keys(byHolder).map(k => {
         const h = byHolder[k]
@@ -570,58 +479,30 @@ return {
           : { teamTasks: [], teamTasksNote: '官方 Agent Teams 服务在场：此刻没有在跑任务' })
       return { ok: true, data: withWarn(Object.assign({ statePath: fs.processPath(target), stateDir: stateDir, serverTime: t, totalClaims: state.claims.length, holders }, other, teamField), warn) }
     }
-    async function status(a, agentId) {
-      const { state, target, stateDir, warn } = await load(agentId); const t = now(); expire(state, t)
+    async function status(a, agentId, agent) {
+      const { state, target, stateDir, warn } = await load(agentId, agent); const t = now(); expire(state, t)
       const paths = (Array.isArray(a.paths) ? a.paths : []).map(norm).filter(Boolean)
       const rel = state.claims.filter(c => paths.some(p => c.paths.some(cp => ov(p, cp))))
-      return { ok: true, data: withWarn({ statePath: fs.processPath(target), stateDir: stateDir, paths, related: rel.map(pub), exclusive: rel.filter(c => c.mode === 'exclusive').map(pub), serverTime: t }, warn) }
+      return { ok: true, data: withWarn({ statePath: fs.processPath(target), stateDir: stateDir, paths, related: rel.map(publish), exclusive: rel.filter(c => c.mode === 'exclusive').map(publish), serverTime: t }, warn) }
     }
-    // 留言读取的**纯函数**：与 collab-core.filterMessages 同名同形，逐输出对拍
-    // （tests/collab-inline-parity.mjs 的 EXPECTED_PARITY）。宿主以前把这段抄在 msgs 里，
-    // 对拍抓不到漂移 —— 0.12.2 及以前两边都取 matched 的末尾 limit 条，一起丢中段谁也没发现。
-    // 注意：本段在模板字符串里，注释里**不能出现反引号**（会截断 hostCode）。
-    function filterMessages(state, a) {
-      const since = Number(a.since) || 0, limit = Math.max(1, Math.min(200, Number(a.limit) || 50))
-      const ch = typeof a.channel === 'string' && a.channel.trim() ? a.channel.trim() : null
-      const l = ch ? state.messages.filter(m => m.channel === ch) : state.messages
-      const matched = l.filter(m => m.seq > since)
-      const mode = since > 0 ? 'forward' : 'tail'
-      const returned = mode === 'forward' ? matched.slice(0, limit) : matched.slice(-limit)
-      const hasMore = matched.length > returned.length
-      const nextSince = returned.length ? returned[returned.length - 1].seq : since
-      const earliestSeq = l.length ? l[0].seq : 0
-      const channelNote = ch && matched.length === 0 && state.messages.length ? channelRosterNote(state) : undefined
-      const out = { since, mode, returned: returned.length, total: matched.length, hasMore, nextSince, earliestSeq, latestSeq: state.messages.length ? state.messages[state.messages.length - 1].seq : 0, messages: returned }
-      if (channelNote) out.channelNote = channelNote
-      return out
-    }
-    // 给定频道没有命中时列出**现有频道**（与 collab-core.channelRosterNote 同名同形、逐输出对拍）。
-    function channelRosterNote(state) {
-      const count = new Map()
-      for (const m of state.messages) count.set(m.channel, (count.get(m.channel) || 0) + 1)
-      const top = [...count.entries()].sort((x, y) => (y[1] - x[1]) || String(x[0]).localeCompare(String(y[0])))
-      const shown = top.slice(0, 5).map(([c, n]) => c + '（' + n + ' 条）').join('、')
-      const more = top.length > 5 ? ' 等 ' + top.length + ' 个' : ''
-      return '该频道没有消息。现有频道：' + shown + more + '。channel 是精确匹配的字符串：写什么就得按什么读（path: 频道与 claim 用同一套相对路径写法）。'
-    }
-    async function msgs(a, agentId) {
-      const { state, warn } = await load(agentId)
+    async function msgs(a, agentId, agent) {
+      const { state, warn } = await load(agentId, agent)
       return { ok: true, data: withWarn(filterMessages(state, a), warn) }
     }
-    async function waitFor(a, h, agentId) {
+    async function waitFor(a, h, agentId, agent) {
       const timeoutMs = Math.max(0, Math.min(120000, Number(a.timeoutMs) || 30000))
       const paths = (Array.isArray(a.paths) ? a.paths : []).map(norm).filter(Boolean)
       if (!paths.length) return { ok: false, error: 'bad-request', message: 'paths required' }
       const deadline = now() + timeoutMs
       let blockers = []
       while (now() < deadline) {
-        const { state } = await load(agentId)
+        const { state } = await load(agentId, agent)
         const t = now()
         blockers = state.claims.filter(c => c.expiresAt > t && c.mode === 'exclusive' && !inFamily(h, c.holderId) && c.paths.some(cp => paths.some(p => ov(p, cp))))
         if (blockers.length === 0) return { ok: true, data: { paths, blockers: [], waitedMs: Math.round(timeoutMs - Math.max(0, deadline - now())) } }
         await ctx.timer.timeout(400)
       }
-      return { ok: false, error: 'timeout', message: 'paths still claimed', paths, blockers: blockers.map(pub), waitedMs: timeoutMs }
+      return { ok: false, error: 'timeout', message: 'paths still claimed', paths, blockers: blockers.map(publish), waitedMs: timeoutMs }
     }
     // op=reap 的活体检查：agents.list() 的 holderId 列表（'agent:' + a.id）。
     // 返回 **null** = 检查没跑成（服务/方法缺失或抛错）—— 与"名单为空"是两件事：
@@ -637,11 +518,14 @@ return {
         return out
       } catch (e) { return null }
     }
-    const exec = (fn) => async (args, e) => { args = args || {}; const h = holderOf(e); const name = hname(h); const aId = h.sessionId || null; try { return await fn(args, h, name, aId, h.agent) } catch (err) { return { ok: false, error: 'internal', message: String((err && err.message) || err) } } }
+    // 时钟注入：collab-core 的纯函数不隐式读时钟，全部由调用点把 now 传进去
+    // （claim/release/heartbeat/post/holder 的最后一个参数）。h.name 也是 collab-core
+    // 取名字的入口（旧的宿主副本走独立的 name 形参）。
+    const exec = (fn) => async (args, e) => { args = args || {}; const h = holderOf(e); const name = hname(h); h.name = name; const aId = h.sessionId || null; try { return await fn(args, h, name, aId, h.agent) } catch (err) { return { ok: false, error: 'internal', message: String((err && err.message) || err) } } }
     // op=claim + 官方 Agent Teams 的 advisory 交叉预警（0.11.0，与包形态 tools.ts 同语义）：
     // claim 的结果与冲突判定**一字不动**，只在成功返回的 data 上追加 teamOverlaps。
     async function claimWithTeamAdvisory(a, h, name, aId, agent) {
-      const res = await mutate(s => claim(s, h, name, a), aId, agent)
+      const res = await mutate(s => claim(s, h, a, now), aId, agent)
       try {
         if (res && res.ok === true && res.data) {
           const team = teamTasks(agent)
@@ -655,17 +539,17 @@ return {
     }
     const lock = exec((a, h, name, aId, agent) => {
       if (a.op === 'claim') return claimWithTeamAdvisory(a, h, name, aId, agent)
-      if (a.op === 'release') return mutate(s => release(s, h, a), aId, agent)
-      if (a.op === 'heartbeat') return mutate(s => heartbeat(s, h, a), aId, agent)
+      if (a.op === 'release') return mutate(s => release(s, h, a, now), aId, agent)
+      if (a.op === 'heartbeat') return mutate(s => heartbeat(s, h, a, now), aId, agent)
       if (a.op === 'list') return list(aId, agent)
-      if (a.op === 'overview') return overview(aId, agent)
+      if (a.op === 'overview') return overviewOf(aId, agent)
       if (a.op === 'status') return status(a, aId, agent)
       if (a.op === 'wait') return waitFor(a, h, aId, agent)
       if (a.op === 'reap') return mutate(s => reap(s, h, a, liveAgentHolderIds(), now()), aId, agent)
       return { ok: false, error: 'bad-request', message: '未知操作：' + String(a.op) }
     })
     const board = exec((a, h, name, aId, agent) => {
-      if (a.op === 'post') return mutate(s => post(s, h, name, a), aId, agent)
+      if (a.op === 'post') return mutate(s => post(s, h, a, now), aId, agent)
       if (a.op === 'read') return msgs(a, aId, agent)
       return { ok: false, error: 'bad-request', message: '未知操作：' + String(a.op) }
     })
@@ -702,7 +586,7 @@ return {
         properties: {
           op: { type: 'string', enum: ['post', 'read'], description: 'post 发消息 / read 增量读取' },
           channel: { type: 'string', description: '频道，默认 general；**精确匹配**的自由字符串（写什么就得按什么读，path: 频道与 claim 用同一套相对路径写法），未命中时返回会列出既有频道' },
-          body: { type: 'string', description: 'post 用，消息正文' },
+          body: { type: 'string', maxLength: 8000, description: 'post 用，消息正文。上限 8000 字符（与 collab-core 的 MESSAGE_BODY_MAX_CHARS 同值）；超限由 post() 以 bad-request 挡回且**整条不写入**，不静默截断' },
           replyTo: { type: 'string', description: '回复的 msgId' },
           since: { type: 'number', description: 'read 用：省略或 0 = 读最新 limit 条（tail）；>0 = 从该 seq 往后读 limit 条（forward，旧→新）。返回的 nextSince 是下一次的游标' },
           limit: { type: 'number', description: 'read 用，最多条数，默认 50，上限 200' }
@@ -733,119 +617,6 @@ return {
     // 文本必须**时间稳定**：DSH 的 RuntimeContextProjection.project() 在 rendered === retained.text 时
     // 直接返回 undefined（内容没变就不提交新快照），而快照是整块提交的（沙箱策略 + 审批策略 + 本摘要）。
     // 「剩 N 分」每分钟都变，会让整块快照每分钟重发一次；改用绝对起止时刻后只在占用集合真变时才变。
-    // 以下 clockUtc / renderDigest 与 collab-core.ts 的同名导出**逐字节等价**（受限执行环境不能 import，
-    // 只能内联）；二者的一致性由 tests/collab-hostcode-parity.mjs 逐字符对拍。
-    // 模式名 → 渲染给人看的标签（W9 文案中文化），与 collab-core.ts 的 MODE_LABELS / modeLabel
-    // **同形同值**。只用于渲染文本：mode 的取值与契约仍是 'exclusive' | 'shared' | 'read'。
-    const MODE_LABELS = { exclusive: '独占', shared: '共享', read: '只读' }
-    function modeLabel(mode) {
-      return MODE_LABELS[mode] || String(mode)
-    }
-    function clockUtc(ms) {
-      const d = new Date(ms)
-      const p = (n) => String(n).padStart(2, '0')
-      return p(d.getUTCMonth() + 1) + '-' + p(d.getUTCDate()) + ' ' + p(d.getUTCHours()) + ':' + p(d.getUTCMinutes()) + 'Z'
-    }
-    // 与 collab-core 的 holderHandle / holderLabel / holderRosterNote **同名同形**（见 src/collab-core.ts
-    // 的注释：名字来自会话标题，子代理会话的标题是父 AI 那条 prompt 的开头，实测一个名字占 10 份）。
-    function holderHandle(holderId) {
-      const id = typeof holderId === 'string' ? holderId : ''
-      if (id.slice(0, 6) !== 'agent:') return ''
-      return id.slice(6).replace(/^session-/, '').slice(0, 8)
-    }
-    function holderLabel(holderId, holderName) {
-      if (typeof holderName !== 'string' || !holderName) return holderId || ''
-      const handle = holderHandle(holderId)
-      return handle ? holderName + '#' + handle : holderName
-    }
-    function holderRosterNote(staleHolders) {
-      const n = Number(staleHolders)
-      if (!Number.isFinite(n) || n <= 0) return null
-      return 'holders 是会话名册，不是锁（锁在 claims）：其中 ' + n +
-        ' 条 stale = 该 holder 已无未过期声明且静默超过 1 小时；静默超过 24 小时后由下一次 sweep 回收。'
-    }
-    function renderDigest(others) {
-      // 显式排序只为确定性：状态文件里的插入顺序不该让同一组占用渲染出不同文本。
-      const ordered = others.slice().sort((a, b) => (a.expiresAt - b.expiresAt) || String(a.holderId).localeCompare(String(b.holderId)))
-      const parts = ordered.slice(0, 3).map(c => {
-        const mins = Math.max(1, Math.round((c.ttlSec || 0) / 60))
-        const paths = c.paths.slice(0, 2).join(' ') + (c.paths.length > 2 ? ' 等 ' + c.paths.length + ' 条' : '')
-        const start = clockUtc(typeof c.createdAt === 'number' ? c.createdAt : c.expiresAt - (c.ttlSec || 0) * 1000)
-        return holderLabel(c.holderId, c.holderName) + '（' + modeLabel(c.mode) + '）占用 ' + paths + '，租约 ' + mins + ' 分（' + start + '–' + clockUtc(c.expiresAt) + '）'
-      })
-      const more = ordered.length > 3 ? '；另有 ' + (ordered.length - 3) + ' 条' : ''
-      return '[dsh-collab] 同项目其他会话当前占用：' + parts.join('；') + more + '。改动这些路径前请先执行 collab_lock op=wait 或用 collab_board 协商。'
-    }
-    // 官方 Agent Teams 交叉预警（0.11.0，与 collab-core.ts 的三个同名导出**逐字节等价**，
-    // 由 tests/collab-inline-parity.mjs 的 name-set + 逐输出对拍守护）：
-    // 把官方**在跑任务**（status='in_progress'）的 advisory writeScopes 当"外部占用"报出来。
-    // 只读、不参与任何门控；服务缺席时上层拿到的 teamTasks 是 null，输出一字不变。
-    //
-    // 坑（实测踩过，别重踩）：hostCode 本身是 TS 模板字面量，内联代码里凡是要生成转义序列的地方，
-    // 反斜杠必须写两个（例如"换行"要写成反斜杠+反斜杠+n）。只写一个反斜杠会被外层模板先吃掉：
-    // 生成的源码里要么出现真实换行（字符串未闭合）、要么出现裸 NUL 字节 —— 两种都让 hostCode
-    // 无法 new Function，由 tests/collab-hostcode-parity.mjs 当场抓住。
-    function teamTaskScopeLine(tasks) {
-      const rows = (Array.isArray(tasks) ? tasks : []).filter(t => t && typeof t.id === 'string' && t.id && Array.isArray(t.writeScopes) && t.writeScopes.length > 0)
-      if (!rows.length) return null
-      const ordered = rows.slice().sort((a, b) => String(a.id).localeCompare(String(b.id)))
-      const parts = ordered.slice(0, 3).map(t => {
-        const scopes = t.writeScopes.slice(0, 3).join(' ') + (t.writeScopes.length > 3 ? ' 等 ' + t.writeScopes.length + ' 条' : '')
-        return t.id + (t.subject ? '（' + t.subject + '）' : '') + ' → ' + scopes
-      })
-      const more = ordered.length > 3 ? '；另有 ' + (ordered.length - 3) + ' 条' : ''
-      return '[dsh-collab] 官方 Agent Teams 在跑任务的写域（advisory，非锁）：' + parts.join('；') + more + '。'
-    }
-    function teamScopeOverlaps(tasks, paths) {
-      const ps = []
-      for (const p of (Array.isArray(paths) ? paths : [])) { const n = norm(p); if (n && !ps.includes(n)) ps.push(n) }
-      if (!ps.length) return []
-      const seen = new Set()
-      const out = []
-      for (const t of (Array.isArray(tasks) ? tasks : [])) {
-        if (!t || typeof t.id !== 'string' || !t.id || !Array.isArray(t.writeScopes)) continue
-        for (const scope of t.writeScopes) {
-          const ns = norm(scope)
-          if (!ns) continue
-          for (const p of ps) {
-            if (!ov(ns, p)) continue
-            const key = t.id + '\\u0000' + ns + '\\u0000' + p
-            if (seen.has(key)) continue
-            seen.add(key)
-            out.push({ taskId: t.id, subject: t.subject || '', scope: scope, path: p })
-          }
-        }
-      }
-      out.sort((a, b) => (a.taskId.localeCompare(b.taskId)) || (a.scope.localeCompare(b.scope)) || (a.path.localeCompare(b.path)))
-      return out
-    }
-    function teamCrossWarnLine(tasks, claims) {
-      const rows = []
-      const seen = new Set()
-      for (const t of (Array.isArray(tasks) ? tasks : [])) {
-        if (!t || typeof t.id !== 'string' || !t.id || !Array.isArray(t.writeScopes)) continue
-        for (const scope of t.writeScopes) {
-          const ns = norm(scope)
-          if (!ns) continue
-          for (const c of (Array.isArray(claims) ? claims : [])) {
-            if (!c || !Array.isArray(c.paths)) continue
-            let hit = null
-            for (const p of c.paths) { const np = norm(p); if (np && ov(ns, np)) { hit = p; break } }
-            if (hit === null) continue
-            const holder = holderLabel(c.holderId, c.holderName)
-            const key = t.id + '\\u0000' + ns + '\\u0000' + hit + '\\u0000' + holder
-            if (seen.has(key)) continue
-            seen.add(key)
-            rows.push({ taskId: t.id, scope: scope, path: hit, holder: holder })
-          }
-        }
-      }
-      if (!rows.length) return null
-      rows.sort((a, b) => (a.taskId.localeCompare(b.taskId)) || (a.scope.localeCompare(b.scope)) || (a.path.localeCompare(b.path)))
-      const parts = rows.slice(0, 2).map(r => '任务 ' + r.taskId + ' 的写域 ' + r.scope + ' 与「' + r.holder + '」的声明 ' + r.path + ' 重叠')
-      const more = rows.length > 2 ? '；另有 ' + (rows.length - 2) + ' 条' : ''
-      return '[dsh-collab] 交叉预警：' + parts.join('；') + more + '（advisory：官方 write_scopes 不挡写入；先 collab_board 协商或换写域）。'
-    }
     // 官方 Agent Teams 在跑任务的只读视图（0.11.0，与包形态 store.teamTasks 同语义）：
     // 服务缺席 / 读不到 ⇒ null（调用方一字不变）；服务在场但此刻没有在跑任务 ⇒ []。
     function teamTasks(agent) {
@@ -913,6 +684,17 @@ return {
             return lines.join('\\n')
           } catch (e) { return OPEN_HINT }
         }
+      }))
+      // 委托纪律（order 131，与包形态 src/delegation.ts 同名同序号、**同一份文本**）。
+      // 纪律文本的唯一事实源是 src/spec.ts 的 DELEGATION_DISCIPLINE_TEXT：构建时由
+      // scripts/build-host.mjs 从 lib/spec.js 取值，内联到上面的 /*__COLLAB_DISCIPLINE_TEXT__*/
+      // 标记处 —— 外壳里**没有**手抄副本（手抄副本会静默腐烂，见 AGENTS.md §1）。
+      // 这里不认包形态的 DSH_COLLAB_NO_PROMPT_HINT / exposeDelegationDiscipline 开关：
+      // 受限动态宿主里读不到 process/env 与插件 Config，所以按"默认开"处理。
+      ctx.effect(() => systemPrompt.context({
+        name: 'dsh-collab/delegation',
+        order: 131,
+        text: () => DELEGATION_DISCIPLINE_TEXT
       }))
     }
     if (agents && typeof agents.list === 'function' && ctx.timer && typeof ctx.timer.interval === 'function') {
@@ -1028,6 +810,3 @@ return {
   }
 }
 `
-
-// 默认导出便于 `import host from '...'` 取用；动态插件场景直接取 hostCode 字符串即可。
-export default { hostCode }

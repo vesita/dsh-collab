@@ -1,1316 +1,360 @@
 // tests/collab-inline-parity.mjs
 //
 // 守护什么
-//   dsh-collab 有两形态，纯逻辑**各写一份**：
-//     · 包形态    src/collab-core.ts → lib/collab-core.js（可 import）
-//     · 动态宿主形态  src/collab-plugin.host.ts 里 hostCode 字符串内联的自包含副本
-//       （Cordis 动态插件的 code.host 不接受 import/打包，只能把纯逻辑复制一遍）
-//   本文件从 hostCode 字符串里**抽出真实函数体**（不是复制品），与 lib/collab-core.js 的
-//   同名导出用**同一份语料**逐输出深度对拍；并断言"两形态同名函数集合"恰好等于下面的
-//   期望集合 —— 将来有人在两边各加同名函数却忘了接进对拍，集合断言会变红。
+//   dsh-collab 曾经两形态**各写一份**纯逻辑：
+//     · 包形态      src/collab-core.ts → lib/collab-core.js（可 import）
+//     · 动态宿主形态 src/collab-plugin.host.ts 里 hostCode 字符串内联的手写自包含副本
+//   0.14.0 起宿主形态的纯逻辑**不再手写**：scripts/build-host.mjs 把 lib/collab-core.js
+//   剥掉顶层 `export ` 后原样内联进 src/host-shell.js 的核心标记处，生成
+//   lib/collab-plugin.host.js。两形态的纯逻辑因此逐字节同源 —— 漂移这一整类问题从根上消失。
 //
-// 为什么
-//   内联副本会静默漂移：只改一边，两形态行为就此分叉，而没有任何测试会红。
+//   本文件守这条链路的**同源事实**（旧版"31 个同名函数逐输出对拍"在内联之后是同一份代码，
+//   比对不可能失败，已删除）：
+//     1. hostCode 内联的核心与 lib/collab-core.js 去 export 后**逐字节一致**；
+//     2. 内联区自包含（无 import/export/require/process/os），能被 new Function 独立求值；
+//     3. 外壳层没有把任何 collab-core 导出的名字再写一遍（不遮蔽、不复刻），
+//        每个核心导出在 hostCode 里恰好声明一次且都在内联区里；
+//     4. hostCode 仍能被 new Function 直接构造，宿主真实 I/O op（overview / status）
+//        与几条继承来的核心语义（sweep 消费 opts、filterMessages 的 tail/forward）仍然工作。
 //
 // 与 tests/collab-hostcode-parity.mjs 的分工（互补，不要合并）
-//   · collab-hostcode-parity.mjs 把 hostCode 整体装进 fake ctx **跑起来**，走
-//     "注册工具 → 路径解析 → 锁语义 → awareness 注入文本"的端到端链路，
-//     但它逐输出对拍的只有 clockUtc / renderDigest / modeLabel 三个函数。
-//   · 本文件不跑插件，只做"抽函数体 → 逐函数语料对拍"，覆盖同名集合里的每一个函数，
-//     并守护"同名集合本身"（漏接对拍会红）。抽取思路照抄旧测试第 258-266 行的先例，
-//     但改用括号配对扫描（旧正则抓不到单行箭头，也会把 `ov` 吃到后面的 `norm` 里去）。
+//   · collab-hostcode-parity.mjs 把 hostCode 装进 fake ctx 跑锁语义/路径解析/事件接线的端到端；
+//   · 本文件做"源码同源 + 外壳不越权"的结构守卫，加两条宿主 op 冒烟。
 //
 // 运行：node tests/collab-inline-parity.mjs   退出码非 0 即失败
-// 本文件自包含：不依赖任何既有测试文件，也不改动任何既有文件。
 
-// ---------------------------------------------------------------- 结果统计
-let pass = 0
-let fail = 0
-const groups = new Map()
-let currentGroup = 'setup'
-const group = (name, subtitle) => {
-  currentGroup = name
-  if (!groups.has(name)) {
-    groups.set(name, { pass: 0, fail: 0 })
-    console.log('\n# ' + name + (subtitle ? ' · ' + subtitle : ''))
-  }
-}
-const ok = (cond, label, extra) => {
-  const g = groups.get(currentGroup)
-  if (cond) { pass++; if (g) g.pass++ }
-  else { fail++; if (g) g.fail++; console.log('  FAIL ' + label + (extra ? '  <-- ' + extra : '')) }
-}
+import { readFileSync } from 'node:fs'
+import path from 'node:path'
+import { createHarness } from './_harness.mjs'
 
-const deepEqual = (a, b) => {
-  if (a === b) return true
-  if (typeof a === 'number' && typeof b === 'number') return Number.isNaN(a) && Number.isNaN(b)
-  if (a === null || b === null || typeof a !== 'object' || typeof b !== 'object') return false
-  const aArr = Array.isArray(a), bArr = Array.isArray(b)
-  if (aArr !== bArr) return false
-  if (aArr) {
-    if (a.length !== b.length) return false
-    for (let i = 0; i < a.length; i++) if (!deepEqual(a[i], b[i])) return false
-    return true
-  }
-  const ka = Object.keys(a), kb = Object.keys(b)
-  if (ka.length !== kb.length) return false
-  for (const k of ka) {
-    if (!Object.prototype.hasOwnProperty.call(b, k)) return false
-    if (!deepEqual(a[k], b[k])) return false
-  }
-  return true
-}
+const h = createHarness()
+const { ok } = h
+
+const BEGIN = '/*__COLLAB_CORE_BEGIN__*/'
+const END = '/*__COLLAB_CORE_END__*/'
+// 外壳模板里的内联点（构建时被换成 BEGIN + 核心 + END）。生成物里不许再有它。
+const MARKER_LINE = '    /*__COLLAB_CORE__*/'
+
 const show = (v) => {
   let s
-  try {
-    s = JSON.stringify(v, (k, val) => {
-      if (typeof val === 'function') return '[fn]'
-      if (val === undefined) return '[undefined]'
-      if (typeof val === 'number' && Number.isNaN(val)) return '[NaN]'
-      return val
-    })
-  } catch (e) { s = String(v) }
+  try { s = JSON.stringify(v) } catch (e) { s = String(v) }
   if (s === undefined) s = String(v)
   return s.length > 240 ? s.slice(0, 240) + '…' : s
 }
-const cmp = (label, hv, cv, extra) =>
-  ok(deepEqual(hv, cv), label, 'host=' + show(hv) + ' core=' + show(cv) + (extra ? ' ' + extra : ''))
-
-// ---------------------------------------------------------------- 抽取器
-// 从 hostCode 源码文本里取出**真实函数体**并执行。三种形态都要吃下：
-//   function name(args) { … \n    }          （多行函数声明）
-//   const name = (args) => { … \n    }       （多行箭头）
-//   const name = args => expr                （单行箭头，如 seg）
-//   const name = () => ({ … })               （单行箭头 + 括号包裹的对象字面量，如 init）
-// 因此不能只靠正则，必须做**括号配对扫描**；并且声明必须锚定**恰好 4 空格缩进**：
-// hostCode 里还有一处深层缩进的 `const init = agents.currentInitiator()…`（12 空格），
-// 裸匹配 `const init` 会抽到它。锚定这一事实由下面的 group('name-set') 显式断言。
-const PAIRS = { '(': ')', '[': ']', '{': '}' }
-const ID_CHAR = /[A-Za-z0-9_$]/
-
-function skipTrivia(src, i) {
-  for (;;) {
-    const c = src[i]
-    if (c === undefined) return i
-    if (c === ' ' || c === '\t' || c === '\n' || c === '\r') { i++; continue }
-    if (c === '/' && src[i + 1] === '/') { while (i < src.length && src[i] !== '\n') i++; continue }
-    if (c === '/' && src[i + 1] === '*') { i += 2; while (i < src.length && !(src[i] === '*' && src[i + 1] === '/')) i++; i += 2; continue }
-    return i
+const firstDiff = (got, want) => {
+  const n = Math.min(got.length, want.length)
+  for (let i = 0; i < n; i++) {
+    if (got[i] !== want[i]) return 'i=' + i + ' got=' + JSON.stringify(got.slice(i, i + 40)) + ' want=' + JSON.stringify(want.slice(i, i + 40))
   }
+  return got.length === want.length ? '' : 'length got=' + got.length + ' want=' + want.length
 }
-function skipString(src, i) {
-  const q = src[i]; i++
-  while (i < src.length) {
-    if (src[i] === '\\') { i += 2; continue }
-    if (src[i] === q) return i + 1
-    i++
-  }
-  throw new Error('unterminated string')
-}
-function skipTemplate(src, i) {
-  i++
-  while (i < src.length) {
-    if (src[i] === '\\') { i += 2; continue }
-    if (src[i] === '`') return i + 1
-    if (src[i] === '$' && src[i + 1] === '{') { i = scanBalanced(src, i + 1) + 1; continue }
-    i++
-  }
-  throw new Error('unterminated template')
-}
-function skipRegex(src, i) {
-  i++
-  let cls = false
-  while (i < src.length) {
-    const c = src[i]
-    if (c === '\\') { i += 2; continue }
-    if (c === '\n') throw new Error('unterminated regex')
-    if (c === '[') cls = true
-    else if (c === ']') cls = false
-    else if (c === '/' && !cls) { i++; while (/[a-z]/i.test(src[i] || '')) i++; return i }
-    i++
-  }
-  throw new Error('unterminated regex')
-}
-const regexAllowed = (prev) => prev === null || '(,=:[!&|?{};+-*/%^<>~'.includes(prev)
-
-// src[openIdx] 是开括号；返回配对闭括号的下标（跳过字符串/注释/正则）。
-function scanBalanced(src, openIdx) {
-  const close = PAIRS[src[openIdx]]
-  if (!close) throw new Error('not an opening bracket at ' + openIdx)
-  let depth = 0, i = openIdx, prev = null
-  while (i < src.length) {
-    const c = src[i]
-    if (c === "'" || c === '"') { i = skipString(src, i); prev = 'x'; continue }
-    if (c === '`') { i = skipTemplate(src, i); prev = 'x'; continue }
-    if (c === '/' && src[i + 1] === '/') { while (i < src.length && src[i] !== '\n') i++; continue }
-    if (c === '/' && src[i + 1] === '*') { i += 2; while (i < src.length && !(src[i] === '*' && src[i + 1] === '/')) i++; i += 2; continue }
-    if (c === '/' && regexAllowed(prev)) { i = skipRegex(src, i); prev = 'x'; continue }
-    if (c === '(' || c === '[' || c === '{') { depth++; prev = c; i++; continue }
-    if (c === ')' || c === ']' || c === '}') {
-      depth--
-      if (depth === 0) { if (c !== close) throw new Error('bracket mismatch at ' + i); return i }
-      prev = c; i++; continue
-    }
-    if (!(c === ' ' || c === '\t' || c === '\n' || c === '\r')) prev = c
-    i++
-  }
-  throw new Error('unbalanced bracket from ' + openIdx)
-}
-function findDecl(src, name) {
-  const esc = name.replace(/\$/g, '\\$')
-  const mFn = new RegExp('^ {4}(?:async\\s+)?function\\s+' + esc + '\\s*\\(', 'm').exec(src)
-  const mVar = new RegExp('^ {4}const\\s+' + esc + '\\s*=', 'm').exec(src)
-  if (mFn && (!mVar || mFn.index < mVar.index)) return { idx: mFn.index, kind: 'function' }
-  if (mVar) return { idx: mVar.index, kind: 'const' }
-  return null
-}
-function declText(src, name) {
-  const d = findDecl(src, name)
-  if (!d) throw new Error('declaration not found: ' + name)
-  const start = d.idx
-  let end
-  if (d.kind === 'function') {
-    const j = scanBalanced(src, src.indexOf('(', d.idx))
-    const i = skipTrivia(src, j + 1)
-    if (src[i] !== '{') throw new Error('no body brace: ' + name)
-    end = scanBalanced(src, i)
-  } else {
-    let j = skipTrivia(src, src.indexOf('=', d.idx) + 1)
-    if (src.startsWith('async', j)) j = skipTrivia(src, j + 5)
-    if (src[j] === '(') j = scanBalanced(src, j) + 1
-    else { while (ID_CHAR.test(src[j] || '')) j++ }
-    j = skipTrivia(src, j)
-    if (!src.startsWith('=>', j)) throw new Error('no arrow: ' + name)
-    j = skipTrivia(src, j + 2)
-    if (src[j] === '{' || src[j] === '(') { end = scanBalanced(src, j) }
-    else {
-      // 单表达式箭头（如 `p => p.split('/').filter(Boolean)`）：扫到顶层换行/分号为止。
-      let depth = 0, prev = null, k = j
-      while (k < src.length) {
-        const c = src[k]
-        if (c === "'" || c === '"') { k = skipString(src, k); prev = 'x'; continue }
-        if (c === '`') { k = skipTemplate(src, k); prev = 'x'; continue }
-        if (c === '/' && src[k + 1] === '/') break
-        if (c === '/' && regexAllowed(prev)) { k = skipRegex(src, k); prev = 'x'; continue }
-        if (c === '(' || c === '[' || c === '{') { depth++; prev = c; k++; continue }
-        if (c === ')' || c === ']' || c === '}') { if (depth === 0) break; depth--; prev = c; k++; continue }
-        if ((c === ';' || c === '\n') && depth === 0) break
-        if (!/\s/.test(c)) prev = c
-        k++
-      }
-      end = k - 1
-      while (end > start && /\s/.test(src[end])) end--
-    }
-  }
-  return src.slice(start, end + 1)
-}
-function extractFrom(src, name, scope) {
-  const text = declText(src, name)
-  const k = Object.keys(scope || {}), v = k.map((n) => scope[n])
-  const isFn = /^(?:async\s+)?function\b/.test(text.trim())
-  const body = isFn ? 'return ' + text : text + ';\nreturn ' + name
-  const fn = new Function(...k, body)(...v)
-  if (typeof fn !== 'function') throw new Error('not a function: ' + name)
-  return fn
-}
-// 宿主形态里"恰好 4 空格缩进"的函数声明名（函数声明 + 箭头函数赋值）。
-// 只是候选名集合，用来算同名集合；不要求每个都能被抽取（exec/lock 这类组合式工厂不在对拍范围内）。
-function hostDeclNames(src) {
+// 声明名抽取：只认**apply 顶层**（内联核心在 0 空格，外壳在 4 空格）。局部遮蔽（更深缩进）不算。
+const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+const declaredAt = (src, name) => [...src.matchAll(new RegExp('^(?: {4})?(?:async\\s+)?(?:function|const|let)\\s+' + escapeRe(name) + '\\b', 'gm'))]
+const shellDeclNames = (src) => {
   const out = new Set()
   for (const m of src.matchAll(/^ {4}(?:async\s+)?function\s+([A-Za-z_$][\w$]*)/gm)) out.add(m[1])
-  for (const m of src.matchAll(/^ {4}const\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>/gm)) out.add(m[1])
+  for (const m of src.matchAll(/^ {4}(?:const|let)\s+([A-Za-z_$][\w$]*)\s*=/gm)) out.add(m[1])
   return out
 }
 
 // ---------------------------------------------------------------- 装载产物（缺失即失败，不 SKIP）
 let hostCode = null
 let core = null
+let coreSrc = ''
 try {
   hostCode = (await import(new URL('../lib/collab-plugin.host.js', import.meta.url))).hostCode
   core = await import(new URL('../lib/collab-core.js', import.meta.url))
+  coreSrc = readFileSync(new URL('../lib/collab-core.js', import.meta.url), 'utf8')
 } catch (e) {
   console.log('FAIL cannot load built artifacts (run `npm run build`): ' + String((e && e.message) || e))
   console.log('\nFAILURES: 0 passed, 1 failed')
   process.exit(1)
 }
-group('extraction', '从 lib 产物里取函数（任何失败都算失败，不 SKIP）')
-ok(typeof hostCode === 'string' && hostCode.length > 1000, 'lib/collab-plugin.host.js 导出非空 hostCode 字符串', 'len=' + String(hostCode && hostCode.length))
+
+console.log('# 生成物形态')
+ok(typeof hostCode === 'string' && hostCode.length > 1000, 'lib/collab-plugin.host.js 导出非空 hostCode 字符串',
+  'len=' + String(hostCode && hostCode.length))
 ok(typeof core === 'object' && core !== null, 'lib/collab-core.js 可 import')
-if (!hostCode || typeof hostCode !== 'string') {
-  console.log('\nFAILURES: ' + pass + ' passed, ' + fail + ' failed')
+ok(Boolean(core && core.MODES && core.MODES.length === 3), 'lib/collab-core.js 是构建产物（MODES 就位）')
+if (typeof hostCode !== 'string') {
+  console.log('\nFAILURES: ' + h.pass + ' passed, ' + h.fail + ' failed')
   process.exit(1)
 }
 
-// ---------------------------------------------------------------- 期望集合
-// 30 个"逐输出对拍"的同名函数（0.13.0 加 filterMessages / channelRosterNote）。
-const EXPECTED_PARITY = [
-  'claim', 'cleanName', 'clockUtc', 'dropHolder', 'expire', 'hashProjectKey', 'heartbeat',
-  'holder', 'holderFresh', 'holderHandle', 'holderLabel', 'holderRosterNote', 'holderView',
-  'inFamily', 'init', 'modeLabel', 'norm', 'ov', 'post', 'reap',
-  'release', 'releaseOnLoopEnd', 'renderDigest', 'seg', 'sweep',
-  // 0.11.0 官方 Agent Teams 交叉预警的三个同名纯函数（两形态逐输出对拍）。
-  'teamCrossWarnLine', 'teamScopeOverlaps', 'teamTaskScopeLine',
-  // 0.13.0：留言读取抽成同名纯函数（以前宿主把这段抄在 async msgs 里，对拍抓不到漂移 ——
-  // 两边都是 slice(-limit) 时"一起丢中段"谁也没发现）。现在 30 个逐输出对拍函数。
-  'filterMessages', 'channelRosterNote'
-].sort()
-// 同名但**不同形**：宿主的 overview(agentId) 是 async 的 I/O op（load→expire→聚合），
-// core 的 overview(state) 是纯状态变换。两者不是同一形状的函数，不能逐参对拍；
-// 但"同名"这一事实仍然要进集合断言，聚合逻辑本身另有专门对拍（见 group('overview')）。
-const KNOWN_SHAPE_DIVERGENT = ['overview']
-const EXPECTED_SAME_NAME = [...EXPECTED_PARITY, ...KNOWN_SHAPE_DIVERGENT].sort()
+// ---------------------------------------------------------------- 1. 内联区位置
+const bi = hostCode.indexOf(BEGIN)
+const ei = hostCode.indexOf(END)
+ok(bi >= 0, 'hostCode 含核心内联区起点标记 ' + BEGIN, 'i=' + bi)
+ok(ei > bi, 'hostCode 含核心内联区终点标记 ' + END, 'i=' + ei)
+const region = (bi >= 0 && ei > bi) ? hostCode.slice(bi + BEGIN.length + 1, ei) : ''
+const shellRegion = (bi >= 0 && ei > bi) ? hostCode.slice(0, bi) + hostCode.slice(ei + END.length) : ''
+ok(hostCode.indexOf(MARKER_LINE) === -1, '外壳模板里的内联点标记已被替换（生成物里不残留）')
+ok(region.length > 1000 && region.indexOf(BEGIN) === -1 && region.indexOf(END) === -1,
+  '内联区唯一且非空', 'len=' + region.length)
 
-// 抽取 hostCode 里的函数体（scope 注入它引用到的同源函数，保证依赖也是真实内联副本）。
-const T0 = Date.UTC(2026, 0, 2, 3, 4, 37)
-const fixedNow = () => T0
-const host = {}
-const extractErrors = []
-// 宿主内联的 MODE_LABELS 从真实源码里抽出来（不手抄副本），再注入 modeLabel 抽取。
-let hostModeLabels = {}
+// ---------------------------------------------------------------- 2. 逐字节同源（本文件的核心守卫）
+{
+  const coreStripped = coreSrc.replace(/^export /gm, '')
+  ok(coreStripped.length > 1000, 'lib/collab-core.js 去 export 后非空', 'len=' + coreStripped.length)
+  ok(region === coreStripped,
+    '内联核心与 lib/collab-core.js 去 export 后逐字节一致（两形态纯逻辑同源的根）',
+    firstDiff(region, coreStripped))
+  ok(!/^\s*(?:import|export)\b/m.test(region), '内联核心不含顶层 import/export（自包含）')
+  ok(!/\brequire\s*\(/.test(region), '内联核心不含 require（动态宿主里没有 require）')
+  ok(!/\bprocess\b/.test(region), '内联核心不引用 process（受限动态宿主里 undefined）')
+  ok(!/\bos\b/.test(region), '内联核心不引用 os（受限动态宿主里 undefined）')
+}
+
+// ---------------------------------------------------------------- 2b. 纪律文本内联区（第二处内联）
+// 委托纪律文本（order 131）从 lib/spec.js 取值内联 —— 它同样是动态宿主里的受限内容，
+// 且**只有值**（JSON 字符串字面量），不是源码切片：spec.js 有顶层 import，整份进不来。
+const DBEGIN = '/*__COLLAB_DISCIPLINE_BEGIN__*/'
+const DEND = '/*__COLLAB_DISCIPLINE_END__*/'
+const DMARKER_LINE = '    /*__COLLAB_DISCIPLINE_TEXT__*/'
+{
+  const dbi = hostCode.indexOf(DBEGIN)
+  const dei = hostCode.indexOf(DEND)
+  ok(dbi >= 0, 'hostCode 含纪律文本内联区起点标记 ' + DBEGIN, 'i=' + dbi)
+  ok(dei > dbi, 'hostCode 含纪律文本内联区终点标记 ' + DEND, 'i=' + dei)
+  ok(hostCode.indexOf(DMARKER_LINE) === -1, '外壳模板里的纪律内联点标记已被替换（生成物里不残留）')
+  const dregion = (dbi >= 0 && dei > dbi) ? hostCode.slice(dbi + DBEGIN.length + 1, dei) : ''
+  ok(!/^\s*(?:import|export)\b/m.test(dregion), '纪律内联区不含顶层 import/export（自包含）')
+  ok(!/\brequire\s*\(/.test(dregion), '纪律内联区不含 require（动态宿主里没有 require）')
+  ok(!/\bprocess\b/.test(dregion) && !/\bos\b/.test(dregion), '纪律内联区不引用 process/os')
+  ok(/const\s+DELEGATION_DISCIPLINE_TEXT\s*=\s*"/.test(dregion),
+    '纪律文本以 JSON 字符串字面量内联（值取自 spec，不是手抄的数组源码）', show(dregion.slice(0, 80)))
+}
+
+// ---------------------------------------------------------------- 2c. 路径规格内联区（第三处内联）
+// 功能 C 的写门控要按工具名/入参判读写路径，事实源是 src/spec.ts 的 TOOL_PATH_SPECS /
+// COMMAND_AWARE_TOOL / pathArgsFor。spec.js **不自包含**（顶层 import schemastery + collab-core），
+// 所以构建期只取**值与函数源码**内联 —— 外壳里一个字都不手抄，改 spec.ts 只需重新 build。
+const PBEGIN = '/*__COLLAB_PATH_SPECS_BEGIN__*/'
+const PEND = '/*__COLLAB_PATH_SPECS_END__*/'
+const PMARKER_LINE = '    /*__COLLAB_PATH_SPECS__*/'
+{
+  const spec = await import(new URL('../lib/spec.js', import.meta.url))
+  const pbi = hostCode.indexOf(PBEGIN)
+  const pei = hostCode.indexOf(PEND)
+  ok(pbi >= 0, 'hostCode 含路径规格内联区起点标记 ' + PBEGIN, 'i=' + pbi)
+  ok(pei > pbi, 'hostCode 含路径规格内联区终点标记 ' + PEND, 'i=' + pei)
+  ok(hostCode.indexOf(PMARKER_LINE) === -1, '外壳模板里的路径规格内联点标记已被替换（生成物里不残留）')
+  const pregion = (pbi >= 0 && pei > pbi) ? hostCode.slice(pbi + PBEGIN.length + 1, pei) : ''
+  ok(!/^\s*(?:import|export)\b/m.test(pregion), '路径规格内联区不含顶层 import/export（自包含）')
+  ok(!/\brequire\s*\(/.test(pregion), '路径规格内联区不含 require（动态宿主里没有 require）')
+  ok(!/\bprocess\b/.test(pregion) && !/\bos\b/.test(pregion), '路径规格内联区不引用 process/os')
+
+  let pinlined = null
+  let perr = null
+  try {
+    // 独立求值：证明这段不依赖任何外部符号就定义出三个名字。
+    pinlined = new Function(pregion + '\n;return { TOOL_PATH_SPECS, COMMAND_AWARE_TOOL, pathArgsFor };')()
+  } catch (e) { perr = String((e && e.stack) || e) }
+  ok(!!pinlined, '路径规格内联区可独立求值（不依赖外部符号）', perr)
+
+  // 漂移守卫：内联的表与 lib/spec.js（= src/spec.ts 的构建产物）**逐字段一致**。
+  // 漏一行就会让某个核心 fs 工具静默不受门控保护（read_image 就是这么漏过一次的）。
+  ok(!!pinlined && JSON.stringify(pinlined.TOOL_PATH_SPECS) === JSON.stringify(spec.TOOL_PATH_SPECS),
+    '内联的 TOOL_PATH_SPECS 与 lib/spec.js 的值逐字段一致',
+    show(pinlined && Object.keys(pinlined.TOOL_PATH_SPECS || {})))
+  ok(!!pinlined && pinlined.COMMAND_AWARE_TOOL === spec.COMMAND_AWARE_TOOL,
+    '内联的 COMMAND_AWARE_TOOL 与 lib/spec.js 的值一致', show(pinlined && pinlined.COMMAND_AWARE_TOOL))
+  // 行为守卫：同一批入参下内联函数与真身输出逐个相同（含 command 分读写的分支）。
+  const CASES = [
+    ['write', { file_path: 'a/b.ts' }],
+    ['edit', { file_path: 'a/b.ts' }],
+    ['read', { file_path: 'a/b.ts' }],
+    ['read_image', { file_path: 'a/b.png' }],
+    ['glob', { path: 'src/' }],
+    ['grep', { path: 'src/', pattern: 'x' }],
+    ['str_replace_editor', { command: 'view', path: 'a/b.ts' }],
+    ['str_replace_editor', { command: 'create', path: 'a/b.ts' }],
+    ['str_replace_editor', { command: 'wat', path: 'a/b.ts' }],
+    ['bash', { command: 'echo hi' }],
+    ['unknown_tool', { file_path: 'a/b.ts' }]
+  ]
+  const diffs = []
+  for (const [tool, args] of CASES) {
+    const got = pinlined && JSON.stringify(pinlined.pathArgsFor(tool, args))
+    const want = JSON.stringify(spec.pathArgsFor(tool, args))
+    if (got !== want) diffs.push(tool + ': got=' + got + ' want=' + want)
+  }
+  ok(diffs.length === 0, '内联 pathArgsFor 与 lib/spec.js 的行为逐例一致（含 command 分读写）', show(diffs))
+}
+
+// ---------------------------------------------------------------- 3. 内联区可独立求值
+let inlined = null
+let inlinedErr = null
 try {
-  const m = /const MODE_LABELS = \{([^}]*)\}/.exec(hostCode)
-  if (!m) throw new Error('hostCode 缺少 MODE_LABELS 对象')
-  hostModeLabels = new Function('return {' + m[1] + '}')()
-} catch (e) { extractErrors.push('MODE_LABELS: ' + String((e && e.message) || e)) }
-const tryExtract = (name, scope) => {
-  try { host[name] = extractFrom(hostCode, name, scope) }
-  catch (e) { extractErrors.push(name + ': ' + String((e && e.message) || e)) }
-}
-tryExtract('seg')
-tryExtract('ov', { seg: host.seg })
-tryExtract('norm')
-tryExtract('hashProjectKey')
-tryExtract('cleanName')
-tryExtract('holderHandle')
-tryExtract('holderLabel', { holderHandle: host.holderHandle })
-tryExtract('holderRosterNote')
-tryExtract('init')
-tryExtract('inFamily')
-tryExtract('holderFresh')
-tryExtract('sweep', { holderFresh: host.holderFresh })
-tryExtract('expire', { sweep: host.sweep })
-tryExtract('holderView', { holderFresh: host.holderFresh })
-tryExtract('clockUtc')
-tryExtract('modeLabel', { MODE_LABELS: hostModeLabels })
-tryExtract('renderDigest', { clockUtc: host.clockUtc, modeLabel: host.modeLabel, holderLabel: host.holderLabel })
-tryExtract('holder', { now: fixedNow })
-tryExtract('hostReaders')
-tryExtract('pub', { hostReaders: host.hostReaders })
-tryExtract('conflict')
-tryExtract('withWarn')
-tryExtract('claim', { now: fixedNow, norm: host.norm, ov: host.ov, holder: host.holder, pub: host.pub, conflict: host.conflict, inFamily: host.inFamily })
-tryExtract('release', { now: fixedNow, norm: host.norm, ov: host.ov, pub: host.pub })
-// reap（0.9.8）：纯函数 reap(s, h, a, liveHolderIds, t)。宿主内联的默认 age 门槛写成字面量 600，
-// 与 core 的 REAP_DEFAULT_OLDER_THAN_SEC 是否一致由下面的语料守护（含一个不传 olderThanSec 的用例）。
-tryExtract('reap', { norm: host.norm, ov: host.ov, pub: host.pub })
-tryExtract('dropHolder', { pub: host.pub, hostReaders: host.hostReaders })
-// releaseOnLoopEnd（0.9.10）：纯函数 releaseOnLoopEnd(s, holderId, holderName, t, graceSec)。
-// 宿主内联的 author 写字面量 'system:dsh-collab'，core 侧用导出的 AUTO_RELEASE_AUTHOR —— 两者是否
-// 一致由下面的语料**逐输出**守护（消息对象里带 author 字段，对拍即校验）。宽限期同理：宿主是
-// 接线层传进来的常量 15，core 不自己判断，所以语料里显式传不同 graceSec 值。
-tryExtract('releaseOnLoopEnd', { pub: host.pub, holderLabel: host.holderLabel })
-tryExtract('heartbeat', { now: fixedNow })
-tryExtract('post', { now: fixedNow, holder: host.holder })
-// 0.13.0：留言读取的同名纯函数（filterMessages 依赖 channelRosterNote，注入它的内联副本）。
-tryExtract('channelRosterNote')
-tryExtract('filterMessages', { channelRosterNote: host.channelRosterNote })
-let overviewLoad = async () => ({ state: null, target: { path: '/fake/collab/state.json' }, stateDir: '/tmp', warn: null })
-// 跨项目观测的宿主内联副本（0.9.11）：不在同名集合里（core 侧的对应实现住在 store.ts），
-// 只为让抽取出的 overview 能解析到它。fs 桩没有 listDir ⇒ 它会走"只报当前项目"的分支。
-tryExtract('otherProjects', { fs: { processPath: (t) => (t && t.path) || String(t) } })
-// 官方 Agent Teams 交叉预警（0.11.0）：三个同名纯函数进对拍；teamTasks 是宿主侧 I/O 读，
-// 不是 core 导出，只作为 overview 抽取的依赖注入（这里给一个"服务缺席"的桩 ⇒ 返回 null）。
-tryExtract('teamTaskScopeLine')
-tryExtract('teamScopeOverlaps', { norm: host.norm, ov: host.ov })
-tryExtract('teamCrossWarnLine', { norm: host.norm, ov: host.ov, holderLabel: host.holderLabel })
-tryExtract('teamTasks', { ctx: { get: () => undefined } })
-tryExtract('overview', {
-  load: (id) => overviewLoad(id),
-  now: fixedNow,
-  expire: host.expire,
-  pub: host.pub,
-  withWarn: host.withWarn,
-  otherProjects: host.otherProjects,
-  teamTasks: host.teamTasks,
-  fs: { processPath: (t) => (t && t.path) || String(t) }
-})
+  // 把内联区当成一段独立脚本求值：证明它不依赖任何外部符号就能定义出核心函数。
+  inlined = new Function(region + '\n;return { sweep, expire, holderView, filterMessages, channelRosterNote, claim, publish, HOLDER_VIEW_LIMIT, MAX_MESSAGES };')()
+} catch (e) { inlinedErr = String((e && e.stack) || e) }
+ok(!!inlined, '内联核心可独立求值（new Function 里不依赖任何外部符号）', inlinedErr)
+ok(inlined && typeof inlined.sweep === 'function' && typeof inlined.claim === 'function',
+  '内联区确实定义了核心函数（sweep / claim）')
 
-// core 侧只取同名导出（lib/collab-core.js 的导出函数集合），不做任何别名映射。
-const coreFns = {}
-for (const n of EXPECTED_PARITY.concat(KNOWN_SHAPE_DIVERGENT)) {
-  if (typeof core[n] !== 'function') extractErrors.push('core 缺少导出函数 ' + n)
-  else coreFns[n] = core[n]
-}
-for (const n of ['pub', 'hostReaders', 'conflict', 'withWarn', 'overview']) {
-  if (typeof host[n] !== 'function') extractErrors.push('hostCode 缺少函数 ' + n)
-}
-
-// ---------------------------------------------------------------- 同名集合守护
-// 放在抽取失败早退**之前**：删掉/改名一侧的同名函数时，集合断言必须先红，
-// 否则"漏接对拍"这条守护会被抽取失败掩盖掉。
-group('name-set', '两形态同名函数集合必须恰好等于期望集合（漏接对拍会红）')
+// ---------------------------------------------------------------- 4. 外壳不越权
 {
-  const hostNames = hostDeclNames(hostCode)
-  const coreNames = new Set(Object.entries(core).filter(([, v]) => typeof v === 'function').map(([k]) => k))
-  const actual = [...hostNames].filter((n) => coreNames.has(n)).sort()
-  const missing = EXPECTED_SAME_NAME.filter((n) => !actual.includes(n))
-  const extra = actual.filter((n) => !EXPECTED_SAME_NAME.includes(n))
-  console.log('  实测同名集合(' + actual.length + ')：' + JSON.stringify(actual))
-  console.log('  期望同名集合(' + EXPECTED_SAME_NAME.length + ')：' + JSON.stringify(EXPECTED_SAME_NAME))
-  console.log('  差集：期望缺失=' + show(missing) + '  实测多出=' + show(extra))
-  ok(deepEqual(actual, EXPECTED_SAME_NAME),
-    '两形态同名函数集合 === 期望集合（多出的同名函数必须接进对拍或登记为 shape-divergent）',
-    'missing=' + show(missing) + ' extra=' + show(extra))
-  ok(missing.length === 0, '期望集合里每个函数在两侧都存在', show(missing))
-  ok(extra.length === 0, '没有"两边同名却没被本测试登记"的函数', show(extra))
-  ok(hostNames.size > EXPECTED_SAME_NAME.length && coreNames.size > EXPECTED_SAME_NAME.length,
-    '宿主/包形态的函数集合都大于同名集合（说明同名集合是真交集，不是被空集对上）',
-    'host=' + hostNames.size + ' core=' + coreNames.size)
-  // init 遮蔽：抽取必须锚定 4 空格缩进
-  const rawInit = [...hostCode.matchAll(/const\s+init\s*=/g)].length
-  const anchoredInit = [...hostCode.matchAll(/^ {4}const\s+init\s*=/gm)].length
-  ok(rawInit > anchoredInit && anchoredInit === 1,
-    '抽取锚定 4 空格缩进：hostCode 里 `const init` 另有一处更深缩进的同名遮蔽',
-    'raw=' + rawInit + ' anchored=' + anchoredInit)
-}
+  const coreNames = new Set(Object.keys(core))
+  const shellDecls = shellDeclNames(shellRegion)
+  const shadow = [...shellDecls].filter((n) => coreNames.has(n)).sort()
+  console.log('  外壳顶层声明(' + shellDecls.size + ')：' + show([...shellDecls].sort()))
+  ok(shellDecls.size > 0, '外壳层有顶层声明（不是被掏空的外壳）', 'n=' + shellDecls.size)
+  ok(shadow.length === 0, '外壳层不声明任何 collab-core 导出的名字（不遮蔽、不复刻）', show(shadow))
+  // 唯一被逼改名的接缝：核心有纯函数 overview(state)，外壳的 I/O op 因此改名 overviewOf。
+  ok(shellDecls.has('overviewOf') && !shellDecls.has('overview'),
+    'op=overview 的 I/O 层叫 overviewOf（避免与核心 overview 同名）', show([...shellDecls].filter((n) => n === 'overview' || n === 'overviewOf')))
 
-// ---------------------------------------------------------------- 抽取失败即失败（不 SKIP）
-group('extraction')
-ok(extractErrors.length === 0, '全部函数抽取成功（' + (EXPECTED_PARITY.length + 1) + ' 个对拍目标 + 4 个依赖）',
-  show(extractErrors))
-if (extractErrors.length) {
-  console.log('\n抽取失败明细：\n  - ' + extractErrors.join('\n  - '))
-  console.log('\nFAILURES: ' + pass + ' passed, ' + fail + ' failed')
-  process.exit(1)
-}
-
-// ---------------------------------------------------------------- 语料工具
-const mkState = (o) => Object.assign({ schemaVersion: 1, seq: 7, claims: [], messages: [], holders: [] }, o)
-const mkClaimRec = (o) => Object.assign({
-  claimId: 'c_1', holderId: 'agent:A', holderName: 'Worker A', paths: ['src/a/'], mode: 'exclusive',
-  ttlSec: 1800, expiresAt: T0 + 1800 * 1000, note: '', createdAt: T0, readable: true, readers: []
-}, o)
-const HOLDER_A = { holderId: 'agent:A', sessionId: 'sess-A', name: 'Worker A' }
-const HOLDER_B = { holderId: 'agent:B', sessionId: 'sess-B', name: 'Worker B' }
-const NAME_A = 'Worker A'
-const mkMessages = (n, startSeq) => Array.from({ length: n }, (_, i) => ({
-  msgId: 'm_' + (startSeq + i), seq: startSeq + i, channel: (i % 3 === 0) ? 'general' : 'path:src/a/',
-  author: 'agent:A', ts: T0 + i, body: 'body ' + i
-}))
-const mkBackdated = (ms) => T0 - ms
-
-const run = (fn, args) => {
-  try { return { threw: false, value: fn.apply(null, args) } }
-  catch (e) {
-    return { threw: true, err: { name: e && e.name, message: e && e.message, collabConflict: e && e.collabConflict, conflicts: e && e.conflicts } }
+  const missing = [], dup = [], outside = []
+  for (const n of coreNames) {
+    const hits = declaredAt(hostCode, n)
+    if (hits.length === 0) missing.push(n)
+    else if (hits.length > 1) dup.push(n + 'x' + hits.length)
+    else if (hits[0].index <= bi || hits[0].index >= ei) outside.push(n)
   }
-}
-// 剥掉 core 信封里的注入时钟与 state 引用（不是可比较的数据；state 另行逐字段比较）。
-const strip = (r) => {
-  if (!r || typeof r !== 'object' || Array.isArray(r) || !('ok' in r)) return r
-  const out = {}
-  for (const k of Object.keys(r)) { if (k === 'tNow' || k === 'state') continue; out[k] = r[k] }
-  return out
-}
-const outcome = (r) => (r.threw ? { threw: true, err: r.err } : { threw: false, value: strip(r.value) })
+  ok(coreNames.size > 40, '核心导出足够多（说明在扫真的模块）', 'n=' + coreNames.size)
+  ok(missing.length === 0, '每个 collab-core 导出都在 hostCode 里出现', show(missing))
+  ok(dup.length === 0, '没有哪个核心名在 apply 顶层被声明两次（外壳没有复刻）', show(dup))
+  ok(outside.length === 0, '每个核心声明的唯一出现都落在内联区里', show(outside))
 
-// 每例各自建**两份独立输入**（共享可变对象会掩盖漂移）。
-// build() 返回 { hostArgs, coreArgs, state?, stateKey? }；state 是同一份独立输入里被传入的对象。
-const pairCase = (fnName, label, build) => {
-  const h = build(), c = build()
-  const hr = run(host[fnName], h.hostArgs)
-  const cr = run(coreFns[fnName], c.coreArgs)
-  cmp(fnName + ' · ' + label + ' · 输出', outcome(hr), outcome(cr))
-  if (h.state !== undefined) cmp(fnName + ' · ' + label + ' · 调用后 state', h.state, c.state)
-}
-// 纯函数（无 state 入参）
-const pureCase = (fnName, label, hostArgs, coreArgs) =>
-  cmp(fnName + ' · ' + label, run(host[fnName], hostArgs).value, run(coreFns[fnName], coreArgs).value,
-    run(host[fnName], hostArgs).threw || run(coreFns[fnName], coreArgs).threw ? '(存在抛出)' : '')
-
-// 参数名/顺序不同的同名函数：显式登记两边的调用适配（不改变任何一边的真实签名）。
-const CLAIM_SPEC = (state, h, name, a) => ({ hostArgs: [state, h, name, a], coreArgs: [state, h, a, fixedNow], state })
-
-// ---------------------------------------------------------------- norm
-group('norm', '路径归一：空/斜杠/波浪号/前导尾随/./..')
-{
-  const inputs = [
-    ['空串', ''], ['纯空白', '   '], ['单斜杠', '/'], ['多斜杠', '///'], ['波浪号', '~'],
-    ['前导斜杠', '/src/foo'], ['尾随斜杠', 'src/foo/'], ['重复斜杠', 'src//foo'],
-    ['点斜杠前缀', './src'], ['段内点', 'src/./foo'], ['回退', 'a/../b'], ['越界回退', 'a/../../b'],
-    ['分隔重叠前缀', 'src/foo 与 src/foobar 的左项', 'src/foo'], ['右项', 'src/foobar'],
-    ['单段带斜杠', 'a/'], ['两段带斜杠', 'a/b/'], ['反斜杠', 'a\\b'], ['反斜杠尾随', 'a\\b\\'],
-    ['纯点点', '..'], ['单点', '.'], ['点点斜杠', './'], ['带空白的绝对路径', '  /a//b/  '],
-    ['null', null], ['undefined', undefined], ['数字', 42], ['对象', {}], ['数组', []], ['布尔', true]
-  ]
-  for (const [label, v] of inputs) pureCase('norm', label, [v], [v])
-}
-// ---------------------------------------------------------------- seg
-group('seg', '分段：空/斜杠/尾随；非字符串两侧同样抛错')
-{
-  const inputs = [
-    ['空串', ''], ['单斜杠', '/'], ['普通', 'a/b'], ['重复斜杠尾随', 'a//b/'],
-    ['波浪号', '~'], ['前缀对', 'src/foo'], ['null', null], ['undefined', undefined],
-    ['数字', 42], ['对象', {}], ['数组', []], ['布尔', true]
-  ]
-  for (const [label, v] of inputs) {
-    const hr = run(host.seg, [v]), cr = run(coreFns.seg, [v])
-    cmp('seg · ' + label, outcome(hr), outcome(cr))
-  }
-}
-// ---------------------------------------------------------------- ov
-group('ov', '分段前缀重叠：前缀但不同段不算重叠')
-{
-  const pairs = [
-    ['父子目录', 'src/backend/', 'src/backend/models/'], ['前缀不同段', 'src/foo', 'src/foobar'],
-    ['相同', 'a', 'a'], ['尾斜杠 vs 无', 'a/', 'a'], ['根斜杠 vs 段', '/', 'a'],
-    ['空左', '', 'a'], ['空右', 'a', ''], ['深子路径', 'a/b', 'a/b/c'],
-    ['近前缀', 'a/b', 'a/bc'], ['去斜杠', 'src/foo/', 'src/foo'], ['null 左', null, 'a'],
-    ['null 右', 'a', null], ['双 undefined', undefined, undefined], ['数字', 42, 'a'],
-    ['波浪号', '~', '~x'], ['双根斜杠', '/', '/'], ['兄弟目录', 'src/a/', 'src/b/']
-  ]
-  for (const [label, a, b] of pairs) pureCase('ov', label, [a, b], [a, b])
-}
-// ---------------------------------------------------------------- cleanName
-group('cleanName', '空白压缩 + 24 字截断 + 非字符串原样返回')
-{
-  const inputs = [
-    ['普通', 'hello'], ['压缩空白', '  a   b  '], ['制表换行', 'tab\tand\nnewline'],
-    ['恰好 24', 'a'.repeat(24)], ['25 字截断', 'a'.repeat(25)], ['长文本', 'x'.repeat(30) + ' tail'],
-    ['空串', ''], ['纯空白', '   '], ['中文超长', '中文名称'.repeat(10)],
-    ['数字', 123], ['null', null], ['undefined', undefined], ['对象', { a: 1 }], ['数组', ['a']]
-  ]
-  for (const [label, v] of inputs) pureCase('cleanName', label, [v], [v])
-}
-// ---------------------------------------------------------------- hashProjectKey
-group('hashProjectKey', '跨语言确定性哈希（12 位十六进制）')
-{
-  const inputs = [
-    ['空串', ''], ['默认', 'default'], ['项目名', 'my_project'],
-    ['绝对路径', '/home/vesita/coding/my/dsh-collab'], ['中文', '中文字符串'],
-    ['千字长串', 'a'.repeat(1000)], ['大写 64', 'A'.repeat(64)]
-  ]
-  for (const [label, v] of inputs) pureCase('hashProjectKey', label, [v], [v])
-}
-// ---------------------------------------------------------------- init
-group('init', '空状态形状相等，且每次都是新对象')
-{
-  const h1 = host.init(), c1 = coreFns.init()
-  cmp('init · 形状', h1, c1)
-  cmp('init · 键集合', Object.keys(h1).sort(), Object.keys(c1).sort())
-  ok(!deepEqual({}, h1), 'init 不是空对象（比较的是真实结构）', show(h1))
-  const h2 = host.init(), c2 = coreFns.init()
-  ok(h1 !== h2 && c1 !== c2, 'init 每次返回新对象（不是共享单例）')
-  h2.claims.push('x')
-  ok(h1.claims.length === 0, 'host init 两次调用互不影响')
-  c2.claims.push('x')
-  ok(c1.claims.length === 0, 'core init 两次调用互不影响')
-}
-// ---------------------------------------------------------------- clockUtc
-group('clockUtc', '毫秒 → MM-DD HH:MMZ（UTC 分钟粒度，秒被截掉）')
-{
-  const inputs = [
-    ['epoch', 0], ['固定时刻（秒非 0）', T0], ['+59s', T0 + 59000], ['-1ms 跨日', T0 - 1],
-    ['1969 年末', Date.UTC(1969, 11, 31, 23, 59, 59)], ['9999 年末', 253402300799000],
-    ['NaN', NaN]
-  ]
-  for (const [label, v] of inputs) pureCase('clockUtc', label, [v], [v])
-}
-// ---------------------------------------------------------------- modeLabel
-group('modeLabel', '模式名 → 中文标签（渲染专用；数据取值仍是 exclusive/shared/read）')
-{
-  for (const m of ['exclusive', 'shared', 'read']) {
-    cmp('modeLabel · ' + m, run(host.modeLabel, [m]), run(coreFns.modeLabel, [m]))
-  }
-  ok(coreFns.modeLabel('exclusive') === '独占' && coreFns.modeLabel('shared') === '共享' && coreFns.modeLabel('read') === '只读',
-    '三档中文标签固定为 独占/共享/只读',
-    JSON.stringify([coreFns.modeLabel('exclusive'), coreFns.modeLabel('shared'), coreFns.modeLabel('read')]))
-  cmp('modeLabel · 未知取值原样回退', run(host.modeLabel, ['weird']), run(coreFns.modeLabel, ['weird']))
-}
-// ---------------------------------------------------------------- renderDigest
-group('renderDigest', '占用摘要文本：逐字节等价 + 顺序无关')
-{
-  const c1 = mkClaimRec({ claimId: 'c_1', holderId: 'agent:one', holderName: 'One', paths: ['src/one/'] })
-  const c2 = mkClaimRec({ claimId: 'c_2', holderId: 'agent:two', holderName: 'Two', paths: ['src/two/'], mode: 'shared', expiresAt: T0 + 900000, ttlSec: 900 })
-  const c3 = mkClaimRec({ claimId: 'c_3', holderId: 'agent:three', holderName: 'Three', paths: ['src/three/'], mode: 'read', expiresAt: T0 + 3600000, ttlSec: 3600 })
-  const c4 = mkClaimRec({ claimId: 'c_4', holderId: 'agent:four', holderName: 'Four', paths: ['src/four/'], expiresAt: T0 + 7200000, ttlSec: 7200 })
-  const fixtures = [
-    ['空集合', []], ['单条', [c1]], ['三条', [c1, c2, c3]], ['四条', [c1, c2, c3, c4]],
-    ['多路径', [mkClaimRec({ claimId: 'c_p', paths: ['a/', 'b/', 'c/', 'd/'] })]],
-    ['缺 holderName', [mkClaimRec({ claimId: 'c_n', holderId: 'agent:anon', holderName: undefined })]],
-    ['乱序输入', [c3, c1, c2]], ['ttlSec 0', [mkClaimRec({ ttlSec: 0 })]],
-    ['无 createdAt', [mkClaimRec({ createdAt: undefined, ttlSec: 600 })]], ['单路径', [mkClaimRec({ paths: ['solo/'] })]]
-  ]
-  for (const [label, claims] of fixtures) {
-    cmp('renderDigest · ' + label, host.renderDigest(claims.slice()), coreFns.renderDigest(claims.slice()))
-  }
-  ok(host.renderDigest([c3, c1, c2]) === host.renderDigest([c1, c2, c3]), 'host 形态顺序无关')
-  ok(coreFns.renderDigest([c3, c1, c2]) === coreFns.renderDigest([c1, c2, c3]), 'core 形态顺序无关')
-  const sample = coreFns.renderDigest([c1, c2])
-  ok(sample.includes('One#one（独占）占用 src/one/，租约 30 分（01-02 03:04Z–01-02 03:34Z）'),
-    'core 渲染出文档化的绝对 UTC 窗口文案（证明比的是真实文本）', sample)
-  ok(sample.includes('Two#two（共享）占用 src/two/'), 'core 渲染 shared → 共享', sample)
-  const readOnly = coreFns.renderDigest([c3])
-  ok(readOnly.includes('Three#three（只读）占用 src/three/'), 'core 渲染 read → 只读', readOnly)
-}
-// ---------------------------------------------------------------- 名单短句柄（0.12.2）
-// 目的只有一个：会话标题会重名（实测一个名字占 10 份），holderId 不随标题变。
-// 三个 group 分别以函数名命名，以接入下面的「语料完整性守护」。
-const HB_U1 = 'agent:9c57bc11-b86b-4dc7-b98a-fe0f13b54fc8'
-const HB_U2 = 'agent:session-4942839c-7ca8-4d85-a689-902d3fb38236'
-const HB_U3 = 'agent:ff240262-aa4d-41b9-aa82-247f2c20ceb3'
-const HB_NAME = '你是 DTSeek 的实验子代理。工'
-
-group('holderHandle', '会话 id → 稳定短句柄（前 8 字符，session- 前缀剥掉）')
-{
-  const cases = [['uuid', HB_U1], ['session- 前缀', HB_U2], ['human', 'human:console'], ['缺 id', undefined], ['非字符串', 123]]
-  for (const [label, id] of cases) {
-    cmp('holderHandle · ' + label, run(host.holderHandle, [id]), run(coreFns.holderHandle, [id]))
-  }
-  ok(coreFns.holderHandle(HB_U1) === '9c57bc11', 'uuid 取前 8 字符', coreFns.holderHandle(HB_U1))
-  ok(coreFns.holderHandle(HB_U2) === '4942839c',
-    'session- 前缀必须剥掉（否则句柄恒为 "session-"，等于没有）', coreFns.holderHandle(HB_U2))
-  ok(coreFns.holderHandle('human:console') === '', 'human 没有会话 id → 空串（渲染侧据此不附句柄）')
+  // 缺陷 2：外壳曾自带 storageNameFor —— 与核心 projectStorageFileName 异名同义的双胞胎，
+  // 恰好落在所有对拍之外（名字不同，逐输出对拍认不出它）。它必须彻底消失：
+  // 文件名只在核心里组装一次，外壳只调核心。下面三条各自能独立失败。
+  ok(!/\b(?:function|const|let)\s+storageNameFor\b/.test(shellRegion),
+    '外壳不再声明自己的文件名函数（storageNameFor 已删除）')
+  ok(!/\bhashProjectKey\b/.test(shellRegion),
+    '外壳不再自己拼文件名（hashProjectKey 只出现在内联核心区）')
+  ok(/\bprojectStorageFileName\s*\(/.test(shellRegion),
+    '外壳的文件名来自核心的 projectStorageFileName（唯一事实源）')
 }
 
-group('holderLabel', '名字#句柄：重名会话可区分；缺名 / human 不附句柄')
+// ---------------------------------------------------------------- 5. hostCode 可构造 + 宿主真实 I/O op 冒烟
+console.log('# hostCode 装载 + 宿主 I/O op（overview / status）')
 {
-  const cases = [
-    ['uuid', HB_U1, HB_NAME], ['同名另一会话', HB_U3, HB_NAME], ['human', 'human:console', 'Console'],
-    ['缺 holderName', 'agent:anon-12345678', undefined], ['空 holderName', HB_U1, ''], ['缺 holderId', undefined, 'No Id']
-  ]
-  for (const [label, id, n] of cases) {
-    cmp('holderLabel · ' + label, run(host.holderLabel, [id, n]), run(coreFns.holderLabel, [id, n]))
+  const HOME = path.join('/tmp', 'dsh-collab-inline-' + process.pid)
+  const SETTINGS_DOC = path.join(HOME, 'settings.yaml')
+  const PROJECT_CWD = '/fake/project/alpha'
+  const store = new Map()
+  const makeTarget = (abs) => {
+    const t = { displayPath: abs, path: abs, targetKey: abs }
+    const plain = () => ({ displayPath: abs, path: abs, targetKey: abs })
+    t.then = (f, r) => Promise.resolve(plain()).then(f, r)
+    return t
   }
-  ok(coreFns.holderLabel(HB_U1, HB_NAME) === HB_NAME + '#9c57bc11', '渲染成 名字#句柄', coreFns.holderLabel(HB_U1, HB_NAME))
-  ok(coreFns.holderLabel(HB_U1, HB_NAME) !== coreFns.holderLabel(HB_U3, HB_NAME),
-    '同名不同会话 → 标签可区分（本改动的唯一目的）')
-  ok(coreFns.holderLabel('human:console', 'Console') === 'Console', 'human:console 不附句柄')
-  ok(coreFns.holderLabel('agent:anon-12345678', undefined) === 'agent:anon-12345678',
-    '缺名字时 holderId 本身就是唯一标识 → 不重复附句柄')
-  ok(coreFns.renderDigest([mkClaimRec({ claimId: 'c_h', holderId: HB_U1, holderName: HB_NAME, paths: ['src/h/'] })])
-    .includes(HB_NAME + '#9c57bc11（独占）占用 src/h/'), '占用摘要里名字带句柄')
-}
+  const fs = {
+    resolve: (p, opts) => makeTarget(path.isAbsolute(p) ? p : path.resolve(opts && opts.cwd ? opts.cwd : process.cwd(), p)),
+    stat: async (t) => (store.has(t.path) ? { version: 1, type: 'file' } : undefined),
+    readText: async (t) => store.get(t.path) || '',
+    writeText: async (t, c) => { store.set(t.path, c); return { operation: 'create', version: 1 } },
+    processPath: (t) => t.path,
+    listDir: async () => []
+  }
+  const tools = []
+  const harness = {
+    defineTool: (def) => def,
+    registerTool: (_ctx, tool) => { tools.push(tool); return () => {} },
+    handle: () => () => {}
+  }
+  const ctx = {
+    fs,
+    timer: { timeout: (ms) => new Promise((r) => setTimeout(r, ms)) },
+    effect: (fn) => { const d = fn(); return typeof d === 'function' ? d : () => {} },
+    on: () => () => {},
+    get: (name) => {
+      if (name === 'settings') return { prepareDocument: async () => SETTINGS_DOC }
+      if (name === 'sessions') return { get: () => ({ header: { cwd: PROJECT_CWD } }) }
+      if (name === 'sessionTitle') return { get: () => ({ title: 'Inline Worker' }) }
+      return undefined
+    }
+  }
+  let lock = null
+  try {
+    const plugin = new Function('harness', 'ctx', hostCode)(harness, ctx)
+    ok(plugin && typeof plugin.apply === 'function' && Array.isArray(plugin.inject),
+      'hostCode 能被 new Function 构造出带 apply 的插件对象', show(plugin && Object.keys(plugin)))
+    await plugin.apply(ctx)
+    lock = tools.find((t) => t.name === 'collab_lock')
+  } catch (e) {
+    ok(false, 'hostCode 装载不抛错', String((e && e.stack) || e))
+  }
+  ok(!!lock, 'hostCode 注册出 collab_lock', show(tools.map((t) => t.name)))
 
-group('holderRosterNote', '有 stale 条目才说明「名册不是锁」，否则 null')
-{
-  for (const n of [0, 1, 32, undefined, -1]) {
-    cmp('holderRosterNote · ' + String(n), run(host.holderRosterNote, [n]), run(coreFns.holderRosterNote, [n]))
-  }
-  ok(coreFns.holderRosterNote(0) === null && coreFns.holderRosterNote(undefined) === null,
-    '没有 stale 条目 → null（list 一个字段都不加）')
-  ok((coreFns.holderRosterNote(32) || '').includes('不是锁'), '有 stale 条目 → 点名「名册不是锁」')
-  ok((coreFns.holderRosterNote(1) || '').includes('1 条 stale'), '条数写进说明', coreFns.holderRosterNote(1))
-}
-// ---------------------------------------------------------------- 官方 Agent Teams 交叉预警（0.11.0）
-// 三个同名纯函数：两形态必须逐输出等价。语料同时覆盖"服务缺席"的 null 态与"有任务"的渲染态。
-// 三个 group 分别以函数名命名，以接入下面的「语料完整性守护」。
-const task = (over) => Object.assign({ id: 'task-1', subject: 'probe', status: 'in_progress', writeScopes: ['src/backend/'] }, over)
-const claimRec = (over) => Object.assign({ claimId: 'c_1', holderId: 'agent:x', holderName: 'X', paths: ['src/backend/'] }, over)
+  if (lock) {
+    const A = { agent: { id: 'agent-A' } }
+    const call = (args) => lock.execute(args, A)
+    const expectedPath = path.join(HOME, 'collab', 'projects', path.basename(PROJECT_CWD) + '-' + core.hashProjectKey(PROJECT_CWD) + '.json')
+    // 两形态（外壳 / 核心）对同一 cwd 必须产出**同一个文件名**：这里先把测试自己的独立推导
+    // （basename + hash）钉到核心的 projectStorageFileName 上，再由下面的 statePath 断言钉到外壳。
+    ok(expectedPath === path.join(HOME, 'collab', 'projects', core.projectStorageFileName(PROJECT_CWD)),
+      '同一 cwd 下，独立推导与核心 projectStorageFileName 产出同一文件名', show(expectedPath))
 
-group('teamTaskScopeLine', '官方团队写域一行摘要：两形态逐输出等价 + null / 异常输入')
-{
-  const fixtures = [
-    ['null', null], ['undefined', undefined], ['非数组', 'nope'], ['空数组', []],
-    ['单任务', [task()]],
-    ['无 subject', [task({ subject: '' })]],
-    ['四个任务（截断到 3）', [task({ id: 'task-1' }), task({ id: 'task-2' }), task({ id: 'task-3' }), task({ id: 'task-4' })]],
-    ['四个写域（截断到 3）', [task({ writeScopes: ['a/', 'b/', 'c/', 'd/'] })]],
-    ['空写域被过滤', [task({ writeScopes: [] }), task({ id: 'task-9' })]],
-    ['id 非字符串', [task({ id: 7 })]],
-    ['id 为空', [task({ id: '' })]],
-    ['乱序输入', [task({ id: 'task-b' }), task({ id: 'task-a' })]]
-  ]
-  for (const [label, list] of fixtures) {
-    cmp('teamTaskScopeLine · ' + label,
-      outcome(run(host.teamTaskScopeLine, [list])), outcome(run(coreFns.teamTaskScopeLine, [list])))
-  }
-  ok(coreFns.teamTaskScopeLine([task()]) === coreFns.teamTaskScopeLine([task()]), '无时间/顺序抖动')
-  ok(String(coreFns.teamTaskScopeLine([task({ writeScopes: [] })])) === 'null', '空写域 ⇒ null')
-  const sample = coreFns.teamTaskScopeLine([task()])
-  ok(typeof sample === 'string' && sample.indexOf('advisory') >= 0, '文案显式声明 advisory（不冒充锁）', sample)
-}
+    const c1 = await call({ op: 'claim', paths: ['src/a/'], mode: 'exclusive', ttlSec: 1800 })
+    ok(c1 && c1.ok === true && c1.data && c1.data.claim && c1.data.claim.holderId === 'agent:agent-A',
+      '宿主 op=claim 建档成功', show(c1))
 
-group('teamScopeOverlaps', '团队写域 × collab 路径的纯重叠：两形态逐输出等价')
-{
-  const overlapTasks = [
-    task({ id: 'task-1', writeScopes: ['src/backend/'], subject: 's1' }),
-    task({ id: 'task-2', writeScopes: ['docs/'] })
-  ]
-  const fixtures = [
-    ['null', null], ['undefined', undefined], ['空数组', []], ['精确命中', ['src/backend/']],
-    ['子路径命中', ['src/backend/models/a.ts']],
-    ['兄弟前缀不算', ['src/backendor/']],
-    ['尾斜杠不敏感', ['src/backend']],
-    ['重复路径去重', ['docs/x', 'docs/x']],
-    ['多任务命中', ['src/backend/a', 'docs/b']],
-    ['非字符串项', [42, null, 'src/backend/a']],
-    ['空串项', ['', 'docs/x']]
-  ]
-  for (const [label, paths] of fixtures) {
-    cmp('teamScopeOverlaps · ' + label,
-      outcome(run(host.teamScopeOverlaps, [overlapTasks, paths])),
-      outcome(run(coreFns.teamScopeOverlaps, [overlapTasks, paths])))
-  }
-  ok(coreFns.teamScopeOverlaps(overlapTasks, ['docs/b', 'src/backend/a'])[0].taskId === 'task-1', '按 taskId 确定性排序')
-  ok(coreFns.teamScopeOverlaps([task({ writeScopes: [] })], ['src/backend/']).length === 0, '空写域不产生重叠')
-}
+    const ov = await call({ op: 'overview' })
+    ok(ov && ov.ok === true, '宿主 op=overview 成功', show(ov))
+    ok(ov && ov.data && ov.data.statePath === expectedPath,
+      'overview 报出的 statePath 是 settings.prepareDocument() 同目录下的绝对路径', show(ov && ov.data && ov.data.statePath))
+    ok(ov && ov.data && ov.data.totalClaims === 1, 'overview 聚合出 1 条声明', show(ov && ov.data && ov.data.totalClaims))
+    ok(ov && ov.data && Array.isArray(ov.data.holders) && ov.data.holders.length === 1 &&
+      ov.data.holders[0].holderId === 'agent:agent-A' && ov.data.holders[0].claimCount === 1 &&
+      ov.data.holders[0].mode === 'exclusive',
+      'overview 按 holder 聚合（holderId / claimCount / mode）', show(ov && ov.data && ov.data.holders))
 
-group('teamCrossWarnLine', '反向交叉预警文本：两形态逐输出等价（截断到 2 条）')
-{
-  const fixtures = [
-    ['null 两侧', null, null], ['无任务', [], [claimRec()]], ['无声明', [task()], []],
-    ['重叠', [task()], [claimRec()]],
-    ['不重叠', [task()], [claimRec({ paths: ['other/'] })]],
-    ['退化为 holderId', [task()], [claimRec({ holderName: undefined })]],
-    ['三条重叠（截断到 2）', [task()], [claimRec({ claimId: 'c_1' }), claimRec({ claimId: 'c_2' }), claimRec({ claimId: 'c_3' })]],
-    ['声明 paths 缺失', [task()], [claimRec({ paths: undefined })]]
-  ]
-  for (const [label, ts, cs] of fixtures) {
-    cmp('teamCrossWarnLine · ' + label,
-      outcome(run(host.teamCrossWarnLine, [ts, cs])), outcome(run(coreFns.teamCrossWarnLine, [ts, cs])))
-  }
-  const sample = coreFns.teamCrossWarnLine([task()], [claimRec()])
-  ok(typeof sample === 'string' && sample.indexOf('advisory') >= 0, '文案显式声明 advisory（不冒充门控）', sample)
-  // 字面量锚点：两形态**同时**退化时上面的 cmp 必然失明（对拍只比"两侧相同"），
-  // 只有写死期望文本的断言能抓住"一起错"——本组存在的第二个理由。
-  const warned = coreFns.teamCrossWarnLine([task()], [claimRec({ holderId: 'agent:9c57bc11-x', holderName: '同名' })])
-  ok(warned.includes('与「同名#9c57bc11」的声明'),
-    '同一段注入里的交叉预警行也带稳定句柄（不是只有摘要带）', warned)
-}
+    const st = await call({ op: 'status', paths: ['src/'] })
+    ok(st && st.data && Array.isArray(st.data.related) && st.data.related.length === 1 &&
+      Array.isArray(st.data.exclusive) && st.data.exclusive.length === 1,
+      '宿主 op=status 按路径前缀筛出 related / exclusive', show(st && st.data))
 
-// ---------------------------------------------------------------- holderFresh
-group('holderFresh', '新鲜度判据：24h 回收边界 + 5min 未来偏移容忍')
-{
-  const cases = [
-    ['age 0', T0, T0], ['age 1s', T0 - 1000, T0], ['age 恰好 24h', T0 - 86400000, T0],
-    ['age 24h-1ms', T0 - 86399999, T0], ['future 1s', T0 + 1000, T0], ['future 5min', T0 + 300000, T0],
-    ['future 5min+1ms', T0 + 300001, T0], ['lastSeen 0（age 巨大）', 0, T0],
-    ['undefined', undefined, T0], ['t=0 且 lastSeen 未来', T0, 0], ['双 0', 0, 0]
-  ]
-  for (const [label, ls, t] of cases) {
-    const hr = run(host.holderFresh, [ls, t]), cr = run(coreFns.holderFresh, [ls, t])
-    cmp('holderFresh · ' + label, outcome(hr), outcome(cr))
-  }
-  // 宿主形态把 TTL/偏移写死成字面量；用 core 的导出常量把这两个魔数锚住。
-  ok(core.HOLDER_TTL_MS === 86400000, 'collab-core HOLDER_TTL_MS === 宿主写死的 86400000', String(core.HOLDER_TTL_MS))
-  ok(core.HOLDER_FUTURE_SKEW_MS === 300000, 'collab-core HOLDER_FUTURE_SKEW_MS === 宿主写死的 300000', String(core.HOLDER_FUTURE_SKEW_MS))
-  const mismatched = cases.filter(([, ls, t]) =>
-    coreFns.holderFresh(ls, t) !== coreFns.holderFresh(ls, t, core.HOLDER_TTL_MS))
-  ok(mismatched.length === 0, 'core holderFresh 的默认 TTL 与显式 HOLDER_TTL_MS 一致（宿主无第三参可比）', show(mismatched.map((m) => m[0])))
-}
-// ---------------------------------------------------------------- sweep
-group('sweep', '惰性清理：过期声明 / 留言上限 2000 / holder 24h 与未来偏移回收')
-{
-  const mkHolders = () => [
-    { holderId: 'agent:A', name: 'A', kind: 'agent', sessionId: 'sA', lastSeenAt: T0 - 30 * 3600 * 1000 },
-    { holderId: 'agent:B', name: 'B', kind: 'agent', sessionId: 'sB', lastSeenAt: T0 - 23 * 3600 * 1000 },
-    { holderId: 'agent:C', name: 'C', kind: 'agent', sessionId: 'sC', lastSeenAt: T0 - 25 * 3600 * 1000 },
-    { holderId: 'agent:D', name: 'D', kind: 'agent', sessionId: 'sD', lastSeenAt: T0 + 10 * 60 * 1000 },
-    { holderId: 'agent:E', name: 'E', kind: 'agent', sessionId: 'sE', lastSeenAt: undefined },
-    { holderId: 'agent:F', name: 'F', kind: 'human', sessionId: undefined, lastSeenAt: mkBackdated(86400000) },
-    { holderId: 'agent:G', name: 'G', kind: 'human', sessionId: undefined, lastSeenAt: mkBackdated(86399999) }
-  ]
-  const live = mkClaimRec({ claimId: 'c_live', holderId: 'agent:A', expiresAt: T0 + 60000 })
-  const expired = mkClaimRec({ claimId: 'c_exp', holderId: 'agent:X', expiresAt: T0 - 1 })
-  const boundary = mkClaimRec({ claimId: 'c_bd', holderId: 'agent:Y', expiresAt: T0 })
-  const cases = [
-    ['过期声明被清', () => mkState({ claims: [live, expired, boundary], messages: mkMessages(3, 1), holders: mkHolders() })],
-    ['无过期声明', () => mkState({ claims: [live], messages: mkMessages(2, 1), holders: mkHolders() })],
-    ['空状态', () => mkState({})],
-    ['留言 2005 条 → 保留 2000', () => mkState({ messages: mkMessages(2005, 1), holders: [] })],
-    ['留言恰好 2000 条 → 不动', () => mkState({ messages: mkMessages(2000, 1), holders: [] })],
-    ['只有 holder（无声明）', () => mkState({ claims: [], messages: [], holders: mkHolders() })]
-  ]
-  for (const [label, mk] of cases) pairCase('sweep', label, () => {
-    const state = mk()
-    return { hostArgs: [state, T0], coreArgs: [state, T0], state }
-  })
-  // 已知 API 差异（不是漂移，但必须显式可见）：core 的 opts 是覆盖入口，宿主形态签名留了 opts 却忽略。
-  {
-    const hs = mkState({ messages: mkMessages(10, 1), holders: [] })
-    const cs = mkState({ messages: mkMessages(10, 1), holders: [] })
-    host.sweep(hs, T0, { maxMessages: 3, holderTtlMs: 0 })
-    coreFns.sweep(cs, T0, { maxMessages: 3, holderTtlMs: 0 })
-    ok(hs.messages.length === 10, '宿主形态 sweep 忽略 opts.maxMessages（沿用默认 2000）', String(hs.messages.length))
-    ok(cs.messages.length === 3, 'core 形态 sweep 接受 opts.maxMessages 覆盖', String(cs.messages.length))
-  }
-  ok(core.MAX_MESSAGES === 2000, 'collab-core MAX_MESSAGES === 宿主写死的 2000', String(core.MAX_MESSAGES))
-}
-// ---------------------------------------------------------------- expire
-group('expire', '过期声明计数（= sweep().expiredClaims）')
-{
-  const live = mkClaimRec({ claimId: 'c_live', expiresAt: T0 + 60000 })
-  const expired = mkClaimRec({ claimId: 'c_exp', expiresAt: T0 - 1 })
-  const cases = [
-    ['一条过期', () => mkState({ claims: [live, expired] })],
-    ['无过期', () => mkState({ claims: [live] })],
-    ['空声明', () => mkState({ claims: [] })],
-    ['全部过期', () => mkState({ claims: [expired, mkClaimRec({ claimId: 'c_e2', expiresAt: 0 })] })],
-    ['边界 expiresAt === t', () => mkState({ claims: [mkClaimRec({ claimId: 'c_bd', expiresAt: T0 })] })]
-  ]
-  for (const [label, mk] of cases) pairCase('expire', label, () => {
-    const state = mk()
-    return { hostArgs: [state, T0], coreArgs: [state, T0], state }
-  })
-}
-// ---------------------------------------------------------------- holderView
-group('holderView', 'holder 存活视图：active / stale（1h 预警）/ 未来偏移 / 排序')
-{
-  const mkHolders = () => [
-    { holderId: 'agent:A', name: 'A', kind: 'agent', sessionId: 'sA', lastSeenAt: T0 - 30 * 3600 * 1000 },
-    { holderId: 'agent:B', name: 'B', kind: 'agent', sessionId: 'sB', lastSeenAt: T0 - 2 * 3600 * 1000 },
-    { holderId: 'agent:C', name: 'C', kind: 'human', sessionId: undefined, lastSeenAt: T0 - 3599999 },
-    { holderId: 'agent:D', name: 'D', kind: 'human', sessionId: undefined, lastSeenAt: T0 - 3600000 },
-    { holderId: 'agent:E', name: 'E', kind: 'agent', sessionId: 'sE', lastSeenAt: T0 + 400000 },
-    { holderId: 'agent:F', name: 'F', kind: 'agent', sessionId: 'sF', lastSeenAt: T0 },
-    { holderId: 'agent:G', name: 'G', kind: 'agent', sessionId: 'sG', lastSeenAt: undefined }
-  ]
-  const activeA = mkClaimRec({ claimId: 'c_a', holderId: 'agent:A', expiresAt: T0 + 60000 })
-  const expiredA = mkClaimRec({ claimId: 'c_a2', holderId: 'agent:A', expiresAt: T0 - 1 })
-  const cases = [
-    ['活跃声明压制 stale', () => mkState({ claims: [activeA], holders: mkHolders() })],
-    ['声明已过期', () => mkState({ claims: [expiredA], holders: mkHolders() })],
-    ['无声明', () => mkState({ claims: [], holders: mkHolders() })],
-    ['空 holder', () => mkState({ claims: [activeA], holders: [] })],
-    ['lastSeenAt 并列（排序稳定）', () => mkState({ claims: [], holders: [
-      { holderId: 'agent:P', name: 'P', kind: 'agent', sessionId: 'sP', lastSeenAt: T0 - 5000 },
-      { holderId: 'agent:Q', name: 'Q', kind: 'agent', sessionId: 'sQ', lastSeenAt: T0 - 5000 },
-      { holderId: 'agent:R', name: 'R', kind: 'agent', sessionId: 'sR', lastSeenAt: T0 - 5000 }
-    ] })]
-  ]
-  for (const [label, mk] of cases) pairCase('holderView', label, () => {
-    const state = mk()
-    return { hostArgs: [state, T0], coreArgs: [state, T0], state }
-  })
-  ok(core.HOLDER_STALE_WARN_MS === 3600000, 'collab-core HOLDER_STALE_WARN_MS === 宿主写死的 3600000', String(core.HOLDER_STALE_WARN_MS))
-}
-// ---------------------------------------------------------------- holder
-group('holder', '登记/更新 holder 元数据（kind 由 sessionId 决定）')
-{
-  const cases = [
-    ['新建 agent', () => mkState({}), HOLDER_A, NAME_A],
-    ['新建 human', () => mkState({}), { holderId: 'human:console' }, 'console'],
-    ['已存在则更新名字', () => mkState({ holders: [{ holderId: 'agent:A', name: 'Old', kind: 'agent', sessionId: 'sess-A', lastSeenAt: 0 }] }), HOLDER_A, NAME_A],
-    ['已存在但 sessionId 缺省', () => mkState({ holders: [{ holderId: 'human:console', name: 'Old', kind: 'human', lastSeenAt: 0 }] }), { holderId: 'human:console' }, 'console']
-  ]
-  for (const [label, mk, h, name] of cases) pairCase('holder', label, () => {
-    const state = mk()
-    return { hostArgs: [state, h, name], coreArgs: [state, h, name, fixedNow], state }
-  })
-}
-// ---------------------------------------------------------------- claim
-group('claim', '声明占用：mode 校验 / 合并限定同 mode / readable 与 readers 归一 / 冲突明细')
-{
-  // 签名差异（已知，非漂移）：宿主是 claim(state, h, name, a) 用 name 形参；
-  // core 是 claim(state, h, a, tNow) 用 h.name。真实接线里两者同值 ——
-  // 包形态在 src/index.ts:1249-1250 先做 `h.name = hname(h)`，宿主形态把 hname(h) 当 name 传入。
-  // 所以语料让 name === h.name（这就是两形态的函数级契约）；差异本身在下面单独断言。
-  const C = (label, opts) => pairCase('claim', label, () => {
-    const state = mkState(opts.state ? opts.state() : {})
-    const a = opts.a ? opts.a() : { paths: ['src/a/'] }
-    const h = opts.h || HOLDER_A
-    return Object.assign({ state }, CLAIM_SPEC(state, h, h.name || h.holderId, a))
-  })
-  C('基础 exclusive', {})
-  C('shared 模式', { a: () => ({ paths: ['src/a/'], mode: 'shared' }) })
-  C('read 模式', { a: () => ({ paths: ['src/a/'], mode: 'read' }) })
-  C('未知 mode READ', { a: () => ({ paths: ['src/a/'], mode: 'READ' }) })
-  C('未知 mode 数字', { a: () => ({ paths: ['src/a/'], mode: 5 }) })
-  C('mode 空串即默认 exclusive', { a: () => ({ paths: ['src/a/'], mode: '' }) })
-  C('缺 paths', { a: () => ({}) })
-  C('paths 非数组', { a: () => ({ paths: 'src/a/' }) })
-  C('paths 全部不可归一', { a: () => ({ paths: ['', '  ', '..'] }) })
-  C('paths 含 null 元素', { a: () => ({ paths: [null, 'src/a/'] }) })
-  C('ttl 下限钳制 3→5', { a: () => ({ paths: ['src/a/'], ttlSec: 3 }) })
-  C('ttl 0→1800', { a: () => ({ paths: ['src/a/'], ttlSec: 0 }) })
-  C('ttl 上限钳制', { a: () => ({ paths: ['src/a/'], ttlSec: 999999 }) })
-  C('ttl 非数字', { a: () => ({ paths: ['src/a/'], ttlSec: 'abc' }) })
-  C('短租约告警', { a: () => ({ paths: ['src/a/'], ttlSec: 30 }) })
-  C('note 截断 500', { a: () => ({ paths: ['src/a/'], note: 'x'.repeat(600) }) })
-  C('note 非字符串', { a: () => ({ paths: ['src/a/'], note: 42 }) })
-  C('readable 缺省→true', {})
-  C('readable 显式 false', { a: () => ({ paths: ['src/a/'], readable: false }) })
-  C('readable null→true', { a: () => ({ paths: ['src/a/'], readable: null }) })
-  C('readable 字符串 no→true', { a: () => ({ paths: ['src/a/'], readable: 'no' }) })
-  C('readers 缺省归一为 []', { state: () => ({ claims: [mkClaimRec({ readers: undefined, readable: undefined })] }) })
-  C('readers 去重保序', { state: () => ({ claims: [mkClaimRec({ readers: ['agent:B', 5, 'agent:B', 'agent:C', ''] })] }) })
-  C('同 holder 同 mode 合并', {
-    state: () => ({ claims: [mkClaimRec({ claimId: 'c_1', paths: ['src/a/'] })] }),
-    a: () => ({ paths: ['src/a/b/'], ttlSec: 600 })
-  })
-  C('合并只加新路径', {
-    state: () => ({ claims: [mkClaimRec({ claimId: 'c_1', paths: ['src/a/', 'src/a/b/'] })] }),
-    a: () => ({ paths: ['src/a/', 'src/a/c/'] })
-  })
-  C('合并保留 readable:false（新声明未给 readable）', {
-    state: () => ({ claims: [mkClaimRec({ claimId: 'c_1', readable: false })] }),
-    a: () => ({ paths: ['src/a/b/'], ttlSec: 600 })
-  })
-  C('合并时显式 readable:true 覆盖', {
-    state: () => ({ claims: [mkClaimRec({ claimId: 'c_1', readable: false })] }),
-    a: () => ({ paths: ['src/a/b/'], readable: true })
-  })
-  C('同 holder 不同 mode 不合并', {
-    state: () => ({ claims: [mkClaimRec({ claimId: 'c_1', mode: 'read' })] }),
-    a: () => ({ paths: ['src/a/'], mode: 'exclusive' })
-  })
-  C('前缀但不同段不合并', {
-    state: () => ({ claims: [mkClaimRec({ claimId: 'c_1', paths: ['src/foo'] })] }),
-    a: () => ({ paths: ['src/foobar'] })
-  })
-  C('同 holder 过期声明仍可续', {
-    state: () => ({ claims: [mkClaimRec({ claimId: 'c_1', expiresAt: T0 - 1 })] }),
-    a: () => ({ paths: ['src/a/'] })
-  })
-  C('冲突：他人 exclusive 同路径', {
-    state: () => ({ claims: [mkClaimRec({ claimId: 'c_x', holderId: 'agent:B', holderName: 'Worker B' })] })
-  })
-  C('冲突：他人 exclusive 祖先路径', {
-    state: () => ({ claims: [mkClaimRec({ claimId: 'c_x', holderId: 'agent:B', holderName: 'Worker B', paths: ['src/'] })] }),
-    a: () => ({ paths: ['src/a/b/'] })
-  })
-  C('冲突：剩余 <=30s 建议 wait', {
-    state: () => ({ claims: [mkClaimRec({ claimId: 'c_x', holderId: 'agent:B', holderName: 'Worker B', expiresAt: T0 + 10000 })] })
-  })
-  C('不冲突：他人 shared', {
-    state: () => ({ claims: [mkClaimRec({ claimId: 'c_x', holderId: 'agent:B', mode: 'shared' })] })
-  })
-  C('不冲突：他人 read', {
-    state: () => ({ claims: [mkClaimRec({ claimId: 'c_x', holderId: 'agent:B', mode: 'read' })] })
-  })
-  C('不冲突：他人已过期 exclusive', {
-    state: () => ({ claims: [mkClaimRec({ claimId: 'c_x', holderId: 'agent:B', expiresAt: T0 - 1 })] })
-  })
-  C('不冲突：前缀但不同段', {
-    state: () => ({ claims: [mkClaimRec({ claimId: 'c_x', holderId: 'agent:B', paths: ['src/foo'] })] }),
-    a: () => ({ paths: ['src/foobar'] })
-  })
-  C('read 模式跳过冲突扫描', {
-    state: () => ({ claims: [mkClaimRec({ claimId: 'c_x', holderId: 'agent:B' })] }),
-    a: () => ({ paths: ['src/a/'], mode: 'read' })
-  })
-  C('新 holder 登记进 holders', { h: HOLDER_B })
-  C('console holder（无 sessionId）', { h: { holderId: 'human:console', name: 'human:console' }, a: () => ({ paths: ['tools/'] }) })
-  // 把上面的签名差异显式钉住（否则读者会以为 name/h.name 可以随便传）。
-  {
-    const hs = mkState({}), cs = mkState({})
-    const hx = { holderId: 'agent:H', sessionId: 'sH', name: 'FromH' }
-    const hOut = host.claim(hs, hx, 'FromArg', { paths: ['p/'] })
-    const cOut = coreFns.claim(cs, hx, { paths: ['p/'] }, fixedNow)
-    ok(hOut.data.claim.holderName === 'FromArg', '宿主 claim 的 holderName 来自 name 形参（忽略 h.name）', show(hOut.data.claim.holderName))
-    ok(cOut.data.claim.holderName === 'FromH', 'core claim 的 holderName 来自 h.name（无 name 形参）', show(cOut.data.claim.holderName))
-  }
-}
-// ---------------------------------------------------------------- release
-group('release', '释放：claimId 优先 / forbidden / not-found / 按路径前缀')
-{
-  const R = (label, opts) => pairCase('release', label, () => {
-    const state = mkState(opts.state ? opts.state() : {})
-    return { hostArgs: [state, opts.h || HOLDER_A, opts.a()], coreArgs: [state, opts.h || HOLDER_A, opts.a(), fixedNow], state }
-  })
-  const OWN = () => ({ claims: [mkClaimRec({ claimId: 'c_1', holderId: 'agent:A', paths: ['src/a/'] })] })
-  R('按 claimId 释放自己的', { state: OWN, a: () => ({ claimId: 'c_1' }) })
-  R('按 claimId 释放他人的 → forbidden', { state: OWN, a: () => ({ claimId: 'c_1' }), h: HOLDER_B })
-  R('claimId 不存在 → not-found', { state: OWN, a: () => ({ claimId: 'c_nope' }) })
-  R('claimId 空串则走 paths 分支', { state: OWN, a: () => ({ claimId: '', paths: ['src/a/'] }) })
-  R('按路径释放', { state: OWN, a: () => ({ paths: ['src/a/'] }) })
-  R('按祖先路径释放子路径声明', { state: () => ({ claims: [mkClaimRec({ claimId: 'c_1', paths: ['src/a/b/'] })] }), a: () => ({ paths: ['src/'] }) })
-  R('按路径无匹配', { state: OWN, a: () => ({ paths: ['other/'] }) })
-  R('按路径只匹配他人声明', { state: OWN, a: () => ({ paths: ['src/a/'] }), h: HOLDER_B })
-  R('claimId 与 paths 同时给出 → claimId 优先', {
-    state: () => ({ claims: [mkClaimRec({ claimId: 'c_1', paths: ['src/a/'] }), mkClaimRec({ claimId: 'c_2', paths: ['src/b/'] })] }),
-    a: () => ({ claimId: 'c_1', paths: ['src/b/'] })
-  })
-  R('既无 claimId 也无 paths → bad-request', { state: OWN, a: () => ({}) })
-  R('paths 全部不可归一 → bad-request', { state: OWN, a: () => ({ paths: ['', '..'] }) })
-  R('释放 readable:false 的声明（readable 归一）', {
-    state: () => ({ claims: [mkClaimRec({ claimId: 'c_1', readable: false, readers: ['agent:B', 'agent:B'] })] }),
-    a: () => ({ claimId: 'c_1' })
-  })
-  R('空状态按路径释放', { state: () => ({}), a: () => ({ paths: ['src/a/'] }) })
-}
-// ---------------------------------------------------------------- reap
-// 0.9.8：僵尸声明显式回收。两形态必须逐输出等价 —— 尤其 confirm 缺省必须两边都**不改状态**，
-// 活体名单里有的人无论多老都不碰，age 门槛与 paths 限定的边界完全一致。
-group('reap', '僵尸声明显式回收：默认 dry-run / 活体检查 / age 门槛 / 未过期 / 不含自己（0.9.8）')
-{
-  const at = T0
-  const zombie = (id, paths, holderId) => mkClaimRec({ claimId: id, holderId: holderId || 'agent:DEAD', holderName: 'Dead Worker', paths, mode: 'exclusive', createdAt: T0 - 1000 * 1000, expiresAt: T0 + 600 * 1000, readers: ['agent:READER'] })
-  const fresh = () => mkClaimRec({ claimId: 'c_f', holderId: 'agent:DEAD', paths: ['src/f/'], createdAt: T0 - 100 * 1000, expiresAt: T0 + 600 * 1000 })
-  const alive = () => mkClaimRec({ claimId: 'c_a', holderId: 'agent:LIVE', paths: ['src/a/'], createdAt: T0 - 1000 * 1000, expiresAt: T0 + 600 * 1000 })
-  const expired = () => mkClaimRec({ claimId: 'c_e', holderId: 'agent:DEAD', paths: ['src/e/'], createdAt: T0 - 1000 * 1000, expiresAt: T0 - 1 })
-  const mine = () => mkClaimRec({ claimId: 'c_m', holderId: HOLDER_A.holderId, paths: ['src/m/'], createdAt: T0 - 1000 * 1000, expiresAt: T0 + 600 * 1000 })
-  const human = () => mkClaimRec({ claimId: 'c_h', holderId: 'human:console', paths: ['src/h/'], createdAt: T0 - 1000 * 1000, expiresAt: T0 + 600 * 1000 })
-  const RP = (label, claims, a, live, h) => pairCase('reap', label, () => {
-    const state = mkState({ claims: claims.map(c => Object.assign({}, c, { paths: c.paths.slice(), readers: (c.readers || []).slice() })) })
-    const liveCopy = live === undefined ? ['agent:LIVE'] : (live === null ? null : live.slice())
-    return { hostArgs: [state, h || HOLDER_A, a, liveCopy, at], coreArgs: [state, h || HOLDER_A, a, liveCopy, at], state }
-  })
-  RP('dry-run（缺 confirm）：列候选、状态零变化', [zombie('c_z', ['src/z/']), alive(), mine()], {}, ['agent:LIVE'])
-  RP('confirm:false 仍不改状态（只有显式 true 才动手）', [zombie('c_z', ['src/z/'])], { confirm: false }, [])
-  RP('confirm:true 只删不在活体名单里的', [zombie('c_z', ['src/z/']), alive()], { confirm: true }, ['agent:LIVE'])
-  RP('confirm:true 不碰自己的声明（自己用 op=release）', [zombie('c_z', ['src/z/']), mine()], { confirm: true }, [])
-  RP('已过期声明不由 reap 处理（那是 sweep 的活）', [expired()], { confirm: true }, [])
-  RP('age 未超默认门槛不动', [fresh()], { confirm: true }, [])
-  RP('显式更小 olderThanSec 时才回收', [fresh()], { confirm: true, olderThanSec: 10 }, [])
-  RP('paths 限定：只回收与给定路径相交的', [zombie('c_z', ['src/z/']), zombie('c_o', ['other/x/'], 'agent:DEAD2')], { confirm: true, paths: ['other/'] }, [])
-  RP('活体检查不可用（null）⇒ 一个也不收', [zombie('c_z', ['src/z/'])], { confirm: true }, null)
-  RP('human:console 无活体信号，不收（按 age 收它等于纯按 age 回收）', [human()], { confirm: true }, [])
-  RP('olderThanSec 非法值回退保守默认 600', [zombie('c_z', ['src/z/'])], { confirm: true, olderThanSec: -5 }, [])
-  RP('空状态：ok 且无候选', [], { confirm: true }, [])
-}
-// ---------------------------------------------------------------- dropHolder
-// W7：声明（claim）的生命周期**只由租约 expiresAt 决定** —— dispose 不是释放信号。
-// 两形态都必须：只回收该 holder **已过期**的声明，未过期的原样保留（连同它的 readers），
-// 并把 holderId 从所有**剩余** claim 的 readers 里摘掉。
-group('dropHolder', '会话退出：只回收已过期声明 + 从所有剩余 claim 摘 reader（W7）')
-{
-  // 真实负载同构：一个还活着的 holder（未到期声明）+ 一个到期时刻已知的已过期声明。
-  const live = mkClaimRec({ claimId: 'c_live', holderId: 'agent:X', paths: ['src/x/'], expiresAt: T0 + 60000 })
-  const dead = mkClaimRec({ claimId: 'c_dead', holderId: 'agent:X', paths: ['src/y/'], expiresAt: T0 - 1 })
-  const atT = mkClaimRec({ claimId: 'c_bd', holderId: 'agent:X', paths: ['src/z/'], expiresAt: T0 })
-  const byOther = mkClaimRec({ claimId: 'c_o', holderId: 'agent:Y', paths: ['src/o/'], readers: ['agent:X', 'agent:Z'] })
-  const dirty = mkClaimRec({ claimId: 'c_d', holderId: 'agent:Y', paths: ['src/d/'], readers: ['agent:X', 'agent:X', 42, 'agent:Z'] })
-  const noReader = mkClaimRec({ claimId: 'c_n', holderId: 'agent:Y', paths: ['src/n/'], readers: [] })
-
-  const D = (label, holderId, claims, t) => pairCase('dropHolder', label, () => {
-    const state = mkState({ claims: claims.map((c) => Object.assign({}, c, { readers: (c.readers || []).slice() })) })
-    return { hostArgs: [state, holderId, t === undefined ? T0 : t], coreArgs: [state, holderId, t === undefined ? T0 : t], state }
-  })
-  D('未过期声明**不**被释放（dispose 不缩短租约）', 'agent:X', [live], T0)
-  D('未过期声明不被释放，且 reader 列表原样保留', 'agent:X', [live, byOther], T0)
-  D('已过期声明被回收（expiresAt < t）', 'agent:X', [dead], T0)
-  D('边界：expiresAt === t 也算已过期（与 sweep 的 > t 同一判据）', 'agent:X', [atT], T0)
-  D('混合：未过期保留、已过期回收', 'agent:X', [live, dead, byOther], T0)
-  D('reader 从所有剩余 claim 被摘掉（含脏 readers 归一）', 'agent:X', [byOther, dirty, noReader], T0)
-  D('该 holder 一条声明都没有：只摘 reader', 'agent:X', [byOther], T0)
-  D('其他 holder 的未过期声明完全不受影响', 'agent:X', [live, noReader], T0)
-  D('空状态：ok 且无变化', 'agent:X', [], T0)
-  D('holderId 不在状态里：无变化', 'agent:NOPE', [live, byOther], T0)
-
-  // 幂等：第二次必须 changed === false（两形态一致）。
-  {
-    const mk = () => mkState({ claims: [
-      Object.assign({}, live, { readers: [] }),
-      Object.assign({}, dead, { readers: [] }),
-      Object.assign({}, byOther, { readers: byOther.readers.slice() })
-    ] })
-    const hs = mk(), cs = mk()
-    const h1 = host.dropHolder(hs, 'agent:X', T0), c1 = coreFns.dropHolder(cs, 'agent:X', T0)
-    const h2 = host.dropHolder(hs, 'agent:X', T0), c2 = coreFns.dropHolder(cs, 'agent:X', T0)
-    cmp('dropHolder · 第一次输出', outcome({ threw: false, value: h1 }), outcome({ threw: false, value: c1 }))
-    cmp('dropHolder · 第二次输出（幂等）', outcome({ threw: false, value: h2 }), outcome({ threw: false, value: c2 }))
-    cmp('dropHolder · 两次调用后的 state', hs, cs)
-    ok(h1.changed === true && h2.changed === false, 'host dropHolder 幂等：第一次 changed / 第二次 not changed', String(h1.changed) + '/' + String(h2.changed))
-    ok(c1.changed === true && c2.changed === false, 'core dropHolder 幂等：第一次 changed / 第二次 not changed', String(c1.changed) + '/' + String(c2.changed))
-    ok(h2.changed === false && c2.changed === false, '幂等那次不改变状态（同一次状态变更内完成）')
-  }
-
-  // 显式钉住 W7 的三条语义（不只看两形态相等，还看**具体取值**）。
-  {
-    const hs = mkState({ claims: [
-      Object.assign({}, live, { readers: ['agent:W'] }),
-      Object.assign({}, dead, { readers: ['agent:W'] }),
-      Object.assign({}, byOther, { readers: byOther.readers.slice() })
-    ] })
-    const cs = mkState({ claims: [
-      Object.assign({}, live, { readers: ['agent:W'] }),
-      Object.assign({}, dead, { readers: ['agent:W'] }),
-      Object.assign({}, byOther, { readers: byOther.readers.slice() })
-    ] })
-    const hr = host.dropHolder(hs, 'agent:X', T0), cr = coreFns.dropHolder(cs, 'agent:X', T0)
-    for (const [who, st, r] of [['host', hs, hr], ['core', cs, cr]]) {
-      ok(st.claims.some((c) => c.claimId === 'c_live'), who + '：未过期声明 c_live 在 dropHolder 之后仍然存在（未到期 ⇒ 不释放）',
-        JSON.stringify(st.claims.map((c) => c.claimId)))
-      ok(!st.claims.some((c) => c.claimId === 'c_dead'), who + '：已过期声明 c_dead 被回收',
-        JSON.stringify(st.claims.map((c) => c.claimId)))
-      ok(r.data.released.length === 1 && r.data.released[0].claimId === 'c_dead',
-        who + '：data.released 只含真正被删掉的那条', JSON.stringify(r.data.released.map((x) => x.claimId)))
-      const remain = st.claims.find((c) => c.claimId === 'c_o')
-      ok(remain && !remain.readers.includes('agent:X') && remain.readers.includes('agent:Z'),
-        who + '：reader 仍被摘掉，其他 reader 不受影响', JSON.stringify(remain && remain.readers))
+    // 真跑一遍 expire 路径：把声明改成已过期，再 overview 应看不到它（宿主 op 内部先 sweep）。
+    let doc = null
+    try { doc = JSON.parse(store.get(expectedPath)) } catch (e) { doc = null }
+    ok(doc && Array.isArray(doc.claims) && doc.claims.length === 1,
+      'claim 落盘到 settings.prepareDocument() 同目录的绝对路径', show(store.get(expectedPath)))
+    if (doc && Array.isArray(doc.claims) && doc.claims.length) {
+      doc.claims[0].expiresAt = 1
+      store.set(expectedPath, JSON.stringify(doc))
+      const ov2 = await call({ op: 'overview' })
+      ok(ov2 && ov2.ok === true && ov2.data && ov2.data.totalClaims === 0,
+        'overview 内部先做惰性清理（过期声明不再出现）', show(ov2 && ov2.data && ov2.data.totalClaims))
     }
   }
 }
-// ---------------------------------------------------------------- releaseOnLoopEnd
-// 循环终止自动释放（0.9.10）：会话循环停下（agent/status → idle）并过了宽限期之后，把该 holder
-// 的**未过期**声明全部释放，并在留言板留一条审计留言（channel=agent:<holderId>）。
-// 两形态必须逐输出等价 —— 包括留言对象本身（author / channel / seq / 正文）。
-group('releaseOnLoopEnd', '循环终止自动释放：只释放未过期声明 + 留言留痕（幂等）')
-{
-  const R = (label, opts) => pairCase('releaseOnLoopEnd', label, () => {
-    const state = mkState(opts.state ? opts.state() : {})
-    const holderId = opts.holderId || 'agent:A'
-    const name = opts.name === undefined ? NAME_A : opts.name
-    const t = opts.t === undefined ? T0 : opts.t
-    const graceSec = opts.graceSec === undefined ? 15 : opts.graceSec
-    const cause = opts.cause
-    return { hostArgs: [state, holderId, name, t, graceSec, cause], coreArgs: [state, holderId, name, t, graceSec, cause], state }
-  })
-  R('单条未过期声明被释放', { state: () => ({ claims: [mkClaimRec({ claimId: 'c_1' })] }) })
-  R('已过期声明**不**动（那是 sweep 的活）', { state: () => ({ claims: [mkClaimRec({ claimId: 'c_e', expiresAt: T0 - 1 })] }) })
-  R('混合：未过期释放、已过期原样留下', { state: () => ({ claims: [mkClaimRec({ claimId: 'c_live' }), mkClaimRec({ claimId: 'c_exp', expiresAt: T0 - 1 })] }) })
-  R('其他 holder 的声明不受影响', { state: () => ({ claims: [mkClaimRec({ claimId: 'c_a' }), mkClaimRec({ claimId: 'c_b', holderId: 'agent:B', holderName: 'Worker B', paths: ['src/b/'] })] }) })
-  R('一条声明都没有 → changed:false（不留痕）', { state: () => ({ claims: [] }) })
-  R('holder 不在状态里 → changed:false', { state: () => ({ claims: [mkClaimRec({ claimId: 'c_b', holderId: 'agent:B' })] }) })
-  R('多条声明 + 路径去重折叠（> 3 条只计数）', {
-    state: () => ({
-      seq: 11,
-      claims: [
-        mkClaimRec({ claimId: 'c_1', paths: ['src/a/', 'src/b/', 'src/c/'] }),
-        mkClaimRec({ claimId: 'c_2', paths: ['src/d/', 'src/b/'], mode: 'shared' })
-      ]
-    })
-  })
-  R('holderName 为空时留言用 holderId', { state: () => ({ claims: [mkClaimRec({ claimId: 'c_1' })] }), name: '' })
-  // 0.13.0：cause='disposed'（句柄结束）——正文必须说实话，不能写成"空闲超过 N 秒"。
-  R('cause=disposed：正文写「句柄已结束（agent/disposed）」', { state: () => ({ claims: [mkClaimRec({ claimId: 'c_1' })] }), cause: 'disposed' })
-  R('cause=disposed + 无声明 → changed:false（不留痕）', { state: () => ({ claims: [] }), cause: 'disposed' })
-  R('graceSec 取非默认值时留言文案跟着变', { state: () => ({ claims: [mkClaimRec({ claimId: 'c_1' })] }), graceSec: 90 })
-  R('边界：expiresAt === t **不算**未过期（与 sweep 的 > t 同一判据）', { state: () => ({ claims: [mkClaimRec({ claimId: 'c_bd', expiresAt: T0 })] }) })
-  R('留言 seq 接在既有 seq 之后（claim 与 message 共用一个 seq）', { state: () => ({ seq: 41, claims: [mkClaimRec({ claimId: 'c_1' })] }) })
-  R('已有留言时追加在末尾', { state: () => ({ seq: 9, messages: mkMessages(2, 8), claims: [mkClaimRec({ claimId: 'c_1' })] }) })
 
-  // 幂等：第二次必须 changed === false（两形态一致），且**不**再留痕。
-  {
-    const mk = () => mkState({ claims: [mkClaimRec({ claimId: 'c_1', readers: ['agent:R'] })] })
-    const hs = mk(), cs = mk()
-    const h1 = host.releaseOnLoopEnd(hs, 'agent:A', NAME_A, T0, 15), c1 = coreFns.releaseOnLoopEnd(cs, 'agent:A', NAME_A, T0, 15)
-    const h2 = host.releaseOnLoopEnd(hs, 'agent:A', NAME_A, T0, 15), c2 = coreFns.releaseOnLoopEnd(cs, 'agent:A', NAME_A, T0, 15)
-    cmp('releaseOnLoopEnd · 第一次输出', outcome({ threw: false, value: h1 }), outcome({ threw: false, value: c1 }))
-    cmp('releaseOnLoopEnd · 第二次输出（幂等）', outcome({ threw: false, value: h2 }), outcome({ threw: false, value: c2 }))
-    cmp('releaseOnLoopEnd · 两次调用后的 state', hs, cs)
-    ok(h1.changed === true && h2.changed === false, '幂等：第一次 changed / 第二次 not changed', String(h1.changed) + '/' + String(h2.changed))
-    ok(hs.messages.length === 1, '幂等：只留一条审计留言（第二次不再追加）', String(hs.messages.length))
-  }
+// ---------------------------------------------------------------- 6. 宿主形态继承核心语义（不再是手写副本）
+console.log('# 内联核心的行为样本（旧手写副本在这几处不同）')
+{
+  const mkMessages = (n) => Array.from({ length: n }, (_, i) => ({
+    msgId: 'm_' + (i + 1), seq: i + 1, channel: 'general', author: 'agent:A', ts: i, body: 'b' + i
+  }))
+  // 旧的宿主 sweep 写死上限 2000、忽略 opts.maxMessages；内联之后它就是 core 的 sweep。
+  if (inlined) {
+    const s = { schemaVersion: 1, seq: 0, claims: [], messages: mkMessages(10), holders: [] }
+    const r = inlined.sweep(s, 0, { maxMessages: 3 })
+    ok(r && r.droppedMessages === 7 && s.messages.length === 3,
+      '内联的 sweep 消费 opts.maxMessages（宿主不再有忽略 opts 的手写副本）',
+      show({ dropped: r && r.droppedMessages, left: s.messages.length }))
+    const s2 = { schemaVersion: 1, seq: 0, claims: [], messages: mkMessages(5), holders: [] }
+    const r2 = inlined.sweep(s2, 0)
+    ok(r2 && r2.droppedMessages === 0 && s2.messages.length === 5 && 'expiredClaims' in r2 && 'prunedHolders' in r2,
+      'sweep 缺省 opts 仍是 2000 上限，且诊断字段形状不变', show(r2))
 
-  // 显式钉住取值（不只看两形态相等）：释放了什么、留下了什么、留痕长什么样。
-  {
-    const st = mkState({
-      seq: 7,
-      claims: [
-        mkClaimRec({ claimId: 'c_1', paths: ['src/a/', 'src/a/b/'], readers: ['agent:R'] }),
-        mkClaimRec({ claimId: 'c_2', holderId: 'agent:B', paths: ['src/b/'] })
-      ]
-    })
-    const r = coreFns.releaseOnLoopEnd(st, 'agent:A', NAME_A, T0, 15)
-    ok(r.data.released.length === 1 && r.data.released[0].claimId === 'c_1', 'data.released 只含真正被删的那条', JSON.stringify(r.data.released.map((x) => x.claimId)))
-    ok(st.claims.length === 1 && st.claims[0].claimId === 'c_2', 'state 里只剩别人的声明', JSON.stringify(st.claims.map((x) => x.claimId)))
-    const m = r.data.notice
-    ok(m && m.channel === 'agent:A' && m.author === 'system:dsh-collab', '留痕寻址到持有者（channel 就是 holderId，不再重复拼 agent:）、作者是 system:dsh-collab', JSON.stringify(m && [m.channel, m.author]))
-    ok(m && !('mentions' in m) && String(m.body).includes('自动释放'), '留痕不再带 mentions（0.13.0 移除）且正文说明是自动释放', JSON.stringify(m && m.body))
-    ok(m && m.seq === 8 && m.msgId === 'm_8', '留痕序号接在既有 seq 之后', JSON.stringify(m && [m.seq, m.msgId]))
-    ok(core.AUTO_RELEASE_AUTHOR === 'system:dsh-collab', 'AUTO_RELEASE_AUTHOR 常量与留痕作者一致（宿主内联字面量由上面的逐输出对拍守护）', String(core.AUTO_RELEASE_AUTHOR))
+    // 0.12.2 的实测缺陷：tail 取 matched 的末尾、forward 从游标往后；两条方向都要能独立成立。
+    const st = { messages: mkMessages(100) }
+    const tail = inlined.filterMessages(st, { limit: 5 })
+    ok(tail.mode === 'tail' && tail.messages.map((m) => m.seq).join(',') === '96,97,98,99,100' &&
+      tail.hasMore === true && tail.nextSince === 100 && tail.earliestSeq === 1,
+      'filterMessages 缺省 tail：返回最新 limit 条 + hasMore/nextSince/earliestSeq', show(tail))
+    const fwd = inlined.filterMessages(st, { since: 50, limit: 10 })
+    ok(fwd.mode === 'forward' && fwd.messages.map((m) => m.seq).join(',') === '51,52,53,54,55,56,57,58,59,60' &&
+      fwd.hasMore === true && fwd.nextSince === 60,
+      'filterMessages since>0：从游标往后（旧→新）', show(fwd))
+    const note = inlined.channelRosterNote({ messages: [{ channel: 'general' }, { channel: 'general' }, { channel: 'path:src/a/' }] })
+    ok(note === '该频道没有消息。现有频道：general（2 条）、path:src/a/（1 条）。channel 是精确匹配的字符串：写什么就得按什么读（path: 频道与 claim 用同一套相对路径写法）。',
+      'channelRosterNote 文档化文案', show(note))
   }
-}
-// ---------------------------------------------------------------- heartbeat
-group('heartbeat', '续租：expiresAt = now + ttlSec / forbidden / not-found')
-{
-  const HB = (label, opts) => pairCase('heartbeat', label, () => {
-    const state = mkState(opts.state ? opts.state() : {})
-    return { hostArgs: [state, opts.h || HOLDER_A, opts.a()], coreArgs: [state, opts.h || HOLDER_A, opts.a(), fixedNow], state }
-  })
-  HB('续租自己的声明', { state: () => ({ claims: [mkClaimRec({ claimId: 'c_1', ttlSec: 600, expiresAt: T0 + 1 })] }), a: () => ({ claimId: 'c_1' }) })
-  HB('ttlSec 0 → 回落到 1800', { state: () => ({ claims: [mkClaimRec({ claimId: 'c_1', ttlSec: 0, expiresAt: T0 + 1 })] }), a: () => ({ claimId: 'c_1' }) })
-  HB('ttlSec 缺省 → 1800', { state: () => ({ claims: [mkClaimRec({ claimId: 'c_1', ttlSec: undefined, expiresAt: T0 + 1 })] }), a: () => ({ claimId: 'c_1' }) })
-  HB('续租他人的 → forbidden', { state: () => ({ claims: [mkClaimRec({ claimId: 'c_1' })] }), a: () => ({ claimId: 'c_1' }), h: HOLDER_B })
-  HB('claimId 不存在 → not-found', { state: () => ({ claims: [mkClaimRec({ claimId: 'c_1' })] }), a: () => ({ claimId: 'c_nope' }) })
-  HB('缺 claimId → not-found', { state: () => ({ claims: [mkClaimRec({ claimId: 'c_1' })] }), a: () => ({}) })
-  HB('已过期声明仍可续租', { state: () => ({ claims: [mkClaimRec({ claimId: 'c_1', expiresAt: T0 - 1 })] }), a: () => ({ claimId: 'c_1' }) })
-}
-// ---------------------------------------------------------------- post
-group('post', '留言：body 校验 / channel 缺省与 trim / mentions 已移除（传了即挡回）/ replyTo')
-{
-  // 同 claim：宿主 post(state, h, name, a) 用 name 形参，core post(state, h, a, tNow) 用 h.name。
-  const P = (label, opts) => pairCase('post', label, () => {
-    const state = mkState(opts.state ? opts.state() : {})
-    const a = opts.a ? opts.a() : { body: 'hello' }
-    const h = opts.h || HOLDER_A
-    return { hostArgs: [state, h, h.name || h.holderId, a], coreArgs: [state, h, a, fixedNow], state }
-  })
-  P('基础留言（默认频道）', {})
-  P('频道 trim', { a: () => ({ body: 'hi', channel: '  path:src/a/  ' }) })
-  P('频道空串 → general', { a: () => ({ body: 'hi', channel: '' }) })
-  P('频道非字符串 → general', { a: () => ({ body: 'hi', channel: 5 }) })
-  P('body 空串 → bad-request', { a: () => ({ body: '' }) })
-  P('body 纯空白 → bad-request', { a: () => ({ body: '   ' }) })
-  P('body 非字符串 → bad-request', { a: () => ({ body: 42 }) })
-  P('body 缺省 → bad-request', { a: () => ({}) })
-  P('body 两端 trim', { a: () => ({ body: '  spaced  ' }) })
-  // 0.13.0：mentions 已移除 —— 传了就 bad-request（fail-loud），连空数组也算"传了"。
-  P('mentions 非空数组 → bad-request', { a: () => ({ body: 'hi', mentions: ['agent:B'] }) })
-  P('mentions 空数组 → 也算传了 → bad-request', { a: () => ({ body: 'hi', mentions: [] }) })
-  P('mentions 非数组（字符串）→ bad-request', { a: () => ({ body: 'hi', mentions: 'agent:B' }) })
-  P('replyTo 设置', { a: () => ({ body: 'hi', replyTo: 'm_3' }) })
-  P('replyTo 空串不设置', { a: () => ({ body: 'hi', replyTo: '' }) })
-  P('replyTo 非字符串不设置', { a: () => ({ body: 'hi', replyTo: 5 }) })
-  P('seq 在既有留言后递增', { state: () => ({ seq: 9, messages: mkMessages(2, 8) }) })
-  P('新 holder 登记', { h: HOLDER_B })
-}
-// ---------------------------------------------------------------- filterMessages（0.13.0）
-group('filterMessages', '留言读取：从 since 往后取 / limit 夹取 / channel / hasMore 与 nextSince')
-{
-  const F = (label, opts = {}) => pairCase('filterMessages', label, () => {
-    const s = mkState(opts.state ? opts.state() : { messages: mkMessages(5, 2) })
-    const a = opts.a ? opts.a() : {}
-    return { hostArgs: [s, a], coreArgs: [s, a] }
-  })
-  F('空留言板', { state: () => ({ messages: [] }) })
-  F('全部返回（5 条 / 默认 limit 50）')
-  F('不给 since → tail：最新 limit 条', { a: () => ({ limit: 2 }) })
-  F('limit=0 夹到 1', { a: () => ({ limit: 0 }) })
-  F('limit=300 夹到 200', { state: () => ({ messages: mkMessages(210, 1) }), a: () => ({ limit: 300 }) })
-  F('limit 非数字 → 默认 50', { state: () => ({ messages: mkMessages(60, 1) }), a: () => ({ limit: 'x' }) })
-  F('since 命中中段 → forward', { a: () => ({ since: 4 }) })
-  F('since 超过最新 → 空且 nextSince 原样回传', { a: () => ({ since: 999 }) })
-  F('channel 过滤 + hasMore', { state: () => ({ messages: mkMessages(12, 1) }), a: () => ({ channel: 'general', limit: 2 }) })
-  F('channel 空串不筛', { a: () => ({ channel: '   ' }) })
-  F('channel 未命中 → channelNote 列出既有频道', { state: () => ({ messages: mkMessages(6, 1) }), a: () => ({ channel: 'path:typo/' }) })
-  F('空板 + channel → 不加 channelNote', { state: () => ({ messages: [] }), a: () => ({ channel: 'general' }) })
-  F('earliestSeq 随 since 前的回收变化', { state: () => ({ messages: mkMessages(6, 1).slice(3) }), a: () => ({ since: 0 }) })
-  F('翻页第二页（since=nextSince）', { state: () => ({ messages: mkMessages(62, 1) }), a: () => ({ since: 50 }) })
-
-  // 两模式的**回归门禁**：只有两形态对拍抓不住「两侧一起退化」，这里直接断言语义。
-  // 现场两个失败模式都在这两条里：默认读到远古噪音（哨 A）、增量读静默丢中段（哨 B）。
-  {
-    // 哨 A：不给游标 ⇒ 必须读**最新** limit 条，不是最旧的。现场两次 read 都因此被历史淹没。
-    const st = mkState({ messages: mkMessages(5, 2) }) // seq 2..6
-    const first = core.filterMessages(st, { limit: 2 })
-    ok(first.mode === 'tail' && first.messages.map((m) => m.seq).join(',') === '5,6',
-      '不给 since ⇒ tail：返回最新两条（现场：默认读到远古噪音）', JSON.stringify(first.messages.map((m) => m.seq)))
-    ok(first.hasMore === true && first.nextSince === 6 && first.earliestSeq === 2 && first.total === 5 && first.latestSeq === 6,
-      'tail 报 hasMore/nextSince/earliestSeq/total/latestSeq（窗口被截断这件事必须可察觉）',
-      JSON.stringify({ mode: first.mode, hasMore: first.hasMore, nextSince: first.nextSince, earliestSeq: first.earliestSeq }))
-  }
-  {
-    // 哨 B：给了游标 ⇒ 从游标**往后**读，旧→新。旧实现 slice(-limit) 会取这段里最新的几条，
-    // 于是 10 条里只回 3 条、中间 4 条再也拿不回来（现场：62 条里静默丢 12 条）。
-    const st = mkState({ messages: mkMessages(10, 1) }) // seq 1..10
-    const seen = []
-    let since = 1
-    for (let guard = 0; ; guard++) {
-      if (guard > 100) { ok(false, '游标循环收敛（上限 100 次翻页）'); break }
-      const page = core.filterMessages(st, { since, limit: 3 })
-      for (const m of page.messages) seen.push(m.seq)
-      if (!page.hasMore) break
-      if (page.nextSince === since) { ok(false, 'hasMore=true 时游标必须前进（否则死循环）'); break }
-      since = page.nextSince
-    }
-    ok(seen.length === 9 && new Set(seen).size === 9 && seen.join(',') === '2,3,4,5,6,7,8,9,10',
-      '按 nextSince 循环无损读完后 9 条（旧实现取最新 3 条 ⇒ 中间 4 条永久丢）', seen.join(','))
-  }
-  {
-    // channelNote：实测踩过「按文档写 agent:<holderId> 读 0 条」「path 少个尾斜杠读 0 条」。
-    // 有消息但没命中才给一句话；空板与命中都不给（负向对照）。
-    const st = mkState({ messages: mkMessages(3, 1) })
-    const miss = core.filterMessages(st, { channel: 'path:typo/' })
-    ok(typeof miss.channelNote === 'string' && miss.channelNote.includes('该频道没有消息') && miss.channelNote.includes('general'),
-      'channel 未命中 → channelNote 列出既有频道', String(miss.channelNote))
-    ok(core.filterMessages(mkState({ messages: [] }), { channel: 'general' }).channelNote === undefined,
-      '空板 → 不加 channelNote（负向对照）')
-    ok(core.filterMessages(st, { channel: 'general' }).channelNote === undefined,
-      '命中 → 不加 channelNote（负向对照）')
-  }
-  {
-    // earliestSeq：区分「这段被 MAX_MESSAGES 回收了」与「那段时间没人留言」。
-    const st = mkState({ messages: mkMessages(6, 1).slice(3) }) // 现存 seq 4..6
-    ok(core.filterMessages(st, { since: 0 }).earliestSeq === 4,
-      'earliestSeq 报出还留着的最旧一条', String(core.filterMessages(st, { since: 0 }).earliestSeq))
-    ok(core.filterMessages(st, { since: 1 }).earliestSeq === 4,
-      'since < earliestSeq ⇒ 调用方判得出中间那段已被回收')
-  }
-}
-// ------------------------------------------- channelRosterNote（0.13.0，单独成组）
-group('channelRosterNote', '频道未命中时列出既有频道：按条数降序、最多 5 个、同数按名升序')
-{
-  const C = (label, st) => pureCase('channelRosterNote', label, [st], [st])
-  C('空板 → 「现有频道：」后面是空的（由调用方保证不出现：见上组负向对照）',
-    mkState({ messages: [] }))
-  C('单频道', mkState({ messages: mkMessages(2, 1) }))
-  C('按条数降序列前 5 个 + 等 N 个',
-    mkState({ messages: [
-      ...mkMessages(3, 1),
-      { msgId: 'm_90', seq: 90, channel: 'path:a/', author: 'agent:A', ts: T0, body: 'x' },
-      { msgId: 'm_91', seq: 91, channel: 'path:b/', author: 'agent:A', ts: T0, body: 'x' },
-      { msgId: 'm_92', seq: 92, channel: 'path:c/', author: 'agent:A', ts: T0, body: 'x' },
-      { msgId: 'm_93', seq: 93, channel: 'path:d/', author: 'agent:A', ts: T0, body: 'x' },
-      { msgId: 'm_94', seq: 94, channel: 'path:e/', author: 'agent:A', ts: T0, body: 'x' }
-    ] }))
-  C('同条数按频道名升序（确定性）',
-    mkState({ messages: [
-      { msgId: 'm_80', seq: 80, channel: 'path:zz/', author: 'agent:A', ts: T0, body: 'x' },
-      { msgId: 'm_81', seq: 81, channel: 'path:aa/', author: 'agent:A', ts: T0, body: 'x' }
-    ] }))
-}
-// ---------------------------------------------------------------- overview
-group('overview', '同名但不同形：用桩把宿主的 async op 收敛到聚合逻辑后对拍')
-{
-  const mkFixture = () => mkState({
-    seq: 4,
-    claims: [
-      mkClaimRec({ claimId: 'c_1', holderId: 'agent:A', holderName: 'Worker A', paths: ['src/a/', 'src/a/b/'], mode: 'exclusive' }),
-      mkClaimRec({ claimId: 'c_2', holderId: 'agent:A', holderName: 'Worker A', paths: ['src/c/'], mode: 'read' }),
-      mkClaimRec({ claimId: 'c_3', holderId: 'agent:B', holderName: undefined, paths: ['src/b/'], mode: 'shared', readers: ['agent:A', 'agent:A'] }),
-      mkClaimRec({ claimId: 'c_4', holderId: 'agent:C', holderName: 'Worker C', paths: ['src/d/'], expiresAt: T0 - 1 })
-    ],
-    holders: []
-  })
-  const cases = [
-    ['多 holder 混合 mode + 一条过期', mkFixture],
-    ['空声明', () => mkState({ claims: [] })],
-    ['单 holder 单一 mode', () => mkState({ claims: [mkClaimRec({ claimId: 'c_x', holderId: 'agent:Z', holderName: 'Z' })] })]
-  ]
-  for (const [label, mk] of cases) {
-    const hostState = mk(), coreState = mk()
-    overviewLoad = async () => ({ state: hostState, target: { path: '/fake/collab/state.json' }, stateDir: '/tmp', warn: null })
-    const hOut = await host.overview('agent-A')
-    coreFns.expire(coreState, T0)
-    const cOut = coreFns.overview(coreState)
-    ok(hOut && hOut.ok === true, 'overview · ' + label + ' · 宿主 op 成功', show(hOut))
-    ok(hOut && hOut.data && hOut.data.statePath === '/fake/collab/state.json',
-      'overview · ' + label + ' · 桩接线生效（statePath 来自 load 桩，不是空结果）', show(hOut && hOut.data))
-    cmp('overview · ' + label + ' · totalClaims', hOut && hOut.data && hOut.data.totalClaims, cOut.totalClaims)
-    cmp('overview · ' + label + ' · holders', hOut && hOut.data && hOut.data.holders, cOut.holders)
-  }
-  // 桩的 load 也被 expire 走了一遍：确认宿主 op 内部真的做了惰性清理（不是没跑）
-  ok(typeof overviewLoad === 'function', 'overview 桩可被注入')
 }
 
-// ---------------------------------------------------------------- inFamily
-group('inFamily', '会话家族判据：自己 / 祖先与后代 / 家族外 / 血缘缺省（退化为 holderId 相等）')
-{
-  const me = { holderId: 'agent:parent', family: ['agent:parent', 'agent:child', 'agent:grand'] }
-  const cases = [
-    ['自己', () => [me, 'agent:parent']],
-    ['后代命中', () => [me, 'agent:child']],
-    ['祖先命中', () => [{ holderId: 'agent:child', family: ['agent:child', 'agent:parent'] }, 'agent:parent']],
-    ['家族外', () => [me, 'agent:stranger']],
-    ['血缘缺省（旧语义：自己）', () => [{ holderId: 'agent:solo' }, 'agent:solo']],
-    ['血缘缺省（旧语义：他人）', () => [{ holderId: 'agent:solo' }, 'agent:other']],
-    ['family 为空数组', () => [{ holderId: 'agent:e', family: [] }, 'agent:other']]
-  ]
-  for (const [label, mk] of cases) pairCase('inFamily', label, () => {
-    const [h, id] = mk()
-    return { hostArgs: [h, id], coreArgs: [h, id] }
-  })
-}
-
-// ---------------------------------------------------------------- 语料完整性守护
-group('corpus', '每个同名函数的语料条数下限（防止语料被悄悄掏空）')
-{
-  for (const name of EXPECTED_PARITY) {
-    const g = groups.get(name)
-    const n = g ? g.pass + g.fail : 0
-    ok(n >= 4, 'corpus · ' + name + ' 至少 4 条断言', 'actual=' + n)
-  }
-  ok(EXPECTED_PARITY.length === 30, '逐输出对拍的同名函数恰好 30 个', String(EXPECTED_PARITY.length))
-}
-
-// ---------------------------------------------------------------- 汇总
-console.log('\n每个函数/分组的断言条数：')
-for (const [name, g] of groups) {
-  console.log('  ' + name.padEnd(14) + ' ' + String(g.pass + g.fail).padStart(3) + ' 条' + (g.fail ? '  (' + g.fail + ' 失败)' : ''))
-}
-console.log(`\n${fail === 0 ? 'ALL PASS' : 'FAILURES'}: ${pass} passed, ${fail} failed`)
-process.exit(fail === 0 ? 0 : 1)
+h.finish()

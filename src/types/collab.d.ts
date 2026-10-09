@@ -22,16 +22,19 @@ export interface Claim {
   readable?: boolean;
   /**
    * 读者（功能 D，反向注册）：被本声明通知过的会话 holderId 列表（形如 `agent:<id>`）。
-   * 可选字段同样为了兼容老状态文件 —— 缺省即 `[]`（见 collab-core 的 readersOf）。
-   * 移除时机只有两处：持有者 `op=release`（整条声明消失）、`agent/disposed`（dropHolder 摘登记，
-   * 它在**会话被 dispose 之后往往还会恢复**，所以措辞不用"真正的会话结束"）。
-   * **声明本身不因 dispose 而被回收**（W7）：dispose 只是摘掉 reader 登记、并回收该 holder
-   * 已过期的声明。声明有**三条**回收路径，别把其中任何一条读成"会话结束了"：
-   *   1) 租约到期 `expiresAt`（sweep，唯一无条件的回收路径）；
+   * 缺省即 `[]`（见 collab-core 的 readersOf）。摘除时机：持有者 `op=release`（整条声明消失）、
+   * 或 `agent/disposed`（dropHolder 只摘登记 —— 会话被 dispose 之后往往还会恢复）。
+   *
+   * **声明的回收路径（0.14.0 现状，四条）**：
+   *   1) 租约到期 `expiresAt`（sweep）—— 唯一无条件的一条；
    *   2) 持有者显式 `op=release`；
-   *   3) **循环终止自动释放**（0.9.10，`releaseOnLoopEnd`）：`agent/status` → `idle` 且空闲超过
-   *      宽限期（默认两分钟，可在 settings 关掉）—— 触发者不是 dispose，而是"循环停了、
-   *      但 agent 还加载着"这一刻，见 src/auto-release.ts。恢复工作前必须重新 claim。
+   *   3) **句柄结束**（0.13.0，`agent/disposed`）：立即释放该 holder **全部未过期**声明
+   *      —— 这一条**推翻了 0.9.6 起的 W7 取舍**（旧口径是"dispose 只回收已过期声明"，
+   *      0.13.0 由用户决策改成"句柄结束即删"，见 src/push.ts 的 disposed 处理器）；
+   *   4) **循环终止自动释放**（0.9.10，`releaseOnLoopEnd`）：`agent/status` → `idle` 且空闲超过
+   *      宽限期（默认两分钟，可在 settings 关掉）—— 触发者是"循环停了、但 agent 还加载着"。
+   * 3) 与 4) 都留一条审计留言（频道 `agent:<holderId>`）；恢复工作前必须重新 claim。
+   * 3) 的残余风险如实记：dispose 后被**恢复**的会话会按对话历史以为自己仍持锁。
    * 0.8.3 起 sweep() 不再按 liveness 清理 —— `agents.get()` 对休眠但可唤回的会话
    * 返回 undefined，按它清理会把只是空闲的读者删掉，静默丢掉释放通知。
    */
@@ -44,6 +47,12 @@ export interface Message {
   channel: string;
   author: string;
   ts: number;
+  /**
+   * 消息正文。上限 8000 字符（SSOT `$defs.Message.properties.body.maxLength`，
+   * 同值常量见 collab-core 的 `MESSAGE_BODY_MAX_CHARS`）。
+   * 超限由 `post()` 以 `bad-request` **显式挡回**，不静默截断：
+   * `MAX_MESSAGES = 2000` 只封条数，单条不封 ⇒ 状态文件大小"任意大"。
+   */
   body: string;
   replyTo?: string;
 }
@@ -54,6 +63,13 @@ export interface Holder {
   kind: 'agent' | 'human';
   sessionId?: string;
   lastSeenAt?: number;
+  /**
+   * 写这一行的进程身份令牌 `<pid>:<开机节拍>`（0.14.0）。
+   * 名册行的生死按它判：写它的那个进程不在了 ⇒ 下一次 sweep 就删掉这一行，不等 24h。
+   * 缺省 = 升级前留下的旧行，或该形态拿不到进程身份（受限动态宿主里 process 是 undefined）。
+   * 只影响名册行，不改变任何声明（claim）的租约语义。
+   */
+  proc?: string;
 }
 
 export interface StateDocument {

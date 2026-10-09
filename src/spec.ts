@@ -102,7 +102,13 @@ export const TOOL_PATH_SPECS: Record<string, { write: string[]; read: string[] }
   str_replace_editor: { write: ['path'], read: ['path'] },
   read: { write: [], read: ['file_path'] },
   glob: { write: [], read: ['path'] },
-  grep: { write: [], read: ['path'] }
+  grep: { write: [], read: ['path'] },
+  // 0.14.0 补登：`read_image` 是 DSH 核心文件工具集里**真实注册**的读工具
+  //（dsh-tool-fs/lib/index.js:986，参数同为 `file_path`），漏登记时它拿到 read:[] ⇒ 门控直接放行
+  // ⇒ 对图片的 `exclusive + readable:false` 完全失效（2026-10 审计实测缺口）。
+  // 教训：**核心文件工具集新增一个读工具，这张表就得跟着加一行** —— 见 tests/collab-access-gate.mjs
+  // 的「核心 fs 工具必须全部登记」守卫；没有那条守卫，漏登记是静默的。
+  read_image: { write: [], read: ['file_path'] }
 }
 
 /** 需要看 `command` 才能分读写的工具（其余按表直判）。 */

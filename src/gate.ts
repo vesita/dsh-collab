@@ -54,26 +54,35 @@ export function installGate(ctx: CollabContext, store: StateStore, prefs: GatePr
     const { state } = await store.load(id, agent)
     const t = store.now()
     const hits: Array<{ claim: Claim; target: string; kind: 'write' | 'read' }> = []
+    // mode 过滤与 collab-core.ts 的 claim() 冲突判据**同源**（见 collab-core.ts 中
+    // claim() 的冲突扫描：`c.mode === 'shared' || c.mode === 'read'` 一律 continue），
+    // 也与 blockers() 的 `c.mode === 'exclusive'` 一致 —— 不是随手加的例外：
+    //   - shared 按定义就是"声明共用"，两个共享方不该互相挡死；
+    //   - read 是纯观测，**既不排他也不被挡**。插件注入的提示（OPEN_HINT）推荐
+    //     "只读调研用 mode=read"，若在此拦下它，一个只读会话会硬拒绝所有人的写入
+    //     （本部署 ask = deny），正好命中推荐用法。
+    // 由此 readable 只对 exclusive 声明有意义：非 exclusive 声明既不拦写也不拦读，
+    // 其 readable:false 不产生任何门控效果（见 README「锁模式」「功能 C」两节）。
+    const consider = (c: Claim, target: string, kind: 'write' | 'read') => {
+      if (inFamily(me, c.holderId)) return
+      if (c.mode === 'shared' || c.mode === 'read') return
+      hits.push({ claim: c, target, kind })
+    }
     const collect = (fields: string[], kind: 'write' | 'read') => {
       for (const field of fields) {
         const raw = (args as Record<string, unknown>)[field]
         if (typeof raw !== 'string' || !raw) continue
         const rel = relToProject(raw, cwd)
-        if (!rel) continue
-        for (const c of claimsCovering(state.claims, rel, t)) {
-          if (inFamily(me, c.holderId)) continue
-          // mode 过滤与 collab-core.ts 的 claim() 冲突判据**同源**（见 collab-core.ts 中
-          // claim() 的冲突扫描：`c.mode === 'shared' || c.mode === 'read'` 一律 continue），
-          // 也与 blockers() 的 `c.mode === 'exclusive'` 一致 —— 不是随手加的例外：
-          //   - shared 按定义就是"声明共用"，两个共享方不该互相挡死；
-          //   - read 是纯观测，**既不排他也不被挡**。插件注入的提示（OPEN_HINT）推荐
-          //     "只读调研用 mode=read"，若在此拦下它，一个只读会话会硬拒绝所有人的写入
-          //     （本部署 ask = deny），正好命中推荐用法。
-          // 由此 readable 只对 exclusive 声明有意义：非 exclusive 声明既不拦写也不拦读，
-          // 其 readable:false 不产生任何门控效果（见 README「锁模式」「功能 C」两节）。
-          if (c.mode === 'shared' || c.mode === 'read') continue
-          hits.push({ claim: c, target: rel, kind })
+        if (rel === '') {
+          // 空串 = **目标就是项目根**（`'.'` / `'./'` / 绝对 cwd 本身），而**不是**"解析不出来"。
+          // 旧实现把两者混为一谈、用 `if (!rel) continue` 一起跳过 ⇒ 指向根目录的调用
+          // 完全绕开门控（2026-10 审计实测）。根的判据取保守侧：**任何他人的未过期
+          // exclusive 声明都算冲突**（宁可多拦一次 —— 本部署 ask == deny，而指向根的写
+          // 本来也不可能成功，误拦代价≈0；漏拦才是把整道门控关掉）。
+          for (const c of state.claims) if (c.expiresAt > t) consider(c, '.', kind)
+          continue
         }
+        for (const c of claimsCovering(state.claims, rel, t)) consider(c, rel, kind)
       }
     }
     collect(spec.write, 'write')

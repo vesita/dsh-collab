@@ -3,12 +3,13 @@ import { createHarness } from './_harness.mjs'
 // collab-pure-logic.mjs
 // 纯逻辑回归测试。import 自 lib/collab-core.js（唯一事实源），而非复制。
 // 运行：node tests/collab-pure-logic.mjs
-// 额外对拍：从 lib/collab-plugin.host.js 提取 norm/cleanName 源码并 eval，
-//          与核心库做行为对比，防止内联版与核心库漂移。
+// 额外守卫：lib/collab-plugin.host.js 内联的核心与 lib/collab-core.js 逐字节同源，
+//          防止两形态漂移（见文件末尾 §9）。
 import { readFileSync } from 'node:fs'
 import {
   norm, ov, cleanName, init, publish, expire, sweep, HOLDER_TTL_MS, holder, claim, release, heartbeat,
   post, overview, related, filterMessages, blockers, holderView, holderFresh, MODES, reap,
+  MESSAGE_BODY_MAX_CHARS,
 } from '../lib/collab-core.js'
 
 const h = createHarness()
@@ -61,10 +62,38 @@ console.log('# claim (core): warning / merge / conflict')
   ok(conflict && typeof conflict.conflicts[0].remainingSec === 'number', 'conflict provides remainingSec')
 }
 {
+  // 0.14.0「允许协商」：**请求 exclusive 时，已在场的 shared 也构成冲突**。
+  // 旧实现无条件跳过 `c.mode === 'shared'` ⇒ 后来的 exclusive 被**静默批准**，随后原先
+  // shared 持有者的写入被门控硬拒（本部署 ask == deny），而"冲突"双方都没看见。
   const st = init(); claim(st, { holderId: 'agent:b', name: 'B' }, { paths: ['src/core/'], mode: 'shared' }, T)
   let conflict = null
   try { claim(st, { holderId: 'agent:c', name: 'C' }, { paths: ['src/core/models/'] }, T) } catch (e) { conflict = e }
-  ok(conflict === null, 'shared never conflicts (claim succeeds)')
+  ok(conflict !== null && conflict.collabConflict === true,
+    'exclusive over foreign shared -> conflict（允许协商，不再静默抢占）')
+  ok(conflict && conflict.conflicts[0].holderId === 'agent:b' && conflict.conflicts[0].mode === 'shared',
+    '冲突里如实报出对方是 shared（协商对象与它的模式都看得见）',
+    conflict && conflict.conflicts[0] ? JSON.stringify(conflict.conflicts[0]) : 'null')
+}
+{
+  // 反向对照 1：**请求 shared** 与已在场的 shared 不冲突 —— 共享方互不挡死（0.9.x 语义保持）。
+  const st = init(); claim(st, { holderId: 'agent:b', name: 'B' }, { paths: ['src/core/'], mode: 'shared' }, T)
+  let conflict = null
+  try { claim(st, { holderId: 'agent:c', name: 'C' }, { paths: ['src/core/models/'], mode: 'shared' }, T) } catch (e) { conflict = e }
+  ok(conflict === null, 'shared over shared -> 不冲突（两个共享方互不挡死）')
+}
+{
+  // 反向对照 2：shared 被他人 exclusive 挡住 —— 这是 shared 的定义，钉住别退化。
+  const st = init(); claim(st, { holderId: 'agent:b', name: 'B' }, { paths: ['src/core/'], mode: 'exclusive' }, T)
+  let conflict = null
+  try { claim(st, { holderId: 'agent:c', name: 'C' }, { paths: ['src/core/models/'], mode: 'shared' }, T) } catch (e) { conflict = e }
+  ok(conflict !== null && conflict.collabConflict === true, 'shared over foreign exclusive -> conflict')
+}
+{
+  // 反向对照 3：read 纯观测，既不挡人也不被挡。
+  const st = init(); claim(st, { holderId: 'agent:b', name: 'B' }, { paths: ['src/core/'], mode: 'shared' }, T)
+  let conflict = null
+  try { claim(st, { holderId: 'agent:c', name: 'C' }, { paths: ['src/core/models/'], mode: 'read' }, T) } catch (e) { conflict = e }
+  ok(conflict === null, 'read over foreign shared -> 不冲突')
 }
 ok(claim(init(), { holderId: 'agent:x' }, {}, T).data.error === 'bad-request', 'claim: no paths -> bad-request')
 
@@ -105,6 +134,34 @@ console.log('# board: post / read')
   const stNo = init()
   post(stNo, { holderId: 'agent:a', name: 'A' }, { body: 'hi' }, T)
   ok(!('mentions' in stNo.messages[0]), '新消息不再带 mentions 字段（契约里已移除）')
+
+  // ---- M2b item 2：单条 body 的字符上限（只封条数 = 大小任意大；超限必须挡回、不许截断）----
+  {
+    const at = init()
+    const r = post(at, { holderId: 'agent:a', name: 'A' }, { body: 'z'.repeat(MESSAGE_BODY_MAX_CHARS) }, T)
+    ok(r.ok === true && at.messages.length === 1, 'post：**恰好等于上限**的 body 通过（边界含）', JSON.stringify({ ok: r.ok, n: at.messages.length }))
+    ok(at.messages[0].body.length === MESSAGE_BODY_MAX_CHARS, 'post：边界内的 body 原文落盘（未被截断）', String(at.messages[0].body.length))
+  }
+  {
+    const over = init()
+    const r = post(over, { holderId: 'agent:a', name: 'A' }, { body: 'z'.repeat(MESSAGE_BODY_MAX_CHARS + 1) }, T)
+    ok(r.ok === false && r.data.error === 'bad-request', 'post：超过上限 ⇒ bad-request（不静默截断）', JSON.stringify(r.data))
+    ok(String(r.data.message).includes(String(MESSAGE_BODY_MAX_CHARS)) && String(r.data.message).includes('没有写入'),
+      'post：报错文案点明上限与"没有写入"', String(r.data.message))
+    ok(over.messages.length === 0 && over.holders.length === 0, 'post：被挡回时消息与名册行**一个字都不写**', JSON.stringify({ messages: over.messages.length, holders: over.holders.length }))
+  }
+  {
+    // 中文/多字节按**字符**计（与 SSOT 的 maxLength 同口径；UTF-16 单元对星平面字符更严，只会更早拒）。
+    const mb = init()
+    const r = post(mb, { holderId: 'agent:a', name: 'A' }, { body: '中'.repeat(MESSAGE_BODY_MAX_CHARS) }, T)
+    ok(r.ok === true, 'post：多字节字符同样按字符数封顶（与 JSON Schema maxLength 同口径）')
+  }
+  {
+    // SSOT 与核心同值：schema 的 maxLength 就是这里的常量，不许两处各写一个数。
+    const schema = JSON.parse(readFileSync(new URL('../src/schema/collab.schema.json', import.meta.url), 'utf8'))
+    const maxLength = schema.$defs.Message.properties.body.maxLength
+    ok(maxLength === MESSAGE_BODY_MAX_CHARS, 'SSOT Message.body.maxLength == collab-core MESSAGE_BODY_MAX_CHARS', JSON.stringify({ schema: maxLength, core: MESSAGE_BODY_MAX_CHARS }))
+  }
 }
 
 // ===== 6. overview / related =====
@@ -315,45 +372,26 @@ console.log('# future-dated holder (clock skew)')
   ok(swept.prunedHolders === 1 && st.holders.length === 0, 'sweep: far-future holder is reclaimed instead of living forever')
 }
 
-// ===== 9. 宿主源码一致性对拍（hostCode 内联版 vs 核心库） =====
-console.log('# hostCode inline vs core (drift guard)')
+// ===== 9. 宿主形态的内联核心与 lib/collab-core.js 同源（drift guard） =====
+// 动态形态不再手写纯逻辑：lib/collab-plugin.host.js 由 scripts/build-host.mjs 把
+// lib/collab-core.js 剥掉顶层 `export ` 后内联进 src/host-shell.js 的核心标记处。
+// 这里守住"内联的那一段与构建出来的核心逐字节相同"—— 两形态不漂移的根。
+// 不再抽函数体做同义反复的行为对拍（内联后就是同一份代码）；宿主真实 I/O 的端到端断言在
+// tests/collab-hostcode-parity.mjs 与 tests/collab-e2e.mjs，本文件只留这一条源头守卫。
+console.log('# hostCode inlines lib/collab-core.js byte-for-byte (drift guard)')
 {
   const { hostCode } = await import('../lib/collab-plugin.host.js')
-  // 兼容函数声明 (function norm(...) {) 与箭头函数 (const norm = (...) => {)
-  // scope 用于注入被抽取函数所依赖的其他内联函数（如 sweep 依赖 holderFresh）。
-  const extract = (fnName, scope = {}) => {
-    const names = Object.keys(scope), vals = names.map(n => scope[n])
-    const decl = RegExp('function ' + fnName + '\\(([^)]*)\\) \\{([\\s\\S]*?)\\n    \\}', 'm').exec(hostCode)
-    if (decl) return new Function(...names, 'return function ' + fnName + '(' + decl[1] + ') {' + decl[2] + '}')(...vals)
-    const arrow = RegExp('const ' + fnName + ' = \\(([^)]*)\\) => \\{([\\s\\S]*?)\\n    \\}', 'm').exec(hostCode)
-    if (arrow) return new Function(...names, 'return function ' + fnName + '(' + arrow[1] + ') {' + arrow[2] + '}')(...vals)
-    throw new Error('cannot extract ' + fnName + ' from hostCode')
-  }
-  const hn = extract('norm'), hc = extract('cleanName')
-  for (const p of ['src/backend/', './src/backend', 'C:\\src', 'src/foo', 'src/foobar', 'a//b/c']) {
-    ok(hn(p) === norm(p), 'hostCode norm matches core: ' + p)
-  }
-  for (const s of ['  a   b ', 'x'.repeat(40), ''] ) {
-    ok(hc(s) === cleanName(s), 'hostCode cleanName matches core: len ' + s.length)
-  }
-  // holderFresh 内联版与核心库行为一致（含未来时间戳的时钟偏移容忍）
-  const hhf = extract('holderFresh')
-  for (const [ls, t] of [[999000, 1000000], [1001000, 1000000], [1000000 + 600000, 1000000], [1000000 - 25 * 3600 * 1000, 1000000]]) {
-    ok(hhf(ls, t) === holderFresh(ls, t), 'hostCode holderFresh matches core: lastSeenAt=' + ls)
-  }
-  // sweep 内联版与核心库行为一致（默认上限 2000 条；holder 回收判据共用 holderFresh）
-  const hs = extract('sweep', { holderFresh: hhf })
-  const mk = () => {
-    const s = init()
-    for (let i = 0; i < 2100; i++) post(s, { holderId: 'agent:a', name: 'A' }, { body: 'm' + i }, () => 1000)
-    s.holders.push({ holderId: 'ghost', name: 'Ghost', lastSeenAt: 0 })
-    return s
-  }
-  const coreState = mk(), hostState = mk()
-  const coreSwept = sweep(coreState, 1000 + HOLDER_TTL_MS + 1)
-  const hostSwept = hs(hostState, 1000 + HOLDER_TTL_MS + 1)
-  ok(JSON.stringify(coreSwept) === JSON.stringify(hostSwept), 'hostCode sweep returns the same diagnostics as core')
-  ok(JSON.stringify(coreState) === JSON.stringify(hostState), 'hostCode sweep mutates state identically to core')
+  const coreSrc = readFileSync(new URL('../lib/collab-core.js', import.meta.url), 'utf8')
+  const coreStripped = coreSrc.replace(/^export /gm, '')
+  const BEGIN = '/*__COLLAB_CORE_BEGIN__*/'
+  const END = '/*__COLLAB_CORE_END__*/'
+  const bi = hostCode.indexOf(BEGIN), ei = hostCode.indexOf(END)
+  ok(bi >= 0 && ei > bi, 'hostCode 有核心内联区（BEGIN/END 标记）', 'begin=' + bi + ' end=' + ei)
+  const region = (bi >= 0 && ei > bi) ? hostCode.slice(bi + BEGIN.length + 1, ei) : ''
+  ok(region.length > 0, '核心内联区非空', 'len=' + region.length)
+  ok(region === coreStripped, '内联核心与 lib/collab-core.js 去 export 后逐字节一致',
+    'region=' + region.length + ' coreStripped=' + coreStripped.length)
+  ok(!/^\s*(export|import)\s/m.test(region), '内联核心不含顶层 export/import（否则 new Function 装不起来）')
 }
 
 // ===== 会话家族（血缘）豁免（0.9.11，C1）=====

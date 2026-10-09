@@ -2,8 +2,10 @@
 // 多智能体协作插件的纯逻辑唯一事实源（JSON Schema v1 契约见 src/schema/collab.schema.json）。
 // 不依赖 fs/ctx/sessions，只操作 state 对象；时间通过可选参数注入以便测试。
 // 这是可 import、可测试、可被未来 CLI / Python / Rust 对照复用的实现层。
-// 注意：Cordis 动态插件的 code.host 不接受 import，因此 src/collab-plugin.host.ts
-// 内联了与这里逻辑一致的自包含可运行版；正式化进 host 组合后改用本模块消除重复。
+// 注意：Cordis 动态插件的 code.host 不接受 import，所以本模块的**构建产物**
+// （lib/collab-core.js）会被 scripts/build-host.mjs 原样内联进 src/host-shell.js 的
+// /*__COLLAB_CORE__*/ 位置，生成动态宿主形态的 hostCode。改这里 = 两形态同时改
+//（tests/collab-inline-parity.mjs 断言内联区与 lib/collab-core.js 去 export 后逐字节一致）。
 
 import type { Claim, ConflictInfo, Holder, Message, Mode, StateDocument } from './types/collab.js'
 
@@ -26,6 +28,17 @@ export interface HolderInput {
    * 也就是 0.9.10 的行为：既有语料与既有语义一字不变。
    */
   family?: string[]
+  /**
+   * **写这一行的进程身份令牌**（0.14.0，B2）：形如 `<pid>:<开机节拍>`，由接线层从
+   * `/proc/<pid>/stat` 现算。**它决定名册行的生死**：`sweep()` 只保留「有未过期声明」
+   * 或「写它的那个进程还活着」的行 —— 于是进程一被杀（本机 harness 重启就是 SIGKILL 整条
+   * cgroup，既没有 `agent/status` 也没有 `agent/disposed`），它留下的名册行在下一次 sweep
+   * 就消失，不必再等 24h 计时器。
+   *
+   * 缺省（纯逻辑语料、受限宿主拿不到进程身份）⇒ 该行退回 24h TTL 老口径，一字不变。
+   * **只影响名册行**：声明（claim）的回收仍然只由租约 `expiresAt` 决定（W7 未动）。
+   */
+  proc?: string
 }
 
 /**
@@ -96,11 +109,26 @@ export interface ReadInput {
   limit?: number
 }
 
-/** sweep 的可选上限覆盖（默认 MAX_MESSAGES / HOLDER_TTL_MS）。 */
+/** sweep 的可选上限覆盖（默认 MAX_MESSAGES / MAX_MESSAGES_BYTES / HOLDER_TTL_MS）。 */
 export interface SweepOptions {
   maxMessages?: number
+  /** 留言总量的字节预算（默认 MAX_MESSAGES_BYTES）。口径见该常量的注释。 */
+  maxMessagesBytes?: number
   holderTtlMs?: number
   staleWarnMs?: number
+  /**
+   * 名册行的进程判据（0.14.0，B2）：**此刻还活着**的进程令牌集合。
+   * `null`（或缺省）= 判据不可用（非 Linux / 读不到 /proc）⇒ 带 `proc` 的行一个也不收
+   * （fail-closed：漏收只是维持现状）。只有真正的 `Set` 才允许按它删行。
+   */
+  liveProcs?: Set<string> | null
+  /**
+   * 本形态**能**给名册行盖进程章（0.14.0，B2）。只有接线层确认 `proc` 一定写得上去时才传
+   * `true`；传 `true` 时没有 `proc` 的行一律作废（升级前留下的旧行 —— 下一次操作自动重新登记）。
+   * 拿不到进程身份的形态（受限动态宿主里 `process` 是 undefined）**必须不传**，否则会把活会话的行
+   * 反复删掉。
+   */
+  procStamping?: boolean
 }
 
 /** sweep 的清理诊断信息。 */
@@ -257,6 +285,45 @@ export function init(): StateDocument { return { schemaVersion: 1, seq: 0, claim
 // 状态膨胀上限：留言保留最近 MAX_MESSAGES 条，holder 在无活跃声明且 24h 未出现时回收。
 // 两者都由 sweep() 在每次读/写前惰性执行，保证状态文件不会无限增长。
 export const MAX_MESSAGES: number = 2000
+// **单条**留言正文的字符上限（0.14.0，M2b）。为什么需要它：`MAX_MESSAGES` 只封**条数**，
+// 而 `body` 在契约里此前只有 `minLength: 1` —— 一条任意大的正文 × 2000 条 = **任意大**
+// （实测一条 5MB 的 body 原样落盘，`sweep()` 也不会缩小它）。
+// 取 8000 的理由：够写一条长留言（现场溢出的几十 KB 都发生在 `read` 的**结果**里，
+// 不在单条 `post`），× 2000 条上限 ⇒ 最坏约 16MB，而不是"任意大"。
+// 超限由 `post()` **显式挡回**（`bad-request`），**绝不静默截断** —— 截断会悄悄改掉调用方的话。
+// 口径：按 `body.length`（UTF-16 单元）计，对星平面字符比 JSON Schema 的 `maxLength` 更严。
+export const MESSAGE_BODY_MAX_CHARS: number = 8000
+// 留言**总量**的字节预算（0.15.0，R2）。为什么除了条数还要封字节：`MAX_MESSAGES = 2000` 条
+// × 每条上限 8000 字符，最坏仍约 2 MB；真实状态文件的 97% 就是留言（实测 82,248 B 里 79,815 B）。
+// 两者**取先到者**，超出都从**最旧**开始丢（同一个方向，`swept.droppedMessages` 如实报数）。
+// 口径：**每条留言的 JSON 序列化的 UTF-8 字节之和**（不含数组的方括号与逗号，也不含外层
+// `{schemaVersion, seq, messages}` 的键名），即"要落进旁挂文件的正文量"，不是文件总字节数。
+// 一条留言的正文另有 `MESSAGE_BODY_MAX_CHARS` 的硬上限，所以单条不可能大到把预算一口吃光。
+export const MAX_MESSAGES_BYTES: number = 256 * 1024
+
+/**
+ * 一个字符串的 UTF-8 字节数。**刻意不用 `Buffer` / `TextEncoder`**：本模块会被原样内联进
+ * 受限动态宿主（见 src/host-shell.js 的文件头），那里只有纯 JS 全局。
+ * 代理对（星平面字符）按 4 字节计，与 `Buffer.byteLength(s, 'utf8')` 同口径。
+ */
+function utf8Bytes(s: string): number {
+  let n = 0
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i)
+    if (c < 0x80) n += 1
+    else if (c < 0x800) n += 2
+    else if (c >= 0xd800 && c <= 0xdbff) {
+      const d = i + 1 < s.length ? s.charCodeAt(i + 1) : 0
+      if (d >= 0xdc00 && d <= 0xdfff) { n += 4; i++ } else n += 3
+    } else n += 3
+  }
+  return n
+}
+
+/** 一条留言在磁盘上的字节量口径（见 MAX_MESSAGES_BYTES）。序列化失败按 0 计（数据来自 JSON.parse，不会有环）。 */
+export function messageBytes(m: Message): number {
+  try { return utf8Bytes(JSON.stringify(m)) } catch (e) { return 0 }
+}
 export const HOLDER_TTL_MS: number = 24 * 60 * 60 * 1000
 // 时钟偏移容忍：lastSeenAt 落在未来超过该窗口的 holder 视为不可信并回收。
 // 只回收 holder 记录；声明仍按各自的 expiresAt 判定，锁语义不受影响。
@@ -265,6 +332,12 @@ export const HOLDER_FUTURE_SKEW_MS: number = 5 * 60 * 1000
 // 它**小于**回收阈值（24h），所以 stale 是"看起来已废弃"的先行信号，而不是"马上会被删"的同义词；
 // 若与回收同阈值，在"先 sweep 再取视图"的产品路径上该字段恒为 false（死信号）。
 export const HOLDER_STALE_WARN_MS: number = 60 * 60 * 1000
+// 名册行的**显示**上限（0.14.0，C）。为什么要有界：`list` 过去逐条返回整份名册，
+// 现场实测 56 行 / 约 10 KB 一次；而每一步都注入的态势摘要早就把 claims 压到
+// 「最多 3 条 × 每条 2 个路径」（见 renderDigest）。同一份"输出必须与注入频率同量级"的
+// 纪律，名册这边漏了一半。
+// 截断**不丢事实**：调用方始终能拿到 `holdersTotal`，自己看得出被折叠了。
+export const HOLDER_VIEW_LIMIT: number = 12
 
 // holder 是否仍算"新鲜"：age 落在 [-HOLDER_FUTURE_SKEW_MS, holderTtlMs) 内。
 // sweep 的回收判据与 holderView 的 stale 判据共用这一个函数，二者不会再出现"口径不一致"。
@@ -275,9 +348,24 @@ export function holderFresh(lastSeenAt: number | undefined, t: number, holderTtl
 
 // 惰性清理：过期声明 + 超额留言 + 陈旧 holder。
 // 返回各类清理数量，供上层附带诊断信息。
+//
+// **名册行（holder）的回收判据（0.14.0 改写）** —— 旧实现只有一条：`active || 静默 < 24h`，
+// 于是"会话句柄已经结束"这件事对名册毫无影响：0.13.0 的 `agent/disposed` 只释放声明，
+// 现场实测 4/4 条已 dispose 的 holder 行照样留着，直到 24h 计时器把它们扫走
+// （docs/collab-ux-backlog.md §2.24 / §2.27）。现在的判据是**两条终结路径**，都不靠计时器：
+//   1. `dropHolder()`：句柄结束（`agent/disposed`）⇒ 行与它的过期声明一起消失；
+//   2. `proc`：行上盖着写它的那个进程的身份令牌；这个进程不在了 ⇒ 行下一次 sweep 就走。
+//     —— 这一条覆盖第 1 条覆盖不到的"进程被杀"（没有 dispose 事件可等）。
+// 仍然保留的兜底只有一种：**行上没有 `proc`**（升级前的旧行，或该形态拿不到进程身份）。
+// 此时若接线层声明 `procStamping: true`（本形态确实在盖章）⇒ 旧行直接作废，下一次操作重新登记；
+// 否则退回 24h TTL 老口径。判据**只缩不放**：没有任何一条会让行活得更久。
 export function sweep(s: StateDocument, t: number, opts: SweepOptions = {}): SweepResult {
   const maxMessages = Number.isInteger(opts.maxMessages) && opts.maxMessages > 0 ? opts.maxMessages : MAX_MESSAGES
+  const maxMessagesBytes = Number.isInteger(opts.maxMessagesBytes) && opts.maxMessagesBytes > 0 ? opts.maxMessagesBytes : MAX_MESSAGES_BYTES
   const holderTtlMs = Number.isInteger(opts.holderTtlMs) && opts.holderTtlMs >= 0 ? opts.holderTtlMs : HOLDER_TTL_MS
+  // 只有真正的 Set 才算"判据可用"；null / undefined 一律降级（见 SweepOptions.liveProcs）。
+  const liveProcs: Set<string> | null = opts.liveProcs instanceof Set ? opts.liveProcs : null
+  const procStamping = opts.procStamping === true
 
   const beforeClaims = s.claims.length
   s.claims = s.claims.filter(c => c.expiresAt > t)
@@ -288,10 +376,35 @@ export function sweep(s: StateDocument, t: number, opts: SweepOptions = {}): Swe
     droppedMessages = s.messages.length - maxMessages
     s.messages = s.messages.slice(-maxMessages)
   }
+  // 字节预算（0.15.0，R2）：与条数上限**同一个方向**（丢最旧），两者取先到者。
+  // 从尾部往前累加到"再加一条就超预算"为止 —— 只扫被保留的那一段，不必先算全量。
+  // 注意它是**硬**上限：极端情况下（单条留言自己就超预算）会把留言清空，
+  // 因为"文件不无限增长"这条比"留住一条超大的正文"更硬；正常路径上到不了这一步
+  // —— `post()` 的 MESSAGE_BODY_MAX_CHARS = 8000 已经把单条封死。
+  if (s.messages.length) {
+    let total = 0
+    let keepFrom = s.messages.length
+    for (let i = s.messages.length - 1; i >= 0; i--) {
+      const b = messageBytes(s.messages[i])
+      if (total + b > maxMessagesBytes) { keepFrom = i + 1; break }
+      total += b
+      keepFrom = i
+    }
+    if (keepFrom > 0) {
+      droppedMessages += keepFrom
+      s.messages = s.messages.slice(keepFrom)
+    }
+  }
 
   const active = new Set(s.claims.map(c => c.holderId))
   const beforeHolders = s.holders.length
-  s.holders = s.holders.filter(h => active.has(h.holderId) || holderFresh(h.lastSeenAt, t, holderTtlMs))
+  s.holders = s.holders.filter(h => {
+    if (active.has(h.holderId)) return true
+    const proc = typeof h.proc === 'string' ? h.proc : ''
+    if (proc) return liveProcs === null ? true : liveProcs.has(proc)
+    // 没有进程身份：旧行，或本形态盖不了章。能盖章的形态直接作废它，否则退回 24h TTL。
+    return procStamping ? false : holderFresh(h.lastSeenAt, t, holderTtlMs)
+  })
   const prunedHolders = beforeHolders - s.holders.length
 
   // readers **不在这里清理**（0.8.3 修掉的真缺陷）。
@@ -343,7 +456,7 @@ export function holderView(state: StateDocument, t: number, opts: SweepOptions =
 // 累计 337014 字符被重复注入；237 是逐对做最小差异判定得到的精确值）。
 // 改用**绝对 UTC 起止时刻**后，文本只在"他人的占用集合真的变了"时才变，去重恢复生效。
 // 因此签名刻意**不接受任何时间参数**：没有参数，倒计时就无从偷偷加回来。
-// 动态宿主形态在 src/collab-plugin.host.ts 的 hostCode 里保留一份等价内联实现
+// 动态宿主形态的 hostCode（构建时由 scripts/build-host.mjs 内联本模块生成）
 // （限制执行环境不能 import），两者的逐字节等价由 tests/collab-hostcode-parity.mjs 对拍。
 
 // 毫秒时间戳 → `MM-DD HH:MMZ`（UTC，分钟粒度）。分钟粒度 + UTC 让它与本地时区、时钟秒数无关。
@@ -553,11 +666,22 @@ export function accessScope(accessPath: string): string {
  * 把任意路径归一到**项目相对**形式：若它落在 cwd 之下就去掉 cwd 前缀。
  * claim 的 paths 是项目相对的（工具文档："项目相对路径"），而工具入参可能是绝对路径
  * （如 write 的 file_path 交给 fs 后端解析），不归一化就永远匹配不上。
+ *
+ * **相对路径必须先按 cwd 解析**（0.14.0 修的真绕过，2026-10 审计实测）：
+ * 反例 —— cwd = `/home/u/proj`，工具给 `../proj/src/a.ts`。fs 后端按 cwd 解析，
+ * 这次写入**精确落在** `/home/u/proj/src/a.ts`；而旧实现把 raw 直接交给 `norm()`，
+ * 栈回退把首部 `..` 吃掉、得到 `proj/src/a.ts` —— 它不以项目根开头，于是本函数原样返回，
+ * `claimsCovering` 判"无冲突"，**门控放行** ⇒ 拿着别人独占的路径照写不误。
+ * 现在先拼成 `cwd + '/' + raw` 再归一，`..` 就在正确的坐标系里回退，落回 `src/a.ts`。
+ * 三个调用点（gate 的写门控两处、access 的访问通知）因此一起修好 —— 它们共用这一条判据。
  */
 export function relToProject(p: string, cwd?: string | null): string {
-  const n = norm(p)
-  if (!n) return ''
+  const raw = typeof p === 'string' ? p.trim() : ''
+  if (!raw) return ''
   const c = typeof cwd === 'string' && cwd ? norm(cwd) : null
+  // 绝对路径照旧；相对路径先落到 cwd 坐标系里再归一（见上面的反例）。
+  const n = raw.charAt(0) === '/' ? norm(raw) : (c ? norm(c + '/' + raw) : norm(raw))
+  if (!n) return ''
   if (!c) return n
   const root = c.replace(/\/+$/, '')
   if (!root) return n
@@ -631,6 +755,14 @@ export function registerReader(state: StateDocument, claimId: string, holderId: 
  * `t` **必填**（不许隐式读 `Date.now()`）：纯逻辑模块要保持可确定性、可对拍。
  * `data.released` 只含**真正被删掉**的声明 ⇒ 正常情况为空，agent/disposed 路径
  * 也就不再产生"锁已释放"通知（那是实话：没有发生释放事件）。
+ *
+ * **0.14.0 补上"名册行"这一半（A）**：本函数现在还摘掉这个 holder 的**名册行**。
+ * 为什么在同一处做：名字本来就叫 dropHolder，而 0.13.0 之前它只清声明与 readers，
+ * 行留着等 24h（现场实测 4/4 条已 dispose 的行都还在）。为什么安全：在本函数的调用点上，
+ * `releaseOnLoopEnd(..., 'disposed')` **已经在同一个事务里**删掉它全部未过期声明，
+ * 所以摘行那一刻它必然零声明 —— 摘行不可能藏住一把活锁。会话若被唤醒，下一次操作
+ * 会按 `agent.id` 自动重新登记（见 holder()）。这也让"没有声明可释放"的回收路径
+ * 不再是空操作：只要行还在，`changed` 就是 true，handler 会真的写盘。
  */
 export function dropHolder(state: StateDocument, holderId: string, t: number): OpResult {
   const expired = (c: Claim): boolean => c.holderId === holderId && c.expiresAt <= t
@@ -643,6 +775,15 @@ export function dropHolder(state: StateDocument, holderId: string, t: number): O
     c.readers = list.filter(x => x !== holderId)
     changed = true
   }
+  const holdersBefore = Array.isArray(state.holders) ? state.holders.length : 0
+  // **不变量**：只要这个 holder 还有未过期声明，它的名册行就必须留着 —— 行是 holder 在 list
+  // 名册里的可见性来源，删了会出现"claims 里有人、holders 里没有"的自相矛盾。
+  // 真实调用点上 `releaseOnLoopEnd(..., 'disposed')` 已经先删光它的未过期声明，所以这里照常摘干净；
+  // 而这条判断让"单独调用 dropHolder 时误摘活行"从根上不可能发生（判据只缩不放）。
+  // 上面已把该 holder 的**已过期**声明清掉，所以这里凡还在的都是未过期的。
+  const stillClaiming = state.claims.some(c => c.holderId === holderId)
+  if (holdersBefore && !stillClaiming) state.holders = state.holders.filter(h => h.holderId !== holderId)
+  if (state.holders.length !== holdersBefore) changed = true
   if (!changed) return { ok: true, changed: false, data: {} }
   return { ok: true, changed: true, state, data: { released: rel.map(publish) } }
 }
@@ -761,10 +902,13 @@ export function conflictError(cs: ConflictInfo[]): CollabConflictError {
 }
 
 // 登记/更新 holder 元数据。
+// `proc` 只在提供时盖上去（0.14.0）：拿不到进程身份的形态绝不能**清掉**既有行上的章 ——
+// 那会让一个活进程刚盖的章被另一个形态的一条读改写抹掉。
 export function holder(state: StateDocument, h: HolderInput, name: string, tNow: Clock): Holder {
   let r = state.holders.find(x => x.holderId === h.holderId)
   if (!r) { r = { holderId: h.holderId, name, kind: h.sessionId ? 'agent' : 'human', sessionId: h.sessionId, lastSeenAt: tNow() }; state.holders.push(r) }
   else { r.name = name; r.lastSeenAt = tNow() }
+  if (typeof h.proc === 'string' && h.proc) r.proc = h.proc
   return r
 }
 
@@ -796,7 +940,19 @@ export function claim(state: StateDocument, h: HolderInput, a: ClaimInput, tNow:
     for (const c of state.claims) {
       // inFamily 取代了裸的 `c.holderId === h.holderId`：自家子代理（或父会话）的声明
       // 属于同一个写域，不该互相拦。血缘缺省时 inFamily 的语义与旧写法**完全一致**。
-      if (inFamily(h, c.holderId) || c.expiresAt <= t || c.mode === 'shared' || c.mode === 'read') continue
+      if (inFamily(h, c.holderId) || c.expiresAt <= t) continue
+      // read 是纯观测：不阻塞他人，也不被他人阻塞（与上面 `mode !== 'read'` 的外层判断同源）。
+      if (c.mode === 'read') continue
+      // **要不要谈，由"本请求的意图"决定**（0.14.0，用户决策：改成允许协商的模式）。
+      //   · 我请求 exclusive ⇒ 与已在场的 exclusive **和 shared** 都冲突。
+      //     旧实现无条件跳过 shared ⇒ 后来的 exclusive 被**静默批准**：前一秒还在 shared 里
+      //     干活的会话，下一秒写入就被门控硬拒（本部署 ask == deny），而"冲突"这件事双方都没
+      //     看见 —— 后来者反客为主。现在改为报冲突，让它去协商 / 等待 / 换路径：
+      //     返回的 ConflictInfo 里已带 suggestedAction(wait|negotiate)、holderName、
+      //     remainingSec、overlapsWith，正是协商所需的全部信息。
+      //   · 我请求 shared ⇒ 只与已在场的 exclusive 冲突（"shared 会被他人独占挡住"是它的定义）；
+      //     与已在场的 shared 不冲突（共享方互不挡死，保持 0.9.x 起的语义）。
+      if (mode === 'shared' && c.mode === 'shared') continue
       for (const p of paths) for (const cp of c.paths) if (ov(p, cp)) {
         const remainingSec = Math.max(0, Math.ceil((c.expiresAt - t) / 1000))
         const suggestedAction: ConflictInfo['suggestedAction'] = remainingSec <= 30 ? 'wait' : 'negotiate'
@@ -980,6 +1136,10 @@ export function post(state: StateDocument, h: HolderInput, a: PostInput, tNow: C
   }
   const body = typeof a.body === 'string' ? a.body.trim() : ''
   if (!body) return { ok: false, changed: false, state, tNow, data: { error: 'bad-request', message: 'body required' } }
+  // 上限在**任何写入之前**判定（`holder()` 也不跑）：被挡回的 post 一个字都不落盘。
+  if (body.length > MESSAGE_BODY_MAX_CHARS) {
+    return { ok: false, changed: false, state, tNow, data: { error: 'bad-request', message: 'body 过长：' + body.length + ' 字符 > 上限 ' + MESSAGE_BODY_MAX_CHARS + '；本条**没有写入**，超限不截断，请精简或拆分后重发' } }
+  }
   holder(state, h, h.name, tNow)
   const m: Message = { msgId: 'm_' + (++state.seq), seq: state.seq, channel: (typeof a.channel === 'string' && a.channel.trim()) ? a.channel.trim() : 'general', author: h.holderId, ts: tNow(), body }
   if (typeof a.replyTo === 'string' && a.replyTo) m.replyTo = a.replyTo

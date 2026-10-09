@@ -1,4 +1,4 @@
-import { createHarness } from './_harness.mjs'
+import { createHarness, readStateMerged, writeStateSplit } from './_harness.mjs'
 
 // collab-access-gate.mjs
 // 功能 A（访问时的路径相关通知）与功能 C（可读性 + 原生写保护）的回归测试。
@@ -49,6 +49,7 @@ delete process.env.DSH_COLLAB_NO_PROMPT_HINT
 
 const core = await import(path.join(ROOT, '../lib/collab-core.js'))
 const { projectStateFile } = await import(path.join(ROOT, '../lib/paths.js'))
+const { pathArgsFor } = await import(path.join(ROOT, '../lib/spec.js'))
 const mod = await import(path.join(ROOT, '../lib/index.js'))
 const collabPlugin = mod.default
 
@@ -151,9 +152,35 @@ console.log('# claimsCovering / relToProject / isReadable（功能 C 的判据�
   ok(relToProject('/other/src/a/1', '/repo') === 'other/src/a/1', '不在 cwd 之下则原样归一')
   ok(relToProject('src/a/1', null) === 'src/a/1', '无 cwd 时原样')
   ok(relToProject('/repo', '/repo') === '', '恰好等于 cwd -> 空串')
+  // 0.14.0：相对路径**必须先按 cwd 解析**，否则 `../<项目名>/...` 会绕开整道门控
+  //（实况反例：cwd=/home/u/proj、入参 `../proj/src/a.ts`，fs 后端照样落在项目内）。
+  ok(relToProject('../proj/src/a/1', '/repo/proj') === 'src/a/1',
+    '相对路径按 cwd 解析：../<项目名>/… 落回项目内（不再被判成"项目外"）')
+  ok(relToProject('./src/a/1', '/repo') === 'src/a/1', '点斜杠前缀相对路径')
+  ok(relToProject('src/a/1', '/repo') === 'src/a/1', '本来就正确的相对路径不受影响')
+  ok(relToProject('..', '/repo/proj') === 'repo', '上跳到父目录：真的在项目外就如实返回')
+  ok(relToProject('.', '/repo') === '', '目标就是项目根 -> 空串（与"解析不出来"不是一回事）')
+  ok(claimsCovering([mkClaim({ paths: ['src/'] })], relToProject('../proj/src/a/1', '/repo/proj'), T0).length === 1,
+    '归一后的 ../ 路径能被声明命中（旧实现这里是 0 ⇒ 放行）')
   ok(isReadable({ readable: false }) === false, 'isReadable: 显式 false -> 不可读')
   ok(isReadable({}) === true, 'isReadable: 缺字段（老状态文件）-> 可读')
   ok(isReadable({ readable: true }) === true, 'isReadable: true -> 可读')
+}
+
+console.log('# 核心 fs 工具必须**全部**登记进 TOOL_PATH_SPECS（漏登记是静默的）')
+{
+  // 为什么需要这条守卫：漏登记时 pathArgsFor 返回 {write:[],read:[]}，门控第 46 行直接 return null
+  // 放行，**没有任何测试会红**。现场就是 `read_image` 漏登记（DSH 核心文件工具集真实注册的读工具，
+  // 见 dsh-tool-fs/lib/index.js:986，参数同为 file_path）⇒ 对图片的 exclusive + readable:false
+  // 形同不存在。加一个核心 fs 工具就得在这张表加一行，这条断言就是那句纪律的强制点。
+  const CORE_FS_TOOLS = ['read', 'read_image', 'write', 'edit']
+  for (const t of CORE_FS_TOOLS) {
+    const s = pathArgsFor(t, { file_path: 'x', path: 'x' })
+    ok(s.write.length + s.read.length > 0, '核心 fs 工具已登记路径参数：' + t, JSON.stringify(s))
+  }
+  const img = pathArgsFor('read_image', { file_path: 'a/b.png' })
+  ok(img.read.includes('file_path') && img.write.length === 0,
+    'read_image 归为**读**工具且取 file_path（否则图片的 readable:false 拦不住）', JSON.stringify(img))
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -171,7 +198,12 @@ function makeFs(store, versions, opts = {}, calls) {
       return store.has(t.path) ? { version: versions.get(t.path) || 1 } : null
     },
     readText: async (t) => {
-      if (calls) calls.readText++
+      if (calls) {
+        calls.readText++
+        // 0.15.0（R2）起"读一次逻辑状态"要读**两个**文件（主文件 + 留言旁挂），
+        // 所以去重断言数的是**主文件**的读取次数 —— 那才等于 load() 的次数。
+        if (!/\.messages\.json$/.test(t.path)) calls.readTextMain++
+      }
       if (opts.readThrows && opts.readThrows(t.path)) throw new Error('boom: read failed')
       return store.get(t.path) || ''
     },
@@ -217,7 +249,7 @@ function pluginConfig(values) {
 async function makeHarness(opts = {}) {
   const store = new Map()
   const versions = new Map()
-  const calls = { stat: 0, readText: 0, writeText: 0 }
+  const calls = { stat: 0, readText: 0, readTextMain: 0, writeText: 0 }
   const tools = []
   const prompts = []
   // 按 name 索引已注册的运行时上下文段（与 tests/collab-awareness.mjs、collab-skill.mjs 的假服务同形）。
@@ -265,8 +297,12 @@ async function makeHarness(opts = {}) {
     : pluginConfig(Object.assign({ exposeDelegationDiscipline: true, enforceWriteLock: true }, opts.settings || {})))
   await settle()
 
-  const readState = () => JSON.parse(store.get(statePath) || '{}')
-  const writeState = (doc) => { store.set(statePath, JSON.stringify(doc)); versions.set(statePath, (versions.get(statePath) || 0) + 1) }
+  // 逻辑状态 = 主文件 + 留言旁挂；写回也按同一布局拆开（0.15.0，R2）。
+  const readState = () => readStateMerged((p) => store.get(p), statePath)
+  const writeState = (doc) => {
+    writeStateSplit((p, text) => store.set(p, text), statePath, doc)
+    versions.set(statePath, (versions.get(statePath) || 0) + 1)
+  }
 
   /**
    * 改一个偏好字段，完全照 Loader 的 volatile 通道做：更新运行中 fiber 的 Config **引用内容**，
@@ -399,13 +435,13 @@ console.log('# A: post-execute 原样返回 downstream，通知经 agent.inject 
   // ── 重复命中 ⇒ 不再 inject；且不再走一次反向登记的 mutate ──
   // 两个可观测量：inject 次数不涨；且**不再走一次反向登记的 mutate**
   // （重复分支只做 accessEntries 的那一次 load，首次还要多一次 registerAccessReaders 的 load）。
-  const firstReads = h.calls.readText
+  const firstReads = h.calls.readTextMain
   const again = await h.post(execOf('read', { file_path: 'src/a/1' }))
   ok(again.decision === again.downstream && !('additionalContexts' in again.decision), '重复访问仍然原样放行')
   ok(injectLog.length === 1, '重复命中 -> 不再 inject（仍是一条）', 'injects=' + injectLog.length)
-  ok(h.calls.readText - firstReads === 1,
-    '重复命中不再做一次反向登记（状态只读 1 次；首次是 2 次：accessEntries + registerReaders）',
-    'delta=' + (h.calls.readText - firstReads))
+  ok(h.calls.readTextMain - firstReads === 1,
+    '重复命中不再做一次反向登记（逻辑状态只读 1 次；首次是 2 次：accessEntries + registerReaders）',
+    'delta=' + (h.calls.readTextMain - firstReads))
 
   // ── 另一个 agent 各调一次（去重键是 agent 对象）──
   const otherAgent = withInject('agent-other-me')
@@ -918,8 +954,20 @@ console.log('# C: 一致性 —— writeGate 阻塞集合 ≡ claim() 冲突集�
     try { claim(st, { holderId: ME_HOLDER, name: 'Me' }, { paths: [target] }, () => NOW) }
     catch (e) { conflicts = (e && e.conflicts) || [] }
     const coreBlocked = Array.isArray(conflicts) && conflicts.length > 0
-    ok(gateBlocked === coreBlocked, 'writeGate 阻塞 ≡ claim() 冲突：' + cs.label,
-      'gate=' + gateBlocked + ' claim=' + coreBlocked)
+    // 0.14.0「允许协商」：**取得层（claim）比执行层（gate）严一档**，这是刻意的不对称，
+    // 不是漂移 ——
+    //   · 执行层：他人的 shared 不拦你写（共享就是共享）；
+    //   · 取得层：他人在 shared，你就不能把这路径变成自己的 exclusive —— 否则他一觉醒来
+    //     被门控硬拒（本部署 ask == deny），而"冲突"双方都没看见。
+    // 所以对**已在场的 shared 声明**两者故意不相等；其余情形仍必须逐例相等。
+    if (cs.mode === 'shared') {
+      ok(gateBlocked === false && coreBlocked === true,
+        '取得层比执行层严一档（已在场 shared）：' + cs.label,
+        'gate=' + gateBlocked + ' claim=' + coreBlocked)
+    } else {
+      ok(gateBlocked === coreBlocked, 'writeGate 阻塞 ≡ claim() 冲突：' + cs.label,
+        'gate=' + gateBlocked + ' claim=' + coreBlocked)
+    }
   }
 
   // 集合级：shared/read 不进阻塞集合，两条 exclusive 都进；门控报出的第一位阻塞者
@@ -936,11 +984,15 @@ console.log('# C: 一致性 —— writeGate 阻塞集合 ≡ claim() 冲突集�
   for (const c of multi) st.claims.push({ ...c })
   let conflicts = []
   try { claim(st, { holderId: ME_HOLDER, name: 'Me' }, { paths: [target] }, () => NOW) } catch (e) { conflicts = (e && e.conflicts) || [] }
-  ok(gate.decision.kind === 'ask' && conflicts.length === 2,
-    '多条声明：阻塞集合恰好是两条 exclusive（shared/read 不在内）',
+  ok(gate.decision.kind === 'ask' && conflicts.length === 3,
+    '多条声明：**执行层**只被两条 exclusive 拦（shared/read 不在内）；**取得层**连 shared 也拦（允许协商）',
     'gate=' + gate.decision.kind + ' conflicts=' + JSON.stringify(conflicts.map(c => c.claimId)))
-  ok(conflicts.length === 2 && String(gate.decision.reason).includes(conflicts[0].holderName),
-    '门控报出的第一位阻塞者与 claim() 的 cs[0] 同一条', String(gate.decision.reason))
+  ok(conflicts.length === 3 && String(gate.decision.reason).includes('X1') && !String(gate.decision.reason).includes('Sharer'),
+    '门控报出的第一位阻塞者仍是第一条 exclusive，且**不**把 shared 持有者当成写阻塞者',
+    String(gate.decision.reason))
+  ok(conflicts.length === 3 && conflicts[0].claimId === 'c_sh',
+    '取得层的第一位冲突是 shared（按 state.claims 顺序扫描；协商对象要先被看见）',
+    JSON.stringify(conflicts.map(c => c.claimId)))
 }
 
 // ── 功能 C × 会话家族（血缘，0.9.11）：父会话占着的路径，自家子代理写得过 ──
@@ -972,6 +1024,91 @@ console.log('# C · 会话家族：父会话的独占锁不拦自家子代理，
   const noLineage = withInject('agent-me')
   const legacy = await h.pre(execOf('write', { file_path: 'src/a/1', content: 'x' }, noLineage))
   ok(legacy.decision.kind === 'ask', '血缘缺失：退化为旧语义，仍然被拦', JSON.stringify(legacy.decision))
+}
+
+// ---------------------------------------------------------------------------
+// C · 相对路径不得绕开门控（0.14.0 修的真绕过，端到端）
+// 现场：cwd = /fake/project/gate，工具给 `../gate/src/a/1`。fs 后端按 cwd 解析 ⇒ 这次写入
+// **精确落在**项目内的 src/a/1；旧实现把 raw 直接 norm（首部 `..` 被栈回退吃掉）⇒ 判"无冲突"放行。
+console.log('# C: ../<项目名>/ 形式与项目根的相对路径不得绕开门控')
+{
+  // 注意 expiresAt 必须用**当前时刻**（mkClaim 的默认值是固定 T0=2026-01，那已经过期 ⇒ 声明不生效）。
+  const foreign = mkClaim({ claimId: 'c_esc', holderId: 'agent:other', holderName: 'Other Session', paths: ['src/a/'], expiresAt: Date.now() + HOUR })
+  const h = await makeHarness({ claims: [foreign] })
+  const cases = [
+    ['../gate/src/a/1', '上跳一层再回落到项目内'],
+    ['./src/a/1', '点斜杠前缀'],
+    ['src/a/1', '普通相对路径（对照）'],
+    ['.', '项目根本身：空串不再被当作"解析不出来"而跳过']
+  ]
+  for (const [p, label] of cases) {
+    const r = await h.pre(execOf('write', { file_path: p, content: 'x' }))
+    ok(r.decision && r.decision.kind === 'ask',
+      '写 ' + JSON.stringify(p) + ' 被拦（' + label + '）', JSON.stringify(r.decision))
+  }
+  // 反向对照：别人没占的路径照旧放行 —— 证明不是"把门控整段拦死"（那种"修过头"同样不可接受）。
+  const free = await h.pre(execOf('write', { file_path: 'other/thing.ts', content: 'x' }))
+  ok(free.decision.kind === 'allow' && free.nextCalls === 1,
+    '未被占用的路径照旧放行（修过头了吗？没有）', JSON.stringify(free.decision) + ' next=' + free.nextCalls)
+}
+
+console.log('# C 两形态等价：同一份状态 + 同一次写调用 -> 两形态的 ask reason 逐字节一致')
+// 为什么单列一条：包形态（src/gate.ts）与动态宿主形态（src/host-shell.js 的写门控）是**两份接线**，
+// 上面各测各的只能证明"都拦"，证明不了"拦的话术与判据完全一样"。这里把同一条声明塞进两个形态的
+// 状态文件、跑同一次写调用，断言 reason 逐字节相同 —— reason 是用户可见文案，漂了就是两个形态
+// 给出不同解释（而且本部署 ask == deny，文案就是被拒者能看到的全部信息）。
+{
+  const EXP = Date.now() + HOUR
+  const fixed = mkClaim({
+    claimId: 'c_fixed_parity', holderId: 'agent:other', holderName: 'Other Session',
+    paths: ['src/fixed/'], mode: 'exclusive', ttlSec: 3600, createdAt: EXP - HOUR, expiresAt: EXP
+  })
+  // 包形态
+  const hp = await makeHarness({ claims: [JSON.parse(JSON.stringify(fixed))] })
+  const pkgR = await hp.pre(execOf('write', { file_path: 'src/fixed/x.ts', content: 'x' }, ME))
+
+  // 动态宿主形态：真 Cordis Context + 真 waterfall（与 hostcode-parity 的装载方式同构）
+  const { hostCode } = await import(path.join(ROOT, '../lib/collab-plugin.host.js'))
+  const hostMap = new Map()
+  const hostTools = []
+  const hostCtx = new Context()
+  for (const n of ['tools', 'timer', 'fs', 'sessions', 'sessionTitle', 'settings']) hostCtx.provide(n)
+  hostCtx.set('tools', { register: () => () => {}, schemas: () => [], get: () => undefined })
+  hostCtx.set('timer', { timeout: (ms) => new Promise((r) => setTimeout(r, ms)), interval: () => () => {} })
+  hostCtx.set('fs', {
+    resolve: async (p, o) => ({ displayPath: p, path: path.isAbsolute(p) ? p : path.resolve(o && o.cwd ? o.cwd : process.cwd(), p) }),
+    stat: async (t) => (hostMap.has(t.path) ? { version: 1, type: 'file' } : undefined),
+    readText: async (t) => hostMap.get(t.path) || '',
+    writeText: async (t, c) => { hostMap.set(t.path, c); return { operation: 'create', version: 1 } },
+    processPath: (t) => t.path,
+    listDir: async () => []
+  })
+  hostCtx.set('sessions', { get: () => ({ header: { cwd: CWD } }) })
+  hostCtx.set('sessionTitle', { get: () => ({ title: 'Gate Worker' }) })
+  hostCtx.set('settings', { prepareDocument: async () => path.join(os.tmpdir(), 'collab-gate-parity-' + process.pid, 'settings.yaml') })
+  const hostPlugin = new Function('harness', 'ctx', hostCode)(
+    { defineTool: (d) => d, registerTool: (_c, t) => { hostTools.push(t); return () => {} }, handle: () => () => {} }, hostCtx)
+  await hostCtx.plugin(hostPlugin)
+  await settle()
+  const hostLock = hostTools.find((t) => t.name === 'collab_lock')
+  const hostState = (await hostLock.execute({ op: 'list' }, { agent: { id: 'agent-warm' } })).data.statePath
+  hostMap.set(hostState, JSON.stringify({
+    schemaVersion: 1, seq: 1, claims: [JSON.parse(JSON.stringify(fixed))], messages: [], holders: []
+  }))
+  let hostNext = 0
+  const hostR = {
+    decision: await hostCtx.waterfall('tools/pre-execute', execOf('write', { file_path: 'src/fixed/x.ts', content: 'x' }, ME), () => {
+      hostNext++
+      return Promise.resolve({ kind: 'allow' })
+    })
+  }
+
+  ok(pkgR.decision.kind === 'ask', '（对照基准）包形态对这条声明返回 ask', JSON.stringify(pkgR.decision))
+  ok(hostR.decision.kind === 'ask', '动态宿主形态对**同一条声明**也返回 ask', JSON.stringify(hostR.decision))
+  ok(pkgR.decision.reason === hostR.decision.reason,
+    '两形态的 ask reason 逐字节一致（用户可见文案不许漂）',
+    'pkg=' + JSON.stringify(pkgR.decision.reason) + ' host=' + JSON.stringify(hostR.decision.reason))
+  ok(hostNext === 0, '宿主形态 ask 时同样不调用 next()', 'nextCalls=' + hostNext)
 }
 
 h.finish()

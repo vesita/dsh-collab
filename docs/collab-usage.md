@@ -141,7 +141,11 @@ collab_lock op=wait paths=["src/backend/models/"] timeoutMs=15000
 - 只释放该会话**未过期**的声明；别人的、已过期的都不动。
 - 释放后：等待者收到「锁已自动释放」，被释放的会话收到「你的声明已被自动释放，恢复工作前重新
   `claim`」；状态文件里另留一条审计留言（`channel` = `agent:<sessionId>`），`collab_board op=read` 可回读。
-  0.9.11 起**发给本人的注入通知**按 `holderId` 在 60 秒窗口内合并（审计留言不合并）。
+  0.9.11 起**发给本人的注入通知**按 `holderId` + 本次释放的路径集合在 60 秒窗口内合并
+  （不同集合不合并；审计留言不合并）。
+- 返回里的 `notify` 固定带 `pushedNote`：它明说 `pushed` 只表示消息**进了读者的 next-step 收件箱**
+  —— `agent.inject` 的契约是 `wakeup=false`，读者 idle 且此后无人唤醒时不会被模型看到
+  （`cancel` / `dispose` 会清空收件箱）。
 - **句柄结束即删**（0.13.0）：`agent/disposed` 是"这个 agent 的句柄结束了"的确定性事件，
   它**全部未过期**声明立即释放（不再等租约），并留一条"句柄已结束（agent/disposed）"的审计留言、
   通知等待者。恢复后的会话因此有据可查（去 `collab_board` 读那条留痕，重新 `claim` 再写）。
@@ -202,24 +206,25 @@ collab_lock op=reap paths=["src/"] olderThanSec=60    # 可限定路径 / 放宽
 
 ## 3. `collab_board`
 
-**它不是消息通道，是共享的留痕本**：`post` 只往状态文件里写一条，**不投递、不唤醒任何会话**；
-`mentions` 只是记进消息结构。@ 了不等于通知了，对方只在它自己 `read` 时才看得到。
+**它不是消息通道，是共享的留痕本**：`post` 只往状态文件里写一条，**不投递、不唤醒任何会话**。
+@ 了不等于通知了（0.13.0 起连 `@` 这个参数都没有了），对方只在它自己 `read` 时才看得到。
 要某个已经停下的会话动起来，得用它自己的消息工具（哪个工具有这个能力以你当时的工具目录为准）；
 树内成员之间的转向与等待归官方 Agent Teams，本插件不复述也不重做。
 
 ### 3.1 发消息
 
 ```
-collab_board op=post channel=general body="我占用 src/backend/models/ 调整字段校验，预计 30 分钟内完成" mentions=["agent:xxx"]
+collab_board op=post channel=general body="我占用 src/backend/models/ 调整字段校验，预计 30 分钟内完成"
 ```
 
 - `channel`：默认 `general`。约定 `general` 通用 / `path:<相对路径>` 按目录 / `agent:<holderId>` 定向。
   **精确匹配**：写什么就得按什么读。注意 `holderId` 本身已经带前缀，直接写它（写 `agent:agent:…` 会读不到）；
   path 频道与 `claim` 用同一套相对路径写法（尾斜杠也要一致）。未命中时返回里会列出**现有频道**。
 - `body`：正文（必填，去空白）。
-- `mentions`：被 @ 的 holderId（最多 20 个）。**不产生任何投递**，只记进消息。
 - `replyTo`：回复的 msgId（可选，构成线程）。
 - 返回里固定带 `delivered: false` 与 `deliveryNote`：这两项就是"本板不投递"的机器可读事实。
+- **没有 `mentions`**（0.13.0 移除）：旧实现把它记进消息却不产生任何投递，实测被读成"通知过了"。
+  现在传它会被 `bad-request` **挡回且整条留言不写入** —— 要通知某个会话，用它自己的消息工具。
 
 ### 3.2 读消息
 

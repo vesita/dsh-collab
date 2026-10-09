@@ -1,4 +1,4 @@
-import { createHarness } from './_harness.mjs'
+import { createHarness, readStateMerged } from './_harness.mjs'
 
 // tests/collab-agent-teams.mjs
 // 0.11.0 **只读、advisory** 桥接官方 Agent Teams 的回归测试。
@@ -163,7 +163,8 @@ async function makeHarness (opts = {}) {
   await ctx.plugin(collabPlugin)
   await sleep(30)
 
-  const readState = () => JSON.parse(store.get(statePath) || '{}')
+  // 逻辑状态 = 主文件 + 留言旁挂（0.15.0，R2 起留言不再写在主文件里）。
+  const readState = () => readStateMerged((p) => store.get(p), statePath)
   return {
     ctx, store, statePath, readState, contexts,
     lock: tools.find((t) => t.name === 'collab_lock') || null,

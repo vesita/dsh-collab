@@ -33,9 +33,9 @@ const PY_PATH = 'scripts/collab_models.py'
 const RUST_PATH = 'crates/collab-cli/src/main.rs'
 // 真实工具 schema 的对照源：**不写死文件名**。它曾经在 src/index.ts，一次纯重构把它搬到了
 // src/tools.ts —— 写死会让契约守卫在"只是搬家"时误报，而误报会被当成噪音被关掉。
-// 所以扫 src/ 下全部 .ts，但**排除动态形态的内联副本**：那是刻意存在的另一份独立实现。
+// 所以扫 src/ 下全部 .ts。动态形态的宿主源码现在是 src/host-shell.js（.js 模板，纯逻辑由
+// lib/collab-core.js 在构建时内联），本来就不在 .ts 集合里。
 const SRC_DIR = 'src'
-const HOST_FORM_FILE = 'collab-plugin.host.ts'
 
 let passed = 0
 let failed = 0
@@ -68,7 +68,7 @@ function loadToolSchemaSource() {
   let files = []
   try {
     files = readdirSync(join(ROOT, SRC_DIR))
-      .filter((f) => f.endsWith('.ts') && f !== HOST_FORM_FILE)
+      .filter((f) => f.endsWith('.ts'))
       .sort()
   } catch (e) {
     return { error: `cannot list ${SRC_DIR}/: ${e && e.message}` }

@@ -51,6 +51,49 @@ export async function loadCosmokit () {
 
 const BAR = '='.repeat(72)
 
+// ── 状态文件：主文件 + 留言旁挂（0.15.0，R2）────────────────────────────────
+// 磁盘布局拆成两半：<name>.json 只有 {schemaVersion, seq, claims, holders}，
+// 留言在 <name>.messages.json 里（见 src/store.ts 的 writeState / src/host-shell.js 的同名件）。
+// 测试要看的永远是**内存里的逻辑状态**，所以直读主文件必须合并旁挂 —— 直接
+// `JSON.parse(store.get(statePath))` 会看到一个没有 messages 的文档（99% 的字节都在那半边）。
+// 这两个辅助函数就是"测试侧的 load / 落盘"，口径与实现同源；不要在各测试里手抄。
+
+/** 旁挂留言文件的路径（`<name>.json` → `<name>.messages.json`）。 */
+export const sidecarPathOf = (statePath) => statePath.replace(/\.json$/, '.messages.json')
+
+/**
+ * 读取**逻辑状态**：主文件 + 旁挂留言（缺失的字段补成空数组）。
+ * @param {(path: string) => string | undefined} read 按绝对路径取原始文本（测试自己的 Map）
+ * @param {string} statePath 主文件绝对路径
+ */
+export function readStateMerged (read, statePath) {
+  const mainRaw = read(statePath)
+  const main = mainRaw ? JSON.parse(mainRaw) : {}
+  if (!main || typeof main !== 'object') throw new Error('state main file is not an object')
+  const sideRaw = read(sidecarPathOf(statePath))
+  if (sideRaw) {
+    const side = JSON.parse(sideRaw)
+    if (side && Array.isArray(side.messages)) main.messages = side.messages
+    if (side && Number(side.seq) > (Number(main.seq) || 0)) main.seq = Number(side.seq)
+  }
+  if (!Array.isArray(main.messages)) main.messages = []
+  if (!Array.isArray(main.claims)) main.claims = []
+  if (!Array.isArray(main.holders)) main.holders = []
+  return main
+}
+
+/**
+ * 写回**逻辑状态**：主文件不含 messages，留言进旁挂（与实现的落盘布局同源）。
+ * @param {(path: string, text: string) => void} write
+ */
+export function writeStateSplit (write, statePath, doc) {
+  const messages = Array.isArray(doc.messages) ? doc.messages : []
+  const rest = {}
+  for (const k of Object.keys(doc)) if (k !== 'messages') rest[k] = doc[k]
+  write(statePath, JSON.stringify(rest))
+  write(sidecarPathOf(statePath), JSON.stringify({ schemaVersion: doc.schemaVersion, seq: doc.seq, messages }))
+}
+
 /**
  * 打印"这次运行有东西没被验证"的醒目横幅。含"未验证"字样，必须出现。
  * @param {string} what 被跳过的内容描述

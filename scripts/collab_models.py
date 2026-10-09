@@ -36,6 +36,8 @@ class Message:
     channel: str
     author: str
     ts: int
+    # 正文上限 8000 字符（SSOT $defs.Message.properties.body.maxLength；
+    # 同值常量见 collab-core 的 MESSAGE_BODY_MAX_CHARS；超限由 post() 以 bad-request 挡回，不截断）
     body: str
     replyTo: Optional[str] = None
 
@@ -46,6 +48,7 @@ class Holder:
     kind: Literal["agent", "human"]
     sessionId: Optional[str] = None
     lastSeenAt: Optional[int] = None
+    proc: Optional[str] = None
 
 @dataclass
 class StateDocument:

@@ -67,6 +67,22 @@ function stripComments(src) {
   return out
 }
 
+/**
+ * 生成物 `lib/collab-plugin.host.js` 的整份源码装在一个 JSON 字符串里：
+ *     export const hostCode = "<JSON>";
+ * 它的**注释也在字符串里**，直接扫原文会把注释当代码（例如 collab-core 里解释
+ * "为什么不用 sessionController.prompt" 的注释），同时也会漏掉字符串里真正的违规。
+ * 所以先取出字符串本体再扫；其它文件原样返回（解码失败也原样返回，不静默放行）。
+ */
+function decodeHostCode(raw) {
+  const m = /^export const hostCode = (".*");\s*$/m.exec(raw)
+  if (!m) return raw
+  try {
+    const s = JSON.parse(m[1])
+    return typeof s === 'string' ? s : raw
+  } catch (e) { return raw }
+}
+
 /** ① 冒充用户：这两样一出现就违规。 */
 const FORBIDDEN = [
   { re: /role\s*:\s*['"]user['"]/, why: '手写了 role=user —— 那是冒充真人输入' },
@@ -124,7 +140,7 @@ for (const dir of SCAN_DIRS) {
 
   for (const f of files) {
     const raw = readFileSync(join(ROOT, dir, f), 'utf8')
-    const text = stripComments(raw)
+    const text = stripComments(decodeHostCode(raw))
     for (const { re, why } of FORBIDDEN) {
       const m = re.exec(text)
       if (!m) continue

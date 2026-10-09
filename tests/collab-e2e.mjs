@@ -355,7 +355,7 @@ await runTest('T6', '读观测者不被挡：读模式 claim 成功；shared 仍
   throw new CheckFail('read 模式返回了意料之外的形状', '返回 = ' + JSON.stringify(rd))
 })
 
-await runTest('T7', '磁盘落地可审计：statePath 指向真实 JSON，含 claims/messages/holders', async (notes) => {
+await runTest('T7', '磁盘落地可审计：statePath 指向真实 JSON，含 claims/holders（主文件）+ messages（旁挂）', async (notes) => {
   const { cwd, statePath } = shared.t5 || {}
   expect(!!statePath, 'T5 未留下 statePath，无法审计')
   const fresh = (await newInstance(cwd)).lock
@@ -369,11 +369,19 @@ await runTest('T7', '磁盘落地可审计：statePath 指向真实 JSON，含 c
   try { doc = JSON.parse(raw) } catch (e) {
     throw new CheckFail('statePath 内容不是合法 JSON', 'raw[0..200] = ' + raw.slice(0, 200))
   }
-  expect(Array.isArray(doc.claims) && Array.isArray(doc.messages) && Array.isArray(doc.holders),
-    '状态文档缺少 claims/messages/holders 数组', 'keys = ' + JSON.stringify(Object.keys(doc)))
+  // 0.15.0（R2）：逻辑状态摊在两个文件上 —— 主文件 {schemaVersion, seq, claims, holders}，
+  // 留言在 <state>.messages.json。所以这里对**合并后的逻辑状态**审计，同时钉住"主文件里没有 messages"。
+  const sidePath = statePath.replace(/\.json$/, '.messages.json')
+  const side = fs.existsSync(sidePath) ? JSON.parse(fs.readFileSync(sidePath, 'utf8')) : { messages: [] }
+  expect(!('messages' in doc),
+    '0.15.0 起主文件里不该再有 messages 键（留言在旁挂）', 'keys = ' + JSON.stringify(Object.keys(doc)))
+  expect(Array.isArray(doc.claims) && Array.isArray(doc.holders) && Array.isArray(side.messages),
+    '状态文档缺少 claims/holders（主文件）或 messages（旁挂）数组',
+    'main keys = ' + JSON.stringify(Object.keys(doc)) + ' side keys = ' + JSON.stringify(Object.keys(side)))
   const mine = doc.claims.find((c) => c.holderId === 'agent:agent-1' && (c.paths || []).includes('src/core/'))
   expect(!!mine, '磁盘状态里没有 T5 那条 claim', 'claims = ' + JSON.stringify(doc.claims))
-  notes.push('磁盘文件 ' + statePath + ' 合法，claims=' + doc.claims.length + ' messages=' + doc.messages.length + ' holders=' + doc.holders.length)
+  notes.push('磁盘文件 ' + statePath + ' 合法（主文件无 messages），claims=' + doc.claims.length +
+    ' holders=' + doc.holders.length + ' messages(旁挂)=' + side.messages.length)
 })
 
 await runTest('T8', '老 `~` 目录迁移：预置旧落点数据后再 list', async (notes) => {
@@ -521,6 +529,77 @@ await runTest('T10', '乐观并发：真实形状的 FS_STALE_VERSION / FS_NOT_O
   expect(injectedStale === 1, '未能把并发冲突注入到 replaceIfVersion 路径', String(injectedStale))
   expect(r && r.ok === true, 'stale 之后的乐观重试应当最终成功，而不是返回 internal', JSON.stringify(r))
   expect(!(r && r.error === 'internal'), 'stale 冲突不应被当成 internal 错误抛出', JSON.stringify(r))
+})
+
+// ════════════════════════════════════════════════════════════════════════
+// 5.11 名册行的生命周期（0.14.0）：进程章 + 名册有界
+//   为什么必须在这一层测：纯函数对拍喂的是**手工构造的 opts/fixture**（见 collab-inline-parity 与
+//   collab-proc-id），它们证明不了"包形态写盘时真的盖了章""list 真的从 state.holders 现算了 liveProcs"。
+//   删掉 store.ts 里那两行接线，纯函数测试照样全绿 —— 所以这里从**真实落盘的文件**上取证。
+// ════════════════════════════════════════════════════════════════════════
+await runTest('T11', '0.14.0：名册行盖进程章；写它的进程不在了 ⇒ 下次 sweep 就收走（B2）', async (notes) => {
+  const cwd = path.join(TMP_ROOT, 'proj-proc')
+  const { lock } = await newInstance(cwd)
+  const exec = { agent: { id: 'agent-proc' } }
+  const c1 = await lock.execute({ op: 'claim', paths: ['proc/'], ttlSec: 600 }, exec)
+  expect(c1.ok === true, 'claim 应当成功', JSON.stringify(c1))
+  const sp = (await statePathOf(lock, 'agent-proc')).sp
+
+  const doc = JSON.parse(fs.readFileSync(sp, 'utf8'))
+  const row = doc.holders.find((h) => h.holderId === 'agent:agent-proc')
+  expect(!!row, 'claim 之后名册里应当有这一行', JSON.stringify(doc.holders.map((h) => h.holderId)))
+  expect(/^\d+:\d+$/.test(String(row && row.proc)),
+    '名册行必须盖上 <pid>:<开机节拍> 章 —— 没有它，B2（被杀的进程不留行）整条静默失效',
+    'proc = ' + String(row && row.proc))
+  notes.push('本进程令牌 = ' + row.proc)
+
+  // 手工塞三类行：同一个活进程的另一行 / 一个死进程的行 / 一个没有章的旧行。
+  const T = Date.now()
+  doc.holders.push({ holderId: 'agent:ALIVEPROC', name: 'alive', kind: 'agent', sessionId: 'ap', lastSeenAt: T - 1000, proc: row.proc })
+  doc.holders.push({ holderId: 'agent:DEADPROC', name: 'dead', kind: 'agent', sessionId: 'dp', lastSeenAt: T - 1000, proc: '4294967294:1' })
+  doc.holders.push({ holderId: 'agent:LEGACY', name: 'legacy', kind: 'agent', sessionId: 'lg', lastSeenAt: T - 1000 })
+  fs.writeFileSync(sp, JSON.stringify(doc), 'utf8')
+
+  const l = await lock.execute({ op: 'list' }, exec)
+  expect(l.ok === true, 'list 应当成功', JSON.stringify(l))
+  const ids = (l.data.holders || []).map((h) => h.holderId)
+  notes.push('list 名册 = ' + JSON.stringify(ids))
+  expect(ids.includes('agent:agent-proc'), '本进程正在用的行必须留下', JSON.stringify(ids))
+  expect(ids.includes('agent:ALIVEPROC'), '同一个**活**进程写的另一行也必须留下', JSON.stringify(ids))
+  expect(!ids.includes('agent:DEADPROC'),
+    '写它的进程已经不在了 ⇒ 这一行必须被收走（否则又退回"24h 计时器"，B2 等于没做）', JSON.stringify(ids))
+  expect(!ids.includes('agent:LEGACY'),
+    '没有进程章的旧行在能盖章的形态下作废（下一次操作会自动重新登记）—— 这是 B（存量清仓）', JSON.stringify(ids))
+})
+
+await runTest('T12', '0.14.0：包形态 list 的名册**有界**返回，且截断可察觉（C）', async (notes) => {
+  const cwd = path.join(TMP_ROOT, 'proj-bound')
+  const { lock } = await newInstance(cwd)
+  const exec = { agent: { id: 'agent-bound' } }
+  const c1 = await lock.execute({ op: 'claim', paths: ['bound/'], ttlSec: 600 }, exec)
+  expect(c1.ok === true, 'claim 应当成功', JSON.stringify(c1))
+  const sp = (await statePathOf(lock, 'agent-bound')).sp
+
+  const doc = JSON.parse(fs.readFileSync(sp, 'utf8'))
+  const liveToken = (doc.holders.find((h) => h.holderId === 'agent:agent-bound') || {}).proc
+  expect(typeof liveToken === 'string' && !!liveToken, '先决条件：这一行已被盖上进程章', String(liveToken))
+  const T = Date.now()
+  doc.holders = Array.from({ length: 15 }, (_, i) => ({
+    holderId: 'agent:ROSTER' + i, name: 'r' + i, kind: 'agent',
+    sessionId: 'r' + i, lastSeenAt: T - 60000 * (i + 1), proc: liveToken
+  }))
+  fs.writeFileSync(sp, JSON.stringify(doc), 'utf8')
+
+  const l = await lock.execute({ op: 'list' }, exec)
+  expect(l.ok === true, 'list 应当成功', JSON.stringify(l))
+  const hs = l.data.holders || []
+  notes.push('名册返回 ' + hs.length + ' 行 / holdersTotal=' + l.data.holdersTotal)
+  expect(typeof l.data.expiredCount === 'number',
+    'list.expiredCount 必须是**数字**（0.13.0 起的契约；sweep() 返回对象，别把契约换成对象）',
+    'typeof=' + typeof l.data.expiredCount + ' value=' + JSON.stringify(l.data.expiredCount))
+  expect(hs.length === 12, '包形态 list 必须把名册截到 HOLDER_VIEW_LIMIT=12（否则每次调用又是 10 KB 一坨）', String(hs.length))
+  expect(l.data.holdersTotal === 15, 'holdersTotal 必须报出截断前的真实条数（截断必须可察觉）', String(l.data.holdersTotal))
+  expect(hs[0] && hs[0].holderId === 'agent:ROSTER0', '窗口按"最近活跃优先"排（最近的在窗口内）', JSON.stringify(hs.map((h) => h.holderId)))
 })
 
 // ════════════════════════════════════════════════════════════════════════

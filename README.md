@@ -114,7 +114,7 @@ DSH 自带一套实验性的 `Agent Teams`（`dsh-experimental-agent-team*`）�
 │   ├── skill.ts                  # 随包 skill 读盘与 buildSkillIndex（delegation 与路由共用）
 │   ├── client-route.ts           # 浏览器半边只读 loopback 路由（技能索引）
 │   ├── client.ts                 # 浏览器半边：侧边栏 Plugins 页里 dsh-collab 卡上的配置区
-│   ├── collab-plugin.host.ts     # 自包含 Cordis Host 插件源码（导出 hostCode 字符串，可直接作为 code.host）
+│   ├── host-shell.js             # 动态宿主形态的外壳模板；hostCode 由 scripts/build-host.mjs 构建期内联核心生成
 │   ├── schema/
 │   │   └── collab.schema.json    # JSON Schema v1：状态文档 + 工具参数（单一契约）
 │   └── types/
@@ -212,7 +212,7 @@ agents.currentInitiator()            → 正在装配的那个会话
 
 同一个开关也管住**功能 A 的访问通知**（`kind: 'dsh-collab'`、`form: 'notice'` 的消息）：它是运行时状态派生出来、再注入进会话的内容，所以 `DSH_COLLAB_NO_PROMPT_HINT=1` 下**不投递**。只关投递 —— 读者反向登记（功能 D）照常发生。这一条由 `tests/collab-access-gate.mjs` 钉住，并配了负向对照（摘掉开关判定 -> 该断言精确变红）。
 
-（受限的**动态宿主形态**不接线 `tools/pre-execute` / `tools/post-execute`，因此它本来就没有访问通知与原生写保护 —— 那是既定环境限制，与这个开关无关。见 `src/collab-plugin.host.ts`。）
+（受限的**动态宿主形态**：0.14.0 起**已接线** `tools/pre-execute` 写门控（`src/host-shell.js`，判据直接调内联核心，与包形态同源；两形态的 ask 文案逐字节对拍）。但它的开关读不到 —— 受限宿主拿不到 env 与插件 Config ⇒ `enforceWriteLock` **恒为开**、`DSH_COLLAB_NO_PROMPT_HINT` 无效。**访问通知**（`tools/post-execute`）与官方 Agent Teams 的反向交叉预警**仍未接**：它们要 `agent.inject` / `dsh-llm`，受限宿主里没有。）
 
 ---
 
@@ -291,7 +291,7 @@ agents.currentInitiator()            → 正在装配的那个会话
 | `gate.ts` | 原生写门控（子代理写父占的路径） |
 | `awareness.ts` | 常驻态势摘要（不把自家子代理报成"其他会话占用"，backlog §2.2） |
 | `access.ts` | 访问通知（不为自家人发通知） |
-| `collab-plugin.host.ts` | 动态形态的内联副本（同上五处，由 parity 测试对拍） |
+| `src/host-shell.js` + `scripts/build-host.mjs` | 动态形态：外壳模板 + 构建期把 `lib/collab-core.js` 原样内联 ⇒ 两形态纯逻辑**逐字节同源**（由 parity 测试断言） |
 
 **边界**：这条豁免的前提是"同一棵树里的子代理与我共享同一写域"。当树里跑的是官方 `Agent Teams`
 的 teammate（长期并行、各有独立任务）时，树内占用归团队任务 DAG 的 `write_scopes` —— 见
@@ -351,9 +351,14 @@ W7「dispose 不释放」的取舍：`agent/disposed` 是"这个 agent 的句柄
 `claim`」—— 后者是安全阀，否则它恢复后仍以为自己持锁。同时在状态文件里留一条审计留言
 （`channel` = `agent:<sessionId>`，作者 `system:dsh-collab`），`collab_board op=read` 可回读。
 
-0.9.11 降噪：**发给本人的那条注入通知**按 `holderId` 在 60 秒窗口内合并（第二次起记
-`error: 'deduped'`），专治"claim→release→claim"抖动；**审计留言一条都不合并**——那是取证账目，
-合并它等于篡改证据。等待者的通知仍按 `(claimId, reader)` 去重，语义不变。
+0.9.11 降噪：**发给本人的那条注入通知**按 `holderId` + 本次释放的路径集合在 60 秒窗口内合并
+（不同集合不合并；第二次起记 `error: 'deduped'`），专治"claim→release→claim"抖动；**审计留言
+一条都不合并**——那是取证账目，合并它等于篡改证据。等待者的通知仍按 `(claimId, reader)` 去重，语义不变。
+
+**投递口径（`pushedNote`）**：`notify` 返回里固定带一句机读 caveat —— `pushed` 只表示消息
+**进了读者的 next-step 收件箱**。`agent.inject` 的契约是 `wakeup=false`，读者 idle 且此后无人
+唤醒时消息不会被模型看到；`cancel` / `dispose` 会清空收件箱直接丢弃。`pushed` / `pushedVia`
+的既有含义一字未动，`pushedNote` 只是把上面这句口径标出来。
 
 | 回收路径 | 触发 | 说明 |
 | --- | --- | --- |
@@ -457,6 +462,8 @@ W7「dispose 不释放」的取舍：`agent/disposed` 是"这个 agent 的句柄
    解析不到就**如实跳过**（`skipped.reason = 'agent-not-resolvable'`），**没有任何回退通道**；
    `inject` 是同步契约 ⇒ 不再有 `timeout` 这一态；`prompt-failed` / `not-adjacent` /
    `subagent-failed` 三个 reason 随通道一起删除。
+   口径如实标在结果里：`notify.pushedNote` 说明 `pushed` 只保证消息进读者收件箱，
+   `wakeup=false` 下读者 idle 且无人唤醒时它不会被模型看到（见「循环终止自动释放」一节）。
 2. **（0.9.6–0.12.x）租约 `expiresAt` 是声明生命周期的唯一权威**：`agent/disposed` 只回收该 holder **已过期**的声明、
    并把它从各 claim 的 `readers` 里摘掉；未到期声明原样保留，到期由惰性清理回收，`op=heartbeat`
    是唯一续租方式。安全侧后果如实记：会话死亡后其声明会占用到租约到期。
@@ -497,7 +504,7 @@ W7「dispose 不释放」的取舍：`agent/disposed` 是"这个 agent 的句柄
 
 **修法**：缓存改存**该 cwd 的原始活跃 claim 列表**（渲染与时间无关，按 cwd 缓存原始数据是安全的），
 「排除自己」挪到**读取侧**、按当次 `currentInitiator()` 现场过滤。**两形态同改**：
-`src/awareness.ts` 与 `src/collab-plugin.host.ts` 里的内联副本。
+`src/awareness.ts` 与宿主外壳 `src/host-shell.js` 里的对应实现。
 
 **回归守卫**：新增 `tests/collab-awareness-cross-session.mjs`（已进 `npm test`）——两个会话同一 cwd、
 由 `id` 为空的会话先刷新缓存，然后断言三条：**持有者看不到自己的锁**（负向对照）、**他人占用照常显示**、
@@ -705,7 +712,8 @@ mode, content})` 与 `ctx.subagents.sendMessage(sender, targetId, content, {sign
 1. 回收该 holder **已过期**的声明（若确实回收到了，走同一条 `notifyReaders` 通知其读者）；
 2. 把已消失的 holder 从**各 claim 的 `readers`** 里摘掉（否则会向一个已经死掉的会话推送）。
 
-**未到期的声明原样保留**（含它自己的 `readers`），到期由 `sweep()` 回收。
+**（0.9.6–0.12.x）未到期的声明原样保留**（含它自己的 `readers`），到期由 `sweep()` 回收。
+**0.13.0 起不成立**：句柄结束就释放全部未到期声明（见下面的"翻转"与第 4 条回收路径）。
 
 > **为什么（当时）**：会话 dispose 之后常常会被恢复，并继续按对话历史认为自己持有锁；如果声明在
 > dispose 时就消失，另一个会话会看到"路径空闲"，于是两边同时以为可以写。
@@ -713,8 +721,10 @@ mode, content})` 与 `ctx.subagents.sendMessage(sender, targetId, content, {sign
 > （实测现场：`c_191` 挡住 `experiments/entity_identity_v2/` 直到人工 `op=reap`）。现在按"句柄结束
 > 即删 + 审计留痕 + 通知读者"处理，恢复后的会话有据可查（`collab_board` 里那条"句柄已结束"）。
 
-**安全侧后果（如实写）**：会话死亡后，它**未到期**的声明会一直占用到租约到期，期间他人只能
-`op=wait` 等待或用 `collab_board` 协商；`op=heartbeat` 是**唯一**的续租方式。
+**安全侧后果（如实写）**：会话死亡后，**没有被 `agent/disposed` 见证到**的那批声明（进程被杀、
+或 0.13.0 之前就已退场）会一直占用到租约到期，期间他人只能
+`op=wait` 等待或用 `collab_board` 协商；被见证到的（0.13.0 起的正常句柄结束）当场释放。
+`op=heartbeat` 是**唯一**的续租方式。
 
 > **历史（0.8.4 的 `subagents.sendMessage` 回退通道，0.9.6 已整体删除）**：它要求 sender 是
 > 释放者的活 Agent（工具处理器里的 `exec.agent`，DSH 用对象同一性判定）、且只能投给 sender 的
@@ -761,24 +771,39 @@ cargo test --manifest-path crates/collab-cli/Cargo.toml
 
 ## 状态维护
 
-`src/collab-core.ts` 的 `sweep()` 在每次读/写前惰性执行：
+`src/collab-core.ts` 的 `sweep()` 在每次读/写前惰性执行（读路径只清内存；写路径把清理结果一并落盘，**即使该 op 自己 `changed:false`**）：
 
 | 行为 | 阈值 | 说明 |
 | --- | --- | --- |
 | 过期声明回收 | 租约到期 | 过期声明随每次读取失效，不再阻塞他人 |
 | **僵尸声明显式回收** | **仅 `op=reap` + `confirm:true`** | **绝不自动**：dry-run 默认、判据见「僵尸声明的显式回收」一节；被强杀的会话留下的未到期声明由调用方显式确认后回收 |
-| 留言保留 | 最近 `MAX_MESSAGES = 2000` 条 | 超出部分从最旧的开始丢弃，写入时回报 `swept.droppedMessages`（`swept` 是**条件字段**：仅当本次 `droppedMessages > 0` 或 `prunedHolders > 0` 时才出现在返回里，且不含 readers 相关字段） |
+| 留言保留 | 最近 `MAX_MESSAGES = 2000` 条 **且** 总量 ≤ `MAX_MESSAGES_BYTES = 256 KiB` | 两个上限**取先到者**，超出都从最旧的开始丢弃；写入时回报 `swept.droppedMessages`（`swept` 是**条件字段**：仅当本次 `droppedMessages > 0` 或 `prunedHolders > 0` 时才出现在返回里，且不含 readers 相关字段）。字节口径 = 每条留言 JSON 序列化的 UTF-8 字节之和（不含数组分隔符与外层键名） |
+| 单条留言正文上限 | `MESSAGE_BODY_MAX_CHARS = 8000` 字符 | 只封条数会让状态"任意大"（一条 5MB 实测原样落盘）；超限由 `post()` 以 `bad-request` **显式挡回**，不静默截断 |
 | 陈旧 holder 回收 | 无活跃声明且 `HOLDER_TTL_MS = 24h` 未出现 | 回收由 `sweep()` 执行；`list` 另用 `holderView()` 给出 `ageSec` / `active` / `stale` 与 `staleHolders`，并在有 stale 条目时附 `holdersNote` 说明「`holders` 是名册不是锁」 |
 | holder 废弃预警 | 无活跃声明且静默 `HOLDER_STALE_WARN_MS = 1h` | `stale` 走这条更短的阈值，因此它是"看起来已废弃"的先行信号，在 `list` 上始终可达 |
-| 损坏状态自愈 | JSON 解析失败 | 备份为 `<state>.corrupt-<ts>` 后重置为空状态，并以 `warning` 上报 |
+| 损坏状态自愈 | JSON 解析失败 | 备份为 `<state>.corrupt-<ts>` 后重置为空状态，并以 `warning` 上报；旧备份只保留最近 3 份（`fs.listDir` 拿不到时静默跳过清理，绝不让自愈失败） |
 
 工具返回统一信封：失败时 `error` / `message` 在顶层（`bad-request`、`not-found`、`conflict`、`forbidden`、`timeout`、`concurrent-modification`、`internal`）。
+
+### 状态文件的磁盘布局（0.15.0）
+
+内存里的状态文档**没变**（仍是 `{schemaVersion, seq, claims, messages, holders}`，SSOT 见 `src/schema/collab.schema.json`）；变的只是它摊到磁盘上的方式 —— 拆成两半，让锁操作不必重写留言那条大尾巴（实测一份 82 KB 的状态里 97% 是留言）：
+
+| 文件 | 内容 |
+| --- | --- |
+| `<name>.json` | `{schemaVersion, seq, claims, holders}` —— 锁状态（KB 级） |
+| `<name>.messages.json` | `{schemaVersion, seq, messages}` —— 留言旁挂 |
+
+- **加载期合并**：主文件 + 旁挂合并成一个逻辑文档；`seq` 取两边的较大值（它是 `claimId` 与 `msgId` 共用的计数器）。
+- **写盘**：`claim` / `release` / `heartbeat` 只写主文件；旁挂**只在留言真的变了**时才写（判据是"条数 + 首条 msgId + 末条 msgId"指纹，留言只有尾部追加与头部截断两种变化）。迁移那一次**先写旁挂再写主文件**，保证任何一步失败时留言都还在磁盘上。
+- **迁移**：主文件里仍有 `messages`（旧布局）时以它为准，**首次写盘**搬进旁挂并从主文件里去掉这个键；**只搬不删**，`collab_board op=read` 迁移前后返回一致。
+- `overview` 的 `otherProjects` 扫状态目录时排除 `*.messages.json`，不会把旁挂当成一个项目。
 
 ---
 
 ## 作为动态插件运行
 
-把 `collab-plugin.host.ts` 导出的 `hostCode` 作为 `code.host` 传给 `cordis_define` 即可：
+把构建产物 `lib/collab-plugin.host.js` 导出的 `hostCode` 作为 `code.host` 传给 `cordis_define` 即可：
 
 ```js
 import { hostCode } from './lib/collab-plugin.host.js'

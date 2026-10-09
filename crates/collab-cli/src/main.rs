@@ -2,9 +2,13 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -53,6 +57,8 @@ pub struct Message {
     pub channel: String,
     pub author: String,
     pub ts: i64,
+    /// 正文上限 8000 字符（SSOT `$defs.Message.properties.body.maxLength`；
+    /// 同值常量见 collab-core 的 `MESSAGE_BODY_MAX_CHARS`；超限由 post() 以 bad-request 挡回，不截断）。
     pub body: String,
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -69,6 +75,8 @@ pub struct Holder {
     pub session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_seen_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proc: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -324,25 +332,212 @@ enum Commands {
     GitCheck,
 }
 
-fn load_state(path: &Path) -> Result<StateDocument> {
-    if !path.exists() {
-        return Ok(StateDocument::default());
-    }
-    let content = fs::read_to_string(path).context("Failed to read state file")?;
-    let doc: StateDocument = serde_json::from_str(&content).context("Failed to parse JSON")?;
-    Ok(doc)
+/// 加载结果：解析出的文档 + **加载时的原始字节**。
+///
+/// `raw` 是丢失更新守卫的判据：保存前把它与磁盘现状逐字节比较，不一致就拒绝写入。
+/// `None` 表示加载时文件不存在（守卫会在文件"凭空出现"时同样拒绝）。
+struct LoadedState {
+    doc: StateDocument,
+    raw: Option<Vec<u8>>,
 }
 
-fn save_state(path: &Path, doc: &StateDocument) -> Result<()> {
-    let content = serde_json::to_string_pretty(doc).context("Failed to serialize state")?;
-    fs::write(path, content).context("Failed to write state file")?;
-    Ok(())
+/// 读文件字节；文件不存在返回 `Ok(None)`（而不是错误），其余 IO 错误照常上抛。
+fn read_state_bytes(path: &Path) -> Result<Option<Vec<u8>>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("Failed to read state file {}", path.display())),
+    }
+}
+
+fn load_state(path: &Path) -> Result<LoadedState> {
+    match read_state_bytes(path)? {
+        Some(raw) => {
+            let doc: StateDocument =
+                serde_json::from_slice(&raw).context("Failed to parse JSON")?;
+            Ok(LoadedState {
+                doc,
+                raw: Some(raw),
+            })
+        }
+        None => Ok(LoadedState {
+            doc: StateDocument::default(),
+            raw: None,
+        }),
+    }
+}
+
+/// 同目录兄弟文件名：在目标文件名后追加 `suffix`（与目标**同目录**，
+/// 否则跨文件系统的 `rename` 不是原子的）。
+fn sibling_with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(|s| s.to_os_string())
+        .unwrap_or_else(|| "state.json".into());
+    name.push(suffix);
+    match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.join(name),
+        _ => PathBuf::from(name),
+    }
+}
+
+/// 同目录临时文件路径：带 pid + 纳秒 + 进程内计数器，保证同进程内并发调用也不撞名。
+fn temp_sibling(path: &Path) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    sibling_with_suffix(
+        path,
+        &format!(".tmp-{}-{}-{}", std::process::id(), nanos, n),
+    )
+}
+
+/// 跨进程写锁：同目录 `<name>.lock`，`create_new` 保证获取是原子的。
+///
+/// 只用来把 `[重读 → rename]` 临界区串行化。**光靠重读比较挡不住丢失更新**：
+/// 重读本身要读完整个状态文件（大文件几十毫秒），若临界区不互斥，多个进程会在
+/// 任何一次 `rename` 落地之前全部通过守卫，随后互相覆盖。持有时间 = 一次重读 + 一次改名。
+struct WriteLock {
+    path: PathBuf,
+}
+
+impl WriteLock {
+    fn acquire(target: &Path) -> Result<Self> {
+        let path = sibling_with_suffix(target, ".lock");
+        let deadline = SystemTime::now() + Duration::from_secs(10);
+        loop {
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(mut f) => {
+                    let _ = writeln!(f, "{}", std::process::id());
+                    return Ok(WriteLock { path });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if lock_is_stale(&path) {
+                        let _ = fs::remove_file(&path);
+                        continue;
+                    }
+                    if SystemTime::now() >= deadline {
+                        anyhow::bail!(
+                            "Refusing to write state file {}: another process holds the write \
+                             lock {} (lost-update guard). No changes were written.",
+                            target.display(),
+                            path.display()
+                        );
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => {
+                    return Err(e)
+                        .with_context(|| format!("Failed to create write lock {}", path.display()))
+                }
+            }
+        }
+    }
+}
+
+impl Drop for WriteLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// 锁是否已僵死：持有者写下的 pid 已不存在，或锁文件太旧（临界区只有毫秒级，30s 足够）。
+fn lock_is_stale(lock: &Path) -> bool {
+    let Ok(content) = fs::read_to_string(lock) else {
+        return true;
+    };
+    let Ok(pid) = content.trim().parse::<u32>() else {
+        return true;
+    };
+    if Path::new("/proc").is_dir() && !Path::new(&format!("/proc/{pid}")).exists() {
+        return true;
+    }
+    match fs::metadata(lock).and_then(|m| m.modified()) {
+        Ok(mtime) => SystemTime::now()
+            .duration_since(mtime)
+            .map(|age| age > Duration::from_secs(30))
+            .unwrap_or(false),
+        Err(_) => true,
+    }
+}
+
+/// 有守卫的原子替换：同目录临时文件 `write_all` + `sync_all`，**紧接着**在写锁内跑
+/// `guard`，通过后 `rename` 到目标（POSIX 上原子）。任一步失败都清理临时文件与写锁。
+///
+/// 顺序是关键：耗时的临时文件写入放在临界区**之外**（各进程的临时文件名唯一，互不干扰），
+/// 只有 `[重读 → rename]` 进锁。若把守卫提到写临时文件之前，所有并发进程都会在任何人
+/// 改名之前通过守卫；若不给临界区加锁，多个进程仍会在同一次重读窗口里一起通过。二者
+/// 都会让守卫形同虚设。
+fn atomic_replace<F>(target: &Path, bytes: &[u8], guard: F) -> Result<()>
+where
+    F: FnOnce() -> Result<()>,
+{
+    let tmp = temp_sibling(target);
+    let result = (|| -> Result<()> {
+        let mut f = fs::File::create(&tmp)
+            .with_context(|| format!("Failed to create temp file {}", tmp.display()))?;
+        f.write_all(bytes)
+            .with_context(|| format!("Failed to write temp state file {}", tmp.display()))?;
+        f.sync_all()
+            .with_context(|| format!("Failed to sync temp state file {}", tmp.display()))?;
+        drop(f);
+        let _lock = WriteLock::acquire(target)?;
+        guard()?;
+        fs::rename(&tmp, target).with_context(|| {
+            format!(
+                "Failed to atomically rename {} -> {}",
+                tmp.display(),
+                target.display()
+            )
+        })?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// 保存状态：**有守卫的原子替换**。
+///
+/// 1. 紧凑序列化：与 TS 侧 `JSON.stringify` 同格式，消除来回翻倍。
+/// 2. 原子：同目录临时文件 + `rename`，读方永远不会看到 0 字节或半截内容。
+/// 3. 守卫：`rename` 之前重读磁盘现状，与加载时的原始字节逐字节比较；
+///    不一致 = 本次读取之后文件被别的进程改过 ⇒ 拒绝写入（宁可失败报错，也不静默覆盖）。
+fn save_state(path: &Path, doc: &StateDocument, expected: Option<&[u8]>) -> Result<()> {
+    let content = serde_json::to_string(doc).context("Failed to serialize state")?;
+    atomic_replace(path, content.as_bytes(), || {
+        let actual =
+            read_state_bytes(path).context("Failed to re-read state file before saving")?;
+        let unchanged = match (expected, actual.as_deref()) {
+            (None, None) => true,
+            (Some(loaded), Some(actual)) => loaded == actual,
+            // 一边有、一边没有：文件在本次读取之后被创建或删除，同样算被改过。
+            _ => false,
+        };
+        if !unchanged {
+            anyhow::bail!(
+                "Refusing to write state file {}: the file was modified by another process after \
+                 this process read it (lost-update guard). No changes were written. Re-run the \
+                 command so it reads the current state.",
+                path.display()
+            );
+        }
+        Ok(())
+    })
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let state_file = cli.file.unwrap_or_else(resolve_default_state_file);
-    let mut state = load_state(&state_file)?;
+    // 加载时的原始字节必须一路带到保存点，作为丢失更新守卫的基准。
+    let LoadedState {
+        doc: mut state,
+        raw: loaded_raw,
+    } = load_state(&state_file)?;
     let now = now_ms();
 
     // 惰性过期
@@ -482,7 +677,7 @@ fn main() -> Result<()> {
                 readers: Vec::new(),
             };
             state.claims.push(claim.clone());
-            save_state(&state_file, &state)?;
+            save_state(&state_file, &state, loaded_raw.as_deref())?;
 
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&claim)?);
@@ -508,7 +703,7 @@ fn main() -> Result<()> {
                 anyhow::bail!("claim_id or paths required for release");
             }
             let released = before - state.claims.len();
-            save_state(&state_file, &state)?;
+            save_state(&state_file, &state, loaded_raw.as_deref())?;
             println!("Released {} claim(s)", released);
         }
         Commands::Board {
@@ -530,7 +725,7 @@ fn main() -> Result<()> {
                     reply_to: None,
                 };
                 state.messages.push(msg.clone());
-                save_state(&state_file, &state)?;
+                save_state(&state_file, &state, loaded_raw.as_deref())?;
                 println!("Posted message [{}] to #{}", msg.msg_id, channel);
             } else {
                 let msgs: Vec<&Message> = state
@@ -723,6 +918,255 @@ mod tests {
         assert!(s.contains("\"suggestedAction\":\"wait\""), "{s}");
         let sw = serde_json::to_string(&SuggestedAction::SwitchPath).unwrap();
         assert_eq!(sw, "\"switch_path\"");
+    }
+
+    // ---- R3a: 原子写 + 丢失更新守卫 ----
+
+    /// 测试用唯一临时目录（不引入新依赖：pid + 纳秒）。
+    fn unique_tmp_dir(tag: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "collab-cli-test-{}-{}-{}",
+            tag,
+            std::process::id(),
+            nanos
+        ));
+        fs::create_dir_all(&dir).expect("create tmp dir");
+        dir
+    }
+
+    fn sample_claim(id: &str) -> Claim {
+        Claim {
+            claim_id: id.into(),
+            holder_id: "cli:user".into(),
+            holder_name: Some("CLI".into()),
+            paths: vec!["src/a/".into()],
+            mode: Mode::Exclusive,
+            ttl_sec: 1800,
+            expires_at: 99999999999999,
+            note: None,
+            created_at: 1,
+            readable: true,
+            readers: vec![],
+        }
+    }
+
+    /// 状态目录里残留的临时文件 / 写锁（应恒为空）。
+    fn leftovers(dir: &Path) -> Vec<String> {
+        fs::read_dir(dir)
+            .expect("read tmp dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp-") || n.ends_with(".lock"))
+            .collect()
+    }
+
+    /// 正常路径：无并发改动 ⇒ 保存成功、内容正确、紧凑格式、无临时文件残留。
+    #[test]
+    fn test_save_state_normal_path_is_compact_and_clean() {
+        let dir = unique_tmp_dir("normal");
+        let path = dir.join("state.json");
+        let loaded = load_state(&path).expect("load a missing file");
+        assert!(loaded.raw.is_none(), "a missing file loads as raw=None");
+        let mut doc = loaded.doc;
+        doc.seq = 1;
+        doc.claims.push(sample_claim("c_1"));
+
+        save_state(&path, &doc, loaded.raw.as_deref()).expect("uncontended save must succeed");
+
+        let raw = fs::read_to_string(&path).expect("read back");
+        assert!(
+            !raw.contains('\n'),
+            "must be compact like TS JSON.stringify: {raw}"
+        );
+        let back: StateDocument = serde_json::from_str(&raw).expect("parse back");
+        assert_eq!(back.seq, 1);
+        assert_eq!(back.claims.len(), 1);
+        assert_eq!(back.claims[0].claim_id, "c_1");
+        assert!(
+            leftovers(&dir).is_empty(),
+            "no temp file may remain: {:?}",
+            leftovers(&dir)
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 正常路径（文件已存在且未被改动）⇒ 守卫放行。
+    #[test]
+    fn test_save_state_allows_write_when_file_unchanged() {
+        let dir = unique_tmp_dir("unchanged");
+        let path = dir.join("state.json");
+        let first = serde_json::to_string(&StateDocument::default()).unwrap();
+        fs::write(&path, &first).unwrap();
+
+        let loaded = load_state(&path).expect("load existing file");
+        assert_eq!(loaded.raw.as_deref(), Some(first.as_bytes()));
+        let mut doc = loaded.doc;
+        doc.seq = 7;
+
+        save_state(&path, &doc, loaded.raw.as_deref()).expect("unchanged file must be writable");
+        let back: StateDocument =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(back.seq, 7);
+        assert!(leftovers(&dir).is_empty());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 守卫命中：加载后文件被别的进程创建 ⇒ 保存必须失败且报清楚原因，别动对方的数据。
+    #[test]
+    fn test_save_state_refuses_when_file_created_since_load() {
+        let dir = unique_tmp_dir("guard-created");
+        let path = dir.join("state.json");
+        let loaded = load_state(&path).expect("load a missing file");
+        let mut doc = loaded.doc;
+        doc.seq = 1;
+        doc.claims.push(sample_claim("c_1"));
+
+        // 模拟另一个进程在本次读取之后写入
+        let other = br#"{"schemaVersion":1,"seq":9,"claims":[],"messages":[],"holders":[]}"#;
+        fs::write(&path, other).unwrap();
+
+        let err = save_state(&path, &doc, loaded.raw.as_deref()).expect_err("guard must refuse");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("modified by another process"), "{msg}");
+        assert!(msg.contains("lost-update guard"), "{msg}");
+
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            other,
+            "the other process's bytes must survive untouched"
+        );
+        assert!(
+            leftovers(&dir).is_empty(),
+            "refusal must not leave temp files: {:?}",
+            leftovers(&dir)
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 守卫命中：加载后文件被别的进程改写 ⇒ 保存必须失败且不改动磁盘。
+    #[test]
+    fn test_save_state_refuses_when_existing_file_changed() {
+        let dir = unique_tmp_dir("guard-changed");
+        let path = dir.join("state.json");
+        let original = serde_json::to_string(&StateDocument::default()).unwrap();
+        fs::write(&path, &original).unwrap();
+
+        let loaded = load_state(&path).expect("load existing file");
+        let mut doc = loaded.doc;
+        doc.claims.push(sample_claim("c_1"));
+
+        let other_doc = StateDocument {
+            seq: 42,
+            ..Default::default()
+        };
+        let other = serde_json::to_string(&other_doc).unwrap();
+        fs::write(&path, &other).unwrap();
+
+        let err = save_state(&path, &doc, loaded.raw.as_deref()).expect_err("guard must refuse");
+        assert!(format!("{err:#}").contains("modified by another process"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), other);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 丢失更新守卫的直接证据：两次加载后先后保存，第二次必须被挡下，
+    /// 磁盘上保留第一次写入的那条 claim（一个都不丢，也不静默覆盖）。
+    #[test]
+    fn test_guard_stops_lost_update_between_two_loads() {
+        let dir = unique_tmp_dir("lost-update");
+        let path = dir.join("state.json");
+        fs::write(
+            &path,
+            serde_json::to_string(&StateDocument::default()).unwrap(),
+        )
+        .unwrap();
+
+        let a = load_state(&path).expect("load a");
+        let b = load_state(&path).expect("load b");
+
+        let mut doc_a = a.doc.clone();
+        doc_a.seq = 1;
+        doc_a.claims.push(sample_claim("c_a"));
+        save_state(&path, &doc_a, a.raw.as_deref()).expect("first writer wins");
+
+        let mut doc_b = b.doc.clone();
+        doc_b.seq = 1;
+        doc_b.claims.push(sample_claim("c_b"));
+        let err = save_state(&path, &doc_b, b.raw.as_deref()).expect_err("stale writer must fail");
+        assert!(format!("{err:#}").contains("modified by another process"));
+
+        let back: StateDocument =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(back.claims.len(), 1, "no lost update, no silent overwrite");
+        assert_eq!(back.claims[0].claim_id, "c_a");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 失败路径清理：`rename` 失败（目标是目录）时临时文件必须被删掉。
+    #[test]
+    fn test_atomic_write_cleans_temp_when_rename_fails() {
+        let dir = unique_tmp_dir("rename-fail");
+        let target = dir.join("target-is-a-dir");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("occupied"), b"x").unwrap(); // 非空目录 ⇒ rename 必然失败
+
+        let err =
+            atomic_replace(&target, b"{}", || Ok(())).expect_err("rename onto a dir must fail");
+        assert!(format!("{err:#}").contains("rename"), "{err:#}");
+        assert!(
+            leftovers(&dir).is_empty(),
+            "failed write must clean its temp file: {:?}",
+            leftovers(&dir)
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 守卫在 `rename` 之前失败时，临时文件必须清理、目标原封不动。
+    #[test]
+    fn test_atomic_replace_cleans_temp_when_guard_refuses() {
+        let dir = unique_tmp_dir("guard-temp");
+        let target = dir.join("state.json");
+        fs::write(&target, b"original").unwrap();
+
+        let err = atomic_replace(&target, b"{}", || anyhow::bail!("guard said no"))
+            .expect_err("guard refusal must abort the replace");
+        assert!(format!("{err:#}").contains("guard said no"));
+        assert_eq!(
+            fs::read(&target).unwrap(),
+            b"original",
+            "target must be untouched"
+        );
+        assert!(
+            leftovers(&dir).is_empty(),
+            "guard refusal must clean its temp file: {:?}",
+            leftovers(&dir)
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 写锁必须在 Drop 时释放，且僵死（持有者 pid 不存在 / 内容不可解析）的锁可被回收。
+    #[test]
+    fn test_write_lock_release_and_stale_detection() {
+        let dir = unique_tmp_dir("write-lock");
+        let target = dir.join("state.json");
+        let lock_path = sibling_with_suffix(&target, ".lock");
+
+        {
+            let lock = WriteLock::acquire(&target).expect("first acquire must succeed");
+            assert!(lock_path.exists(), "lock file must exist while held");
+            assert!(!lock_is_stale(&lock_path), "our own live lock is not stale");
+            drop(lock);
+        }
+        assert!(!lock_path.exists(), "lock must be released on drop");
+
+        fs::write(&lock_path, format!("{}\n", u32::MAX)).unwrap();
+        assert!(lock_is_stale(&lock_path), "a dead holder's lock is stale");
+        fs::write(&lock_path, "not-a-pid").unwrap();
+        assert!(lock_is_stale(&lock_path), "an unparsable lock is stale");
+        fs::remove_dir_all(&dir).ok();
     }
 }
 

@@ -6,12 +6,15 @@
 // installStore() 的返回值就是它对外暴露的全部能力：其他 installer 通过参数**显式**
 // 接收它。段间不共享任何模块级可变状态。
 
+import { rm } from 'node:fs/promises'
+import { isAbsolute } from 'node:path'
 import {
   init, sweep, publish, overview, related, filterMessages, blockers, holderView,
-  expire, cleanName, norm, projectStorageFileName, reap, holderRosterNote
+  cleanName, norm, projectStorageFileName, reap, holderRosterNote, HOLDER_VIEW_LIMIT
 } from './collab-core.js'
-import type { Claim, HolderInput, OpResult, PublishedClaim, StateDocument } from './collab-core.js'
+import type { Claim, HolderInput, Message, OpResult, PublishedClaim, StateDocument } from './collab-core.js'
 import type { TeamScopeTask } from './collab-core.js'
+import { selfProcToken, liveProcsOf } from './proc-id.js'
 import { LEGACY_PROJECT_FILE, collabDir, projectStateFile, legacyCollabDirs } from './paths.js'
 import type {
   AgentLike, AgentTeamsServiceLike, AgentsLookupService, CollabArgs, CollabContext, CollabFs, FileRef,
@@ -59,6 +62,23 @@ export function installStore(ctx: CollabContext): StateStore {
   const sessionTitle = ctx.get('sessionTitle') as SessionTitleService | undefined
   const now = (): number => Date.now()
 
+  // ---- 名册行的进程判据（0.14.0，B2）----
+  // 本进程的身份令牌只算一次（`<pid>:<开机节拍>`）。拿不到（非 Linux / 读不到 /proc / 解析失败）
+  // 就是 null：此时**不盖章**，`sweepOpts` 里的 liveProcs 也必然不可用 —— 两者一起退回 24h TTL
+  // 老口径（fail-closed：漏收只是维持现状，误收会删掉活会话的行）。
+  const PROC_TOKEN = selfProcToken()
+  // 每次 sweep **现算**：判据只看 state 里实际出现过的那几个进程，不引入定时器、不做全表扫描。
+  const sweepOpts = (state: StateDocument): { liveProcs: Set<string> | null; procStamping: boolean } => {
+    const toks: string[] = []
+    if (Array.isArray(state.holders)) {
+      for (const h of state.holders) {
+        const p = h && typeof h.proc === 'string' ? h.proc : ''
+        if (p && toks.indexOf(p) < 0) toks.push(p)
+      }
+    }
+    return { liveProcs: liveProcsOf(toks), procStamping: PROC_TOKEN !== null }
+  }
+
   const pub = (c: Claim): PublishedClaim => publish(c)
   // 判断"写入失败是否属于乐观并发冲突，值得重读后重试"。
   // 真实 ctx.fs 抛的是 FsError：code 是**独立字段**，message 里不含 code（实测）。
@@ -91,7 +111,8 @@ export function installStore(ctx: CollabContext): StateStore {
    *  0.8.2 曾在 mutate() 里把它注入 sweep()，于是"只是空闲、并未结束"的读者
    *  （agents.get(sessionId) 对休眠会话返回 undefined）会在下一次任意写路径上被删掉，
    *  该 claim 释放时已无人可推 —— 静默丢通知。读者的移除只走 dropHolder()（agent/disposed）；
-   *  它**只摘 reader 登记 + 回收该 holder 已过期的声明**，不释放未过期声明（W7：租约是唯一回收机制）。
+   *  它**只摘 reader 登记 + 回收该 holder 已过期的声明 + 摘掉它的名册行**（0.14.0）；
+   *  未过期声明的释放归同事务里的 `releaseOnLoopEnd(..., 'disposed')`（0.13.0 起，见 src/push.ts）。
    *  判据本身仍是 push 前的安全闸：拿不到 agents 服务时一律不推，
    *  因为推送会 resume 冷会话，宁可少推也不能唤醒。 */
   /**
@@ -225,18 +246,122 @@ export function installStore(ctx: CollabContext): StateStore {
     return null
   }
 
-  async function targetFor(agentId: string | null, agent?: AgentLike): Promise<{ cwd: string | null; target: FileRef; stateDir: string; fileName: string }> {
+  // ---- 磁盘布局（0.15.0，R2）：主文件 + 留言旁挂 ----
+  //
+  // 为什么拆：一份状态文件里 **97% 的字节是留言**（实测 82,248 B：留言 79,815 B、声明 1,313 B、
+  // 名册 1,058 B），而 claim/release/heartbeat 每次都整份重写 —— 为了改 1.3 KB 的锁状态写 82 KB。
+  // 拆开之后锁操作只写主文件（KB 级），那条大尾巴只在**留言真的变了**时才动。
+  //
+  // 硬约束：**内存里的 StateDocument 一个字不改**（仍是 `{schemaVersion, seq, claims, messages, holders}`）
+  // —— src/schema/collab.schema.json 是 SSOT，TS/Python/Rust 三份派生物与全部纯函数因此零改动。
+  // 变的只有"怎么把它摊到磁盘上"：
+  //   <name>.json          {schemaVersion, seq, claims, holders}  主文件（锁状态）
+  //   <name>.messages.json {schemaVersion, seq, messages}         旁挂（留言）
+  // `seq` 两边都写：它是 claimId（`c_<seq>`）与 msgId（`m_<seq>`）**共用**的单调计数器，
+  // 加载时取两边的**较大值**（主文件写得更频繁，正常情形下它就是较大值）。
+  //
+  // 迁移：主文件里**仍有** `messages`（旧布局）时以它为准（见 load），并在**首次写盘**时
+  // 搬进旁挂、同时把主文件里这个键去掉。**只搬不删** —— 留言一条都不许丢。
+  const SIDECAR_EXT = '.messages.json'
+  /** `<name>.json` → `<name>.messages.json`。只在真的以 `.json` 结尾时替换，否则追加。 */
+  const sidecarNameOf = (fileName: string): string =>
+    fileName.slice(-'.json'.length) === '.json'
+      ? fileName.slice(0, -'.json'.length) + SIDECAR_EXT
+      : fileName + SIDECAR_EXT
+  /** 主文件那一半。**不含 messages**：迁移之后主文件里永远不会再有这个键。 */
+  const mainDocOf = (s: StateDocument) => ({
+    schemaVersion: s.schemaVersion, seq: s.seq, claims: s.claims, holders: s.holders
+  })
+  /** 旁挂那一半。 */
+  const sideDocOf = (s: StateDocument) => ({
+    schemaVersion: s.schemaVersion, seq: s.seq, messages: s.messages
+  })
+  /**
+   * 留言指纹：`条数 | 首条 msgId | 末条 msgId`。用来判"这次写盘要不要动旁挂文件"。
+   *
+   * 为什么这个判据是**可靠**的，不是"猜"的启发式：本插件的留言只有**两种**变化形状 ——
+   *   1. `post()` 在**尾部追加**一条（msgId = `m_<seq>`，seq 全局严格递增且唯一）；
+   *   2. `sweep()` 从**头部截断**（`MAX_MESSAGES` 条数上限 / `MAX_MESSAGES_BYTES` 字节预算）。
+   * 两者各自、以及"先截断再追加"同时发生，都必然改变**条数**或**首条 msgId**；
+   * "末条 msgId"再把"条数相同但换了一批"这种（本插件不产生的）情形也覆盖住。
+   * 反向：指纹相同 ⇒ 条数与首尾 msgId 都相同 ⇒ 中间那些条目的 msgId 也必然与上次相同
+   * （msgId 唯一且按追加顺序递增），所以留言内容不可能变。
+   * 迁移（主文件里的 messages 搬进旁挂）**不走**这个指纹，由 `messagesInMain` 单独判定。
+   */
+  const msgFingerprint = (msgs: Message[]): string =>
+    msgs.length + '|' + (msgs.length ? msgs[0].msgId : '') + '|' + (msgs.length ? msgs[msgs.length - 1].msgId : '')
+
+  async function targetFor(agentId: string | null, agent?: AgentLike): Promise<{ cwd: string | null; target: FileRef; sidecar: FileRef; stateDir: string; fileName: string }> {
     const cwd = await cwdOf(agentId, agent)
     const fileName = projectStorageFileName(cwd || 'default')
     // 绝对状态目录（${DSH_HOME:-$HOME/.dsh}/collab/projects），与进程 cwd 无关。
     // fs.resolve 对绝对路径原样通过（实测），所以这里不做字符串拼接猜测基址。
     const stateDir = collabDir()
     const target = await fs.resolve(projectStateFile(cwd))
-    return { cwd, target, stateDir, fileName }
+    // 旁挂与主文件**同一个目录、同一个名字前缀**（前缀取自 projectStorageFileName，唯一事实源）。
+    const sidecar = await fs.resolve(stateDir + '/' + sidecarNameOf(fileName))
+    return { cwd, target, sidecar, stateDir, fileName }
   }
 
-  async function load(agentId: string | null, agent?: AgentLike): Promise<LoadResult> {
-    const { cwd, target, stateDir, fileName } = await targetFor(agentId, agent)
+  /**
+   * 损坏备份的保留份数（0.14.0，M2b）。自愈每次 `JSON.parse` 失败都整份复制状态文件成
+   * `<name>.json.corrupt-<ms>`，而"半截读"（并发写期间读到长度 0）会让自愈在同一个文件上
+   * 反复触发 —— 旧实现**只写不清**，备份只增不减。
+   */
+  const CORRUPT_BACKUP_KEEP = 3
+
+  /**
+   * 顺手清理旧的损坏备份，只保留最近 `CORRUPT_BACKUP_KEEP` 份（0.14.0，M2b）。
+   *
+   * 三条纪律，缺一不可：
+   *   1. `fs.listDir` 是**可选能力**（与 `otherProjects` 同一降级纪律）：拿不到 / 抛错就静默跳过，
+   *      **绝不让自愈路径失败** —— 清理是旁路，不是自愈的前置条件；
+   *   2. 只认**自己命名规则**的文件（`<状态文件名>.corrupt-<纯数字>`），且只删普通文件：
+   *      别人的 `.bak-*`、别的项目的备份、非数字后缀一律不动；
+   *   3. 逐份删除、失败吞掉（`ENOENT` = 目标已经不在，正是我们要的结果）。
+   *
+   * 删除用 `node:fs` 的 `rm`（宿主插件删自己的文件，与 `dsh-spill-local` / `dsh-storage-json`
+   * 同一写法）：`ctx.fs` 服务**没有**删除原语（只有 createIfAbsent / replaceIfVersion 两种写入意图），
+   * 而"只保留 N 份"必须真的把文件去掉。路径取自 `fs.processPath`，非绝对路径一律跳过。
+   */
+  async function pruneCorruptBackups(fileName: string): Promise<void> {
+    try {
+      if (typeof fs.listDir !== 'function') return
+      const dir = await fs.resolve(collabDir())
+      const entries = await fs.listDir(dir)
+      const prefix = fileName + '.corrupt-'
+      const mine: Array<{ local: string; stamp: number }> = []
+      for (const e of entries) {
+        if (!e || typeof e.name !== 'string' || !e.target) continue
+        if (e.type && e.type !== 'file') continue
+        if (!e.name.startsWith(prefix)) continue
+        const tail = e.name.slice(prefix.length)
+        if (!/^\d+$/.test(tail)) continue
+        let local = ''
+        try { local = fs.processPath(e.target) } catch (err) { continue }
+        if (!local || !isAbsolute(local)) continue
+        mine.push({ local, stamp: Number(tail) })
+      }
+      if (mine.length <= CORRUPT_BACKUP_KEEP) return
+      mine.sort((a, b) => b.stamp - a.stamp)
+      for (const old of mine.slice(CORRUPT_BACKUP_KEEP)) {
+        try { await rm(old.local, { force: true }) } catch (err) {}
+      }
+    } catch (e) {}
+  }
+
+  /**
+   * 加载结果：契约的 `LoadResult` + 三样**存取层私有**的东西（旁挂目标/版本、主文件是否
+   * 还带着旧布局的 `messages`）。对外暴露面（StateStore.load）仍是 LoadResult。
+   */
+  interface LoadedState extends LoadResult {
+    sidecar: FileRef
+    sideVersion: number | null
+    messagesInMain: boolean
+  }
+
+  async function load(agentId: string | null, agent?: AgentLike): Promise<LoadedState> {
+    const { cwd, target, sidecar, stateDir, fileName } = await targetFor(agentId, agent)
     const warn = cwd ? null : '状态文件落在默认位置（本会话没有 cwd），按项目隔离已失效'
     // 迁移失败**不再静默**：旧落点搬不过来 = 这个项目凭空退回空状态（用户级故障，且极难自查）。
     // 复用 load() 已有的 warn 通道逐条追加 'legacy migrate failed: <原因>'；
@@ -282,11 +407,57 @@ export function installStore(ctx: CollabContext): StateStore {
         }
       }
     }
-    if (!info) return { state: init(), version: null, target, stateDir, warn: mergeWarn(null) }
+    // ---- 旁挂留言文件：**主文件在不在都读** ----
+    // 主文件丢了（或被损坏自愈重置）时，留言不该跟着消失 —— 那是另一个文件的事。
+    let sideMessages: Message[] | null = null
+    let sideVersion: number | null = null
+    let sideSeq = 0
+    try {
+      const sideInfo = await fs.stat(sidecar)
+      if (sideInfo) {
+        sideVersion = sideInfo.version
+        const sideRaw = await fs.readText(sidecar)
+        try {
+          const sd = JSON.parse(sideRaw)
+          if (sd && Array.isArray(sd.messages)) {
+            sideMessages = sd.messages
+            sideSeq = Number(sd.seq) || 0
+          } else {
+            migrateNotes.push('留言旁挂文件结构无效（messages 不是数组）：本次按无留言处理，原文件未改动')
+          }
+        } catch (e) {
+          // 解析失败**不删不覆盖**：先原样备份成 `<side>.corrupt-<ms>`，再按无留言继续。
+          // 不备份的话，下一次"留言变了"的写盘会把它整份换掉 —— 那就是静默丢留言。
+          let note = '留言旁挂文件损坏：' + describeError(e)
+          let backedUp = false
+          try {
+            const backupTarget = await fs.resolve(sidecar.displayPath + '.corrupt-' + now())
+            await fs.writeText(backupTarget, sideRaw, { kind: 'createIfAbsent' })
+            note += '；备份：' + fs.processPath(backupTarget)
+            backedUp = true
+          } catch (be) { note += '；备份失败：' + describeError(be) }
+          // 与主文件自愈同一降级纪律：备份成功后才顺手清理旧备份，清理失败绝不影响自愈路径。
+          if (backedUp) await pruneCorruptBackups(sidecarNameOf(fileName))
+          migrateNotes.push(note)
+        }
+      }
+    } catch (e) {
+      // 读不到（stat / readText 抛错）：**故意**把 sideVersion 留在 null。
+      // 真实 fs 对"已存在但本次没读过"的目标会拒绝 replaceIfVersion，于是后续写盘走
+      // createIfAbsent 时会失败并重试 —— 宁可让这次 op 失败，也不拿一份读不到的内容去覆盖。
+      migrateNotes.push('留言旁挂文件读取失败：' + describeError(e))
+    }
+    if (!info) {
+      const empty = init()
+      if (sideMessages) { empty.messages = sideMessages; empty.seq = sideSeq }
+      return { state: empty, version: null, target, sidecar, sideVersion, messagesInMain: false, stateDir, warn: mergeWarn(null) }
+    }
     const raw = await fs.readText(target)
     let s: StateDocument
+    let parsed: any = null
     try {
-      s = Object.assign(init(), JSON.parse(raw))
+      parsed = JSON.parse(raw)
+      s = Object.assign(init(), parsed)
     } catch (e) {
       // 自愈而非砖化：保留损坏文件的备份，重置为空状态并把问题作为 warning 上报。
       // **不许谎报**：备份/重置各自是否成功必须如实写进 warning —— 否则"损坏内容是否还在磁盘上、
@@ -301,10 +472,14 @@ export function installStore(ctx: CollabContext): StateStore {
       } catch (backupError) {
         backupFailure = describeError(backupError)
       }
+      // 备份写成功后才顺手清理旧备份（失败时不删：那会把"证据"清掉而没留下新的）。
+      // 这一步自带完整降级（见 pruneCorruptBackups），绝不会让自愈路径失败。
+      if (backupPath !== null) await pruneCorruptBackups(fileName)
       let resetOk = false
       let resetFailure: string | null = null
       try {
-        await fs.writeText(target, JSON.stringify(init()), { kind: 'replaceIfVersion', version: info.version })
+        // 重置写的是**主文件那一半**（不含 messages）：旧布局的 messages 键不能借着重置复活。
+        await fs.writeText(target, JSON.stringify(mainDocOf(init())), { kind: 'replaceIfVersion', version: info.version })
         resetOk = true
       } catch (resetError) {
         resetFailure = describeError(resetError)
@@ -316,18 +491,58 @@ export function installStore(ctx: CollabContext): StateStore {
         + (backupFailure ? '；备份失败：' + backupFailure : '')
         + (resetOk ? '' : '；原始损坏内容仍留在磁盘上')
         + (backupFailure && resetOk ? '；原始损坏内容已被重置覆盖' : '')
-      return { state: init(), version: null, target, stateDir, warn: mergeWarn(corruptWarn) }
+      // 主文件重置了，但旁挂留言还在：把它们并进返回值，别让"主文件坏了"看起来像"板也空了"。
+      const empty = init()
+      if (sideMessages) { empty.messages = sideMessages; empty.seq = sideSeq }
+      return { state: empty, version: null, target, sidecar, sideVersion, messagesInMain: false, stateDir, warn: mergeWarn(corruptWarn) }
     }
+    // 旧布局（主文件里**仍有** messages）以**主文件**为准；否则以旁挂为准。
+    const messagesInMain = !!(parsed && Array.isArray(parsed.messages))
+    if (messagesInMain) s.messages = parsed.messages
+    else if (sideMessages) s.messages = sideMessages
+    else s.messages = []
+    // seq 是 claimId 与 msgId 共用的计数器：取两边的较大值，避免复用已发过的 id。
+    s.seq = Math.max(Number(parsed && parsed.seq) || 0, sideSeq)
     s.claims = Array.isArray(s.claims) ? s.claims : []
     s.messages = Array.isArray(s.messages) ? s.messages : []
     s.holders = Array.isArray(s.holders) ? s.holders : []
-    return { state: s, version: info.version, target, stateDir, warn }
+    return { state: s, version: info.version, target, sidecar, sideVersion, messagesInMain, stateDir, warn: mergeWarn(null) }
+  }
+
+  /**
+   * 落盘：**先写旁挂，再写主文件**。
+   *
+   * 顺序不能反：迁移那一次主文件里的 `messages` 键会被去掉，如果主文件先写成功而旁挂写失败，
+   * 留言就只剩内存里那一份了。旁挂先写 ⇒ 任何一步失败时，磁盘上一定还留着一份完整的留言
+   * （旧布局时在主文件里，迁移后的新布局里在旁挂）。
+   *
+   * `messagesInMain` = 主文件里还带着旧布局的 messages ⇒ 这一次**必须**写旁挂（把留言搬过去），
+   * 否则主文件里那个键被去掉之后留言就无处可存。其余情况只看指纹（判据与可靠性见 msgFingerprint）。
+   */
+  async function writeState(
+    next: StateDocument, version: number | null, target: FileRef,
+    sidecar: FileRef, sideVersion: number | null, messagesInMain: boolean, fpBefore: string
+  ): Promise<void> {
+    const writeSide = messagesInMain || msgFingerprint(next.messages) !== fpBefore
+    if (writeSide) {
+      const sideBody = JSON.stringify(sideDocOf(next))
+      if (sideVersion === null) await fs.writeText(sidecar, sideBody, { kind: 'createIfAbsent' })
+      else await fs.writeText(sidecar, sideBody, { kind: 'replaceIfVersion', version: sideVersion })
+    }
+    // 主文件：本模块**每一次**写盘都写它 —— 它承载声明/名册/seq，本来就是被改的那一半，
+    // 而且只有 KB 级（写放大问题从来不在这一半）。写进去的内容里永远不含 messages。
+    const mainBody = JSON.stringify(mainDocOf(next))
+    if (version === null) await fs.writeText(target, mainBody, { kind: 'createIfAbsent' })
+    else await fs.writeText(target, mainBody, { kind: 'replaceIfVersion', version })
   }
 
   async function mutate(fn: (s: StateDocument) => OpResult, agentId: string | null, agent?: AgentLike): Promise<ToolResult> {
     for (let i = 0; i < 5; i++) {
-      const { state, version, target } = await load(agentId, agent)
-      const swept = sweep(state, now())
+      const { state, version, target, sidecar, sideVersion, messagesInMain } = await load(agentId, agent)
+      // 跑 op **之前**取留言指纹：sweep() 也会截断留言（条数/字节上限），所以要在它之前取，
+      // 否则"这次只清掉了旧留言"会被判成"留言没变"而丢掉截断结果。
+      const fpBefore = msgFingerprint(state.messages)
+      const swept = sweep(state, now(), sweepOpts(state))
       let out: OpResult | undefined
       try {
         out = fn(state)
@@ -339,15 +554,34 @@ export function installStore(ctx: CollabContext): StateStore {
         if (!out) return { ok: false, error: 'not-found', message: 'nothing to change' }
         const data = out.data || {}
         // 统一错误信封：ok:false 时 error/message 提升到顶层，调用方无需再挖 data。
+        // **错误分支绝不写盘**：被挡回的 op 没有产生任何该持久化的状态。
         if (out.ok === false) return { ok: false, error: data.error || 'bad-request', message: data.message, ...data }
-        return { ok: true, data }
+        // 本次 op 自己什么都没改时，过去会直接返回、不写盘。但 `sweep()` 已经在**这个事务里**
+        // 清掉了过期声明 / 超限留言 / 死名册行 —— 丢掉它们意味着：读路径只 sweep 内存、不写盘，
+        // 只要写操作一直返回 changed:false（反复 release 不存在的路径、reap dry-run、reader 已登记），
+        // 磁盘就会长期留着已清理的内容，**视图与磁盘长期不一致**（0.14.0，M2b）。
+        // 所以只要本次确实有清理，就把它写回；返回值形状保持不变（仍 `{ok:true, data}`）。
+        const cleaned = swept.expiredClaims > 0 || swept.droppedMessages > 0 || swept.prunedHolders > 0
+        if (out.changed === false && !cleaned) return { ok: true, data }
+        if (out.changed !== false && (swept.droppedMessages > 0 || swept.prunedHolders > 0)) {
+          out.data = Object.assign({}, out.data, { swept })
+        }
+        // changed:false 的 op 可能不带 state（如 registerReader 的幂等分支）；此时本地 `state`
+        // 就是唯一事实（fn 在 changed:false 语义下不改它，sweep 已经改过它）。
+        const next = out.state || state
+        try {
+          await writeState(next, version, target, sidecar, sideVersion, messagesInMain, fpBefore)
+          return { ok: true, data: out.changed === false ? data : out.data }
+        } catch (e) {
+          if (stale(e) && i < 4) continue
+          throw e
+        }
       }
       if (swept.droppedMessages > 0 || swept.prunedHolders > 0) {
         out.data = Object.assign({}, out.data, { swept })
       }
       try {
-        if (version === null) await fs.writeText(target, JSON.stringify(out.state), { kind: 'createIfAbsent' })
-        else await fs.writeText(target, JSON.stringify(out.state), { kind: 'replaceIfVersion', version })
+        await writeState(out.state, version, target, sidecar, sideVersion, messagesInMain, fpBefore)
         return { ok: true, data: out.data }
       } catch (e) {
         if (stale(e) && i < 4) continue
@@ -364,6 +598,9 @@ export function installStore(ctx: CollabContext): StateStore {
       agent,
       holderId: id ? 'agent:' + id : 'human:console',
       sessionId: id || undefined,
+      // 名册行的进程章（0.14.0，B2）。拿不到就是 undefined —— holder() 只在提供时盖章，
+      // 绝不会把另一个形态刚写上的章抹掉。
+      proc: PROC_TOKEN || undefined,
       // 血缘在这里现算一次，随 h 传进纯逻辑（collab-core 的 inFamily）。
       // 纯逻辑因此不需要认识 agents 服务，仍是可对拍的纯函数。
       family: familyIds(id, agent)
@@ -387,9 +624,13 @@ export function installStore(ctx: CollabContext): StateStore {
   async function list(agentId: string | null, agent?: AgentLike): Promise<ToolResult> {
     const { state, target, stateDir, warn } = await load(agentId, agent)
     const t = now()
-    // 先 sweep 再取视图：超过 24h 的废弃 holder 不再出现在结果里；
-    // 而 stale 用的是 1h 预警阈值（见 HOLDER_STALE_WARN_MS），因此在产品路径上依然是可达信号。
-    const ex = expire(state, t)
+    // 先 sweep 再取视图：死掉的名册行（句柄结束 / 写它的进程不在了）在返回里根本不出现；
+    // stale 用的是 1h 预警阈值（见 HOLDER_STALE_WARN_MS），因此在产品路径上依然是可达信号。
+    // 注意：`sweep()` 返回 SweepResult **对象**，而 `expire()` 返回数字。0.13.0 起 list 的
+    // `expiredCount` 是**数字**（"这次调用顺手扫掉几条过期声明"），动态宿主形态也仍是数字 ——
+    // 这里必须取 `.expiredClaims`，别把用户可见契约悄悄换成对象（2026-10 审计抓到的在飞回归）。
+    const swept = sweep(state, t, sweepOpts(state))
+    const ex = swept.expiredClaims
     const hv = holderView(state, t)
     // holdersNote 只在**有 stale 条目**时出现：名册被读成"过期锁"的实测现场才有这句话，
     // 干净项目一个字都不加（与 otherProjects / teamTasks 同一降级纪律）。
@@ -400,7 +641,11 @@ export function installStore(ctx: CollabContext): StateStore {
       statePath: fs.processPath(target),
       stateDir,
       schemaVersion: state.schemaVersion,
-      holders: hv.holders,
+      // 0.14.0（C）：名册**有界**返回。过去逐条返回整份名册（现场 56 行 / 约 10 KB 一次），
+      // 而每一步都注入的态势摘要早就把 claims 压到「3 条 × 2 路径」。截断不丢事实：
+      // holdersTotal 恒在，调用方自己看得出被折叠了。
+      holders: hv.holders.slice(0, HOLDER_VIEW_LIMIT),
+      holdersTotal: hv.holders.length,
       staleHolders: hv.staleHolders,
       claims: state.claims.map(pub),
       expiredCount: ex
@@ -430,6 +675,10 @@ export function installStore(ctx: CollabContext): StateStore {
       const out: Array<{ file: string; statePath: string; totalClaims: number; claims: unknown[] }> = []
       for (const e of entries) {
         if (!e || typeof e.name !== 'string' || !/\.json$/.test(e.name) || !e.target) continue
+        // **排除留言旁挂文件**：它也以 .json 结尾，不排掉就会被当成"另一个项目"去 parse。
+        // （旁挂本身没有 claims，parse 得出来也只会得到一个空项目，但那是错的分类，
+        //  而且把 80 KB 的留言整个读进来只为知道"它没有声明"。）
+        if (e.name.endsWith(SIDECAR_EXT)) continue
         if (fs.processPath(e.target) === here) continue
         let doc: any
         try { doc = JSON.parse(await fs.readText(e.target)) } catch (err) { continue }
@@ -506,7 +755,7 @@ export function installStore(ctx: CollabContext): StateStore {
   async function overviewOp(agentId: string | null, agent?: AgentLike): Promise<ToolResult> {
     const { state, target, stateDir, warn } = await load(agentId, agent)
     const t = now()
-    expire(state, t)
+    sweep(state, t, sweepOpts(state))
     const o = overview(state)
     const other = await otherProjects(target, t)
     // 官方团队在跑任务的 advisory 写域（0.11.0）：**输出侧附加**，与 otherProjects 同一纪律。
@@ -532,7 +781,7 @@ export function installStore(ctx: CollabContext): StateStore {
   async function status(a: CollabArgs, agentId: string | null, agent?: AgentLike): Promise<ToolResult> {
     const { state, target, stateDir, warn } = await load(agentId, agent)
     const t = now()
-    expire(state, t)
+    sweep(state, t, sweepOpts(state))
     const paths = (Array.isArray(a.paths) ? a.paths : []).map(norm).filter(Boolean)
     const rel = related(state, paths)
     return {

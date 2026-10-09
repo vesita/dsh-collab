@@ -117,9 +117,18 @@
 
 - **测试里"跳过"默认判失败**：只有显式 `COLLAB_ALLOW_SKIP=1` 才放行，且要打「未验证」横幅。
   见 `README.md`「运行测试」。
-- **两形态必须同步**：`src/index.ts` 一侧（包形态）与 `src/collab-plugin.host.ts`（动态形态内联副本）
-  改动语义时要一起改，并由 `tests/collab-inline-parity.mjs`（25 个同名函数逐输出对拍）
-  与 `tests/collab-hostcode-parity.mjs`（行为对拍）守护。
+- **两形态同源（0.14.0 起）—— 仅限纯逻辑**：纯逻辑的唯一事实源是 `src/collab-core.ts`。动态宿主形态的
+  `hostCode` 由 `scripts/build-host.mjs` 在构建时把 `lib/collab-core.js` **原样内联**进
+  `src/host-shell.js` 的外壳模板 —— 纯逻辑**不存在第二份手写副本**。守护：
+  `tests/collab-inline-parity.mjs` 断言生成物里的内联区与 `lib/collab-core.js` 去 `export` 后
+  **逐字节一致**（并断言外壳不复刻任何 core 名），`tests/collab-hostcode-parity.mjs` 把 hostCode
+  装进假 ctx 跑端到端行为。**改纯逻辑只改 `src/collab-core.ts`**。
+- **⚠ 状态层仍是两份，别被上一句误导**：`src/store.ts`（包形态）与 `src/host-shell.js` 的外壳里
+  各有一份 `load` / `mutate` / 损坏自愈 / 路径解析（外壳那份必须自己来：受限宿主里没有 `os`/`process`，
+  状态目录只能从 `settings.prepareDocument()` 反推）。**改存储层行为要两处都改**；已知尚未同步的两处：
+  「`changed:false` 时也把 sweep 清理落盘」与「损坏备份只保留最近 N 份」目前**只在包形态**有。
+  抽成第三份共享源是已记在案的待办（见 `docs/collab-ux-backlog.md`）。只有改"外壳接线"
+  （工具注册、事件接线）才碰 `src/host-shell.js`，改完必须重新 build。
 - **契约只有一份**：`src/schema/collab.schema.json` 是 SSOT，TS / Python / Rust 三份派生物由
   `tests/collab-contract-derivation.mjs` 逐字段核对。
 - **不验证不许说"没问题"**：区分「没测出问题」与「没有问题」；用户可见文案改动要配负向对照。

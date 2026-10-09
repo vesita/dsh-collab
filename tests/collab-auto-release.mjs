@@ -34,7 +34,7 @@
 import path from 'node:path'
 import os from 'node:os'
 import { readFileSync, existsSync } from 'node:fs'
-import { createHarness } from './_harness.mjs'
+import { createHarness, readStateMerged } from './_harness.mjs'
 import { loadCosmokit } from './_harness.mjs'
 
 const cordis = await import('@deepseek-ai/cordis').catch(() => import('../node_modules/.pnpm/node_modules/@deepseek-ai/cordis/lib/index.js'))
@@ -189,7 +189,8 @@ async function makeHarness(opts = {}) {
   return {
     ctx, tools, timers, deliveries, store, versions, statePath, registry, fiber,
     addAgent, emitStatus, dispose, flush,
-    readState: () => JSON.parse(store.get(statePath) || '{}'),
+    // 逻辑状态 = 主文件 + 留言旁挂（0.15.0，R2 起留言不再写在主文件里）。
+    readState: () => readStateMerged((p) => store.get(p), statePath),
     peek: (id) => { const a = registry.get(id); return a ? a.status : undefined },
     set: (patch) => { volatileWrite(fiber, ctx, patch) },
     callTool: (name, args, agent) => {
@@ -541,6 +542,80 @@ console.log('# 降噪：同一 holder 反复释放，注入通知合并，审计
   ok(hh.readState().messages.length === 2, '审计留言**一条都没合并**（取证账目完整）',
     JSON.stringify(hh.readState().messages.length))
   await hh.fiber.dispose()
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// 13b. M1 第 4 条：去重键带上本次释放的 claim 集合指纹
+// ════════════════════════════════════════════════════════════════════════
+console.log('# M1 第 4 条：同 holder 两次释放**不同** claim 集合，第二条不被 dedup')
+{
+  const hh = await makeHarness({
+    claims: [
+      mkClaim({ claimId: 'c_set1', holderId: 'agent:N', holderName: 'Worker N', paths: ['src/deploy/'] }),
+      mkClaim({ claimId: 'c_set2', holderId: 'agent:N', holderName: 'Worker N', paths: ['src/other/'] })
+    ]
+  })
+  hh.addAgent('N', 'running')
+  const agentN = hh.registry.get('N')
+  hh.emitStatus('N', 'idle')
+  await settle()
+  await hh.flush()
+  const first = hh.deliveries.filter((d) => d.sessionId === 'N')
+  ok(first.length === 1,
+    'M1 第 4 条前置：第一次释放（集合 {src/deploy/, src/other/}）投给本人 1 条', String(first.length))
+
+  // 只重新 claim src/deploy/ —— claimId 与路径集合都和上一次不同（同一次抖动里的另一组 claim）。
+  await hh.callTool('collab_lock', { op: 'claim', paths: ['src/deploy/'] }, agentN)
+  ok(hh.readState().claims.length === 1,
+    'M1 第 4 条前置：重新 claim 成功（本次集合只有 src/deploy/）',
+    JSON.stringify(hh.readState().claims.map((c) => c.claimId)))
+  hh.emitStatus('N', 'idle')
+  await settle()
+  await hh.flush()
+  const second = hh.deliveries.filter((d) => d.sessionId === 'N')
+  ok(second.length === 2,
+    'M1 第 4 条：同一 holder 释放**不同** claim 集合时第二条不被 dedup（旧实现静默丢弃）', String(second.length))
+  ok(second.length === 2 && textOf(second[1].message).includes('src/deploy/') && !textOf(second[1].message).includes('src/other/'),
+    'M1 第 4 条：第二条正文确实在讲新集合（只提 src/deploy/）', textOf(second[1] && second[1].message))
+  await hh.fiber.dispose()
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// 13c. M1 第 3 条：去重表真的有界（超过上限淘汰最旧，size 不超上限）
+// ════════════════════════════════════════════════════════════════════════
+console.log('# M1 第 3 条：循环终止通知去重表真的有界（size 不超上限 + 淘汰最旧）')
+{
+  const { installPush } = await import(path.join(ROOT, '../lib/push.js'))
+  const CAP = 500 // 与 src/push.ts 的 LOOP_END_NOTICE_MAX_KEYS 一致
+  let clock = 0
+  const ctxD = new Context()
+  ctxD.provide('agents')
+  ctxD.set('agents', { get: () => undefined, list: () => [] })
+  const storeD = {
+    fs: {},
+    now: () => (clock += 1),
+    livenessOf: () => ({ state: 'not-live' }),
+    hname: () => 'H',
+    mutate: async () => ({ ok: true, data: {} })
+  }
+  const push = installPush(ctxD, storeD)
+  const releaseFor = (i) => [mkClaim({ claimId: 'c_cap_' + i, holderId: 'agent:cap' + i, holderName: 'Cap ' + i, paths: ['src/cap/' + i + '/'] })]
+  for (let i = 0; i < CAP; i++) {
+    await push.notifyLoopEndRelease(releaseFor(i), 'agent:cap' + i, 'Cap ' + i, 120)
+  }
+  ok(push.debugLoopEndNoticeSize() === CAP, 'M1 第 3 条前置：恰好填满上限', String(push.debugLoopEndNoticeSize()))
+  await push.notifyLoopEndRelease(releaseFor(CAP), 'agent:cap' + CAP, 'Cap ' + CAP, 120)
+  ok(push.debugLoopEndNoticeSize() <= CAP,
+    'M1 第 3 条：超过上限后 size 仍 ≤ 上限（真淘汰；旧实现只删窗口外条目，会涨到 CAP+1）',
+    String(push.debugLoopEndNoticeSize()))
+  // 淘汰的是**最旧**的：cap0 被逐出 ⇒ 再次触发它不会被当 deduped。
+  const again = await push.notifyLoopEndRelease(releaseFor(0), 'agent:cap0', 'Cap 0', 120)
+  ok(again.holder.ok === false && again.holder.error !== 'deduped',
+    'M1 第 3 条：被淘汰的是最旧条目（cap0 不再被 dedup）', JSON.stringify(again.holder))
+  // 对照：没超上限的条目（cap500）在同一窗口内仍按"同集合"合并。
+  const dup = await push.notifyLoopEndRelease(releaseFor(CAP), 'agent:cap' + CAP, 'Cap ' + CAP, 120)
+  ok(dup.holder.error === 'deduped',
+    'M1 第 3 条对照：未超上限时同一 holder 同集合仍被合并（有界 ≠ 完全不去重）', JSON.stringify(dup.holder))
 }
 
 // ════════════════════════════════════════════════════════════════════════

@@ -64,7 +64,7 @@
 | 占用声明（Claim） | holder 对一组路径的声明：`{claimId, holderId, paths[], mode, ttlSec, expiresAt, note}` |
 | 租约（Lease） | claim 的存活期限，过期自动释放（防崩溃死锁） |
 | 持有者（Holder） | 身份：`{holderId, name, kind: 'agent'\|'human', sessionId?, preset?}` |
-| 留言（Message） | 协作域内的 append-only 消息：`{msgId, channel, author, ts, body, mentions[]}` |
+| 留言（Message） | 协作域内的 append-only 消息：`{msgId, channel, author, ts, body, replyTo?}`（0.13.0 起无 `mentions`） |
 | 路径模式（PathPattern） | 规范化的相对路径（目录或文件），如 `src/backend/`、`README.md` |
 
 ---
@@ -204,8 +204,8 @@ Message = {
   author: string,           // holderId 或 'human:<name>'
   ts: number,
   body: string,
-  mentions: string[],       // 被 @ 的 holderId
   replyTo?: string,         // 可选，msgId
+  // 0.13.0 移除 mentions：它不产生任何投递，实测被读成"通知过了"；现在传它会被 bad-request 挡回。
 }
 
 Holder = {
@@ -245,7 +245,7 @@ Holder = {
 
 | 方法 | 签名 | 说明 |
 | --- | --- | --- |
-| post | `post({channel, body, mentions?, replyTo?}) → {msgId}` | append-only；channel 约定见数据模型 |
+| post | `post({channel, body, replyTo?}) → {msgId}` | append-only；channel 约定见数据模型。0.13.0 起**没有** `mentions`（传了即 `bad-request`） |
 | read | `read({channel?, since?, limit?}) → {messages[]}` | 增量拉取（since = 上次 seq） |
 | subscribe | 由事件 `collab/message` 承担 | 不单独提供订阅 API |
 
@@ -256,10 +256,12 @@ Holder = {
 
 - **租约扫描**：状态文件每次读/写前惰性 `sweep()`（`expiresAt > now` 才算占用），没有后台定时器；
   租约上限 24h，是**最后的兜底**；
-- **三条回收路径**（见 README 0.9.10）：租约到期、持有者 `op=release`、**循环终止自动释放**
-  （`agent/status` → `idle` 且空闲超过宽限期，默认两分钟；期内恢复 `running` 即取消，到点须仍解析到
-  该 agent 且状态为 `idle` —— 已 dispose 的一律不放）；
-- **`agent/disposed` 不释放未过期声明**（W7）：只摘掉该 holder 的 `readers` 登记 + 回收它已过期的声明；
+- **四条回收路径**：租约到期、持有者 `op=release`、**循环终止自动释放**（`agent/status` → `idle`
+  且空闲超过宽限期，默认两分钟；期内恢复 `running` 即取消，到点须仍解析到该 agent 且状态为 `idle`
+  —— 已 dispose 的一律不放）、以及 **0.13.0 起的「句柄结束即删」**（见下条）；
+- **`agent/disposed` 立即释放该 holder 全部未过期声明**（0.13.0 由用户决策**推翻 W7**）：
+  同时摘掉 `readers` 登记、回收它已过期的声明、删掉它的名册行，并留一条审计留言。旧口径
+  （0.9.6–0.12.x）才是"只摘登记 + 只回收已过期声明"；残余风险是恢复后的会话会以为自己仍持锁；
 - **`op=reap`**（0.9.8）：`agents.list()` 分不清"休眠可唤回"与"真死"，故默认 dry-run、只由显式 `confirm` 触发；
 - **启动恢复**：apply 时从持久化加载全量状态；对**已经 idle** 的会话补一次自动释放武装（热重载 / 晚装载）。
 
@@ -304,8 +306,7 @@ Holder = {
 参数: { op: 'post'|'read',
         channel?: string,        // 默认 'general'
         body?: string,           // post 用
-        mentions?: string[],     // 定向 @
-        replyTo?: string,
+        replyTo?: string,        // 0.13.0 起没有 mentions（传了即 bad-request）
         since?: number,          // read 增量
         limit?: number }
 返回: {msgId} 或 {messages[]}
@@ -451,13 +452,13 @@ Holder = {
 | 路径 | 职责 |
 | --- | --- |
 | `src/collab-core.ts` | **纯逻辑唯一事实源**。不碰 fs/ctx/sessions，只操作 state，时间可注入。可 import / 可测 / 供未来 CLI、Python、Rust 对照复用 |
-| `src/collab-plugin.host.ts` | 自包含 Cordis Host 插件源码，导出 `hostCode` 字符串（直接作为 cordis 的 `code.host`）。因 Cordis 动态插件**不接受 import/打包**，内联与核心一致的纯逻辑 |
+| `src/host-shell.js` + `scripts/build-host.mjs` | 动态宿主形态：外壳模板 + 构建期把 `lib/collab-core.js` 原样内联，生成 `lib/collab-plugin.host.js`（导出 `hostCode`，直接作为 cordis 的 `code.host`）。因 Cordis 动态插件**不接受 import/打包**，纯逻辑只能内联 |
 | `src/schema/collab.schema.json` | **JSON Schema v1（单一契约）**：`StateDocument`（注册表状态结构）+ `colabLockParams` / `colabBoardParams`（两工具参数）。§5.3 定义 TS/Python/Rust 类型均由此派生 |
 | `docs/collab-usage.md` | 面向任意会话的使用指南 |
 | `tests/collab-pure-logic.mjs` | 纯逻辑 + 宿主一致性的回归测试 |
 | `README.md` | 仓库说明与目录结构 |
 
-> 一致性保障：`collab-plugin.host.ts` 内联的 `norm`/`cleanName` 与核心库由对拍测试（`tests/collab-pure-logic.mjs` §9）保证不漂移；正式化进 host 组合后插件改为直接 import 核心模块消除重复。
+> 一致性保障（0.14.0 起）：内联不再手写 —— `tests/collab-inline-parity.mjs` 断言生成物里的内联区与 `lib/collab-core.js` 去 `export` 后**逐字节一致**，并断言外壳不复刻任何核心名。
 >
 > **0.9.0 起**这条保障被强化成两层：`tests/collab-inline-parity.mjs` 用括号配对扫描从 `hostCode` 里抽出**全部 19 个两形态同名函数**逐输出对拍（原先只有 `clockUtc`/`renderDigest` 两个），并以「实测同名集合必须恰好等于期望集合」做回归守护——任何一侧新增同名函数却忘记接入对拍都会变红。
 
@@ -467,7 +468,7 @@ Holder = {
 > 只按依赖顺序调用各 installer，并把上一个 installer 的返回值显式传给下一个（无跨模块可变全局）。
 > **现行源码清单以 `README.md` 的目录树为准**，本节表格仅作历史纪要保留。
 
-> **转义注意**：`collab-plugin.host.ts` 内的 JS 模板字符串，内部正则层级与运行中版本的实际生效正则一致（如 `norm` 中 `/\\/g` 匹配单个反斜杠 → 替换为 `/`）。已用行为级 + 对拍测试双重确认，避免"模板字符串比运行版多一层转义"这类隐蔽漂移。
+> **不再有转义层级**（0.14.0 起）：`scripts/build-host.mjs` 用 `JSON.stringify` 序列化整段源码，反引号/`${}`/反斜杠全部免手工转义 —— 这曾是本文件最隐蔽的漂移来源，现在从机制上消失了。
 
 ### 18.1 与设计的实测偏差（均已验证）
 
@@ -507,7 +508,7 @@ Holder = {
 
 ### 18.5 待办（下一迭代）
 
-- ~~状态文件迁移到 `.dsh-collab/state.json` 目录形态~~ **（已不适用）**：现行落点是 `${DSH_HOME:-$HOME/.dsh}/collab/projects/<项目名>-<哈希>.json`；`.dsh-collab/state.json` 只是**受限动态宿主形态**解析不到 DSH 用户目录时的退化落点（见 `src/collab-plugin.host.ts`），不是待办目标；
+- ~~状态文件迁移到 `.dsh-collab/state.json` 目录形态~~ **（已不适用）**：现行落点是 `${DSH_HOME:-$HOME/.dsh}/collab/projects/<项目名>-<哈希>.json`；`.dsh-collab/state.json` 只是**受限动态宿主形态**解析不到 DSH 用户目录时的退化落点（见 `src/host-shell.js`），不是待办目标；
 - 进程内事件广播（供同会话 UI / 其他 host 插件消费）；
 - 真实双会话自动化测试（两个会话各挂插件、操作同一工作区，验证注册表/留言共享）；
 - storageDomain 后端接入（host 组合化形态）；
@@ -529,7 +530,7 @@ Holder = {
 
 ### 18.6 测试资产
 
-- `tests/collab-pure-logic.mjs`：纯逻辑回归（`node tests/collab-pure-logic.mjs`；通过数以脚本自身输出为准，本文件不写死计数）。**import 自 `lib/collab-core.js`（由 `src/collab-core.ts` 构建）而非复制**，并含主机源码对拍（§9）——从 `lib/collab-plugin.host.js`（源码 `src/collab-plugin.host.ts`）提取 `norm`/`cleanName` 与核心库做行为对比，防止内联版与核心库漂移。
+- `tests/collab-pure-logic.mjs`：纯逻辑回归（`node tests/collab-pure-logic.mjs`；通过数以脚本自身输出为准，本文件不写死计数）。**import 自 `lib/collab-core.js`（由 `src/collab-core.ts` 构建）而非复制**，；两形态的同源由 `tests/collab-inline-parity.mjs`（内联区与 `lib/collab-core.js` 逐字节一致）与 `tests/collab-hostcode-parity.mjs`（把 hostCode 装进假 ctx 跑端到端）守护。
 
 ---
 

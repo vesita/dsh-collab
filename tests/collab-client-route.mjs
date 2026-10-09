@@ -15,7 +15,8 @@ import { createHarness } from './_harness.mjs'
 //   (d) 非 GET → 405 + Allow: GET，且不泄漏载荷；
 //   (e) connection 拒绝 → 直接回拒绝码、空 body，且**先于**方法判定（围栏在最前）；
 //   (f) 文件缺失（buildSkillIndex(null)）→ skill 为 null，不抛；
-//   (g) webServer 缺失 → 插件照常装载、不注册路由、不抛；connection 缺失 → 仍可服务；
+//   (g) webServer 缺失 → 插件照常装载、不注册路由、不抛；connection 缺失（或没有
+//       requestRejection）→ **fail-closed**：不返回 200 数据，回显式的 503 错误，不泄漏路径；
 //   (h) 卸载插件 → 路由 disposer 被调用（可逆）。
 //
 // 运行：node tests/collab-client-route.mjs
@@ -205,7 +206,7 @@ console.log('# (f) missing skill file degrades to skill:null (no throw, no inven
   ok(!('whenToUse' in live.items[0].skill), 'an absent whenToUse is omitted rather than emitted as undefined', Object.keys(live.items[0].skill).join(','))
 }
 
-console.log('# (g) optional services: no webServer -> no route and no throw; no connection -> still served')
+console.log('# (g) optional services: no webServer -> no route and no throw; no connection fence -> fail-closed (never 200)')
 {
   const { ctx, captured } = makeCtx({ webServer: false })
   let threw = null
@@ -214,13 +215,34 @@ console.log('# (g) optional services: no webServer -> no route and no throw; no 
   ok(threw === null, 'the plugin loads without a webServer service', threw && String(threw.message))
   ok(captured.routes.length === 0, 'no route is registered without a webServer', 'routes=' + captured.routes.length)
 
+  // 围栏缺席 = fail-closed：webServer 只做路径匹配、不做 Host/Origin 校验，
+  // 所以 connection 是这条路由**唯一**的一道闸。它缺席时静默服务 = 任何人能连端口就能
+  // GET 到随包 SKILL.md 的绝对路径（泄露 home 目录 / 安装布局）。
   const bare = makeCtx({})
   const fiber = await bare.ctx.plugin(collabPlugin)
   await settle()
   const res = makeRes()
   await bare.captured.routes[0].handler(makeReq('GET'), res)
-  ok(res.statusCode === 200, 'without a connection service the route still answers 200 (fence skipped, path is not a secret)', String(res.statusCode))
+  ok(res.statusCode !== 200, 'without a connection service the route must NOT answer 200 (fail-closed)', String(res.statusCode))
+  ok(res.statusCode === 503, 'the fail-closed answer is an explicit 503', String(res.statusCode))
+  ok(!/SKILL\.md/.test(String(res.body || '')), 'the fail-closed answer leaks no skill path', String(res.body))
+  let bareErr = null
+  try { bareErr = JSON.parse(String(res.body)) } catch (e) { bareErr = null }
+  ok(!!bareErr && typeof bareErr.error === 'string' && bareErr.error.length > 0,
+    'the fail-closed answer carries an explicit error', String(res.body))
   await fiber.dispose()
+  await settle()
+
+  // 半截服务同样是缺席：connection 在、但没有 requestRejection ⇒ 也必须 fail-closed。
+  const partial = makeCtx({ connection: {} })
+  const fiber3 = await partial.ctx.plugin(collabPlugin)
+  await settle()
+  const res3 = makeRes()
+  await partial.captured.routes[0].handler(makeReq('GET'), res3)
+  ok(res3.statusCode === 503, 'a connection service without requestRejection is also fail-closed', String(res3.statusCode))
+  ok(!/SKILL\.md/.test(String(res3.body || '')), 'the partial-service answer leaks no skill path', String(res3.body))
+  await fiber3.dispose()
+  await settle()
 }
 
 h.finish()

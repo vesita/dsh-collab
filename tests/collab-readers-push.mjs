@@ -1,4 +1,4 @@
-import { createHarness } from './_harness.mjs'
+import { createHarness, readStateMerged, writeStateSplit } from './_harness.mjs'
 
 // collab-readers-push.mjs
 // 功能 D：锁上的读者反向注册（readers）+ 释放后的通知投递。
@@ -346,8 +346,12 @@ async function makeHarness(opts = {}) {
   }
   await ctx.plugin(collabPlugin)
   await settle()
-  const readState = () => JSON.parse(store.get(statePath) || '{}')
-  const writeState = (doc) => { store.set(statePath, JSON.stringify(doc)); versions.set(statePath, (versions.get(statePath) || 0) + 1) }
+  // 逻辑状态 = 主文件 + 留言旁挂；写回也按同一布局拆开（0.15.0，R2）。
+  const readState = () => readStateMerged((p) => store.get(p), statePath)
+  const writeState = (doc) => {
+    writeStateSplit((p, text) => store.set(p, text), statePath, doc)
+    versions.set(statePath, (versions.get(statePath) || 0) + 1)
+  }
   const lock = tools.find((t) => t.name === 'collab_lock')
   // agentId 可以是字符串（构造一个 holder），也可以是**现成的 agent 对象**。
   const callLock = async (args, agentId) => {
@@ -500,6 +504,53 @@ console.log('# (a) summary 由 boundContextSummary 截断：超长路径表也�
     JSON.stringify({ len: s && s.summary.length, summary: s && s.summary }))
   ok(noticeText(h.injects[0]).length > 120,
     '对照：模型可见正文不受 120 限制（summary 只是折叠态的一句话）', String(noticeText(h.injects[0]).length))
+}
+
+console.log('# M1 第 1 条：pushed 的诚实口径（pushedNote）—— 只保证进收件箱，不保证读者看到')
+{
+  // 背景：`agent.inject` 的契约是 `send(msg, 'next-step', wakeup=false)`（不唤醒 driver），
+  // 只有下一次 step 才会取走收件箱；读者 idle 且此后无人唤醒 ⇒ 消息不会被模型看到。
+  // `pushed` 的既有含义**不变**（成功调用了 inject），但结果里必须补一句机读 caveat。
+  const foreign = mkClaim({ claimId: 'c_note', holderId: 'agent:owner', holderName: 'Owner', paths: ['src/a/'], readers: ['agent:me'], expiresAt: Date.now() + HOUR })
+  const h = await makeHarness({ claims: [foreign], liveSessions: ['me'] })
+  const res = await h.callLock({ op: 'release', claimId: 'c_note' }, 'owner')
+  await settle()
+  const n = res && res.data && res.data.notify
+  ok(n && typeof n.pushedNote === 'string' && n.pushedNote.length > 0,
+    'M1 第 1 条：notify 带非空字符串 pushedNote（机读 caveat）', JSON.stringify(n && n.pushedNote))
+  ok(n && /wakeup=false/.test(n.pushedNote) && /收件箱/.test(n.pushedNote),
+    'M1 第 1 条：pushedNote 讲清"只保证进收件箱 + inject 契约 wakeup=false"', JSON.stringify(n && n.pushedNote))
+  ok(n && JSON.stringify(n.pushed) === '["me"]' && n.pushedVia.length === 1 && n.pushedVia[0].channel === 'inject',
+    'M1 第 1 条对照：pushed / pushedVia 的既有含义一字未动（只增口径，不改字段）',
+    JSON.stringify({ pushed: n && n.pushed, pushedVia: n && n.pushedVia }))
+}
+
+console.log('# M1 第 5 条：inject 失败不记账，同 claimId 的第二次释放真的重试（不再误报 already-pushed）')
+{
+  const claim = () => mkClaim({ claimId: 'c_idem', holderId: 'agent:owner', holderName: 'Owner', paths: ['src/a/'], readers: ['agent:me'], expiresAt: Date.now() + HOUR })
+  // opts 在 harness 生命周期内可改：liveAgent 每次 inject 现读 opts.injectThrows。
+  const opts = { claims: [claim()], liveSessions: ['me'], injectThrows: true }
+  const h = await makeHarness(opts)
+  const r1 = await h.callLock({ op: 'release', claimId: 'c_idem' }, 'owner')
+  await settle()
+  const n1 = r1 && r1.data && r1.data.notify
+  ok(n1 && n1.pushed.length === 0 && n1.skipped.length === 1 && n1.skipped[0].reason === 'inject-failed',
+    'M1 第 5 条：第一次 inject 失败如实记 inject-failed（不是 already-pushed）', JSON.stringify(n1))
+  ok(n1 && String(n1.skipped[0].error || '').includes('inject channel exploded'),
+    'M1 第 5 条：失败带本次的真实原因（没被旧记账抹掉）', JSON.stringify(n1 && n1.skipped))
+
+  // 同一条 claim（同 claimId、同 reader）放回状态文件，这次通道恢复：必须真的重投。
+  opts.injectThrows = false
+  h.writeState({ schemaVersion: 1, seq: 1, claims: [claim()], messages: [], holders: [] })
+  const r2 = await h.callLock({ op: 'release', claimId: 'c_idem' }, 'owner')
+  await settle()
+  const n2 = r2 && r2.data && r2.data.notify
+  ok(n2 && JSON.stringify(n2.pushed) === '["me"]',
+    'M1 第 5 条：第一次失败后，第二次释放成功重投（pushed 含 me）', JSON.stringify(n2))
+  ok(n2 && !n2.skipped.some(s => s.reason === 'already-pushed'),
+    'M1 第 5 条：第二次**不再**误报 already-pushed（失败的那一对没有被记账）', JSON.stringify(n2 && n2.skipped))
+  ok(h.injects.length === 1 && h.injects[0].sessionId === 'me',
+    'M1 第 5 条：第二次确实调用了 inject（重试是行为，不只是返回话说得对）', JSON.stringify(h.injects.map(i => i.sessionId)))
 }
 
 console.log('# 旧通道整体删除：即使读者是"子代理路由托管"的会话也不再走 prompt/sendMessage')
@@ -824,23 +875,60 @@ console.log('# 存活判据三态：agents.get 抛异常 ≠ 读者没在线（i
     'item 6 对照：会话确实没在线时仍是 not-live（既有取值语义不变）', JSON.stringify(cn && cn.skipped))
 }
 
-console.log('# 源码级：agent/disposed 路径的注释与实现必须一致（item 8）')
+console.log('# M1 第 2 条：agent/disposed 路径的失败必须如实记账（空 catch 换成日志）')
 {
   const src = readFileSync(path.join(ROOT, '../src/push.ts'), 'utf8')
   const start = src.indexOf("ctx.on('agent/disposed'")
   const region = start >= 0 ? src.slice(start) : ''
   ok(region.length > 0, '定位到 agent/disposed 处理器区块（扫描本身有效）', 'start=' + start)
-  // 原缺陷：`.then(res => { try { … } catch (e) {} })`，注释却讲该路径会如实记账。
-  // 这里断言那层**死 catch** 已经不在（notifyReaders 是 async，调用点不会同步抛）。
-  const thenStart = region.indexOf('.then(res => {')
-  const thenEnd = region.indexOf('.catch(() => {})')
-  const thenBody = thenStart >= 0 && thenEnd > thenStart ? region.slice(thenStart, thenEnd) : ''
-  ok(thenBody.length > 0 && !/\btry\s*\{/.test(thenBody),
-    'item 8：agent/disposed 的 .then 回调里不再有空的 try/catch（死 catch 已删）',
-    JSON.stringify(thenBody.slice(0, 120)))
-  ok(!/不静默[\s\S]{0,600}?catch\s*\(\w+\)\s*\{\s*\}/.test(region),
-    'item 8：区块内不存在「注释宣称不静默 + 紧跟空 catch」的自相矛盾')
-  ok(/刻意保持静默/.test(region), 'item 8：该路径的静默被显式写成"刻意保持静默"（注释与实现对齐）')
+  // 只看代码（注释里当然会引述旧写法，例如"把 `.catch(() => {})` 换成如实记账"）。
+  const code = region.replace(/\/\/[^\n]*/g, '').replace(/\/\*[\s\S]*?\*\//g, '')
+  // 旧缺陷：注释讲该路径会如实记账，实现却是 `.catch(() => {})` —— 写失败/异步拒绝没有任何痕迹。
+  ok(!/\.catch\(\s*\(\s*\)\s*=>\s*\{\s*\}\s*\)/.test(code),
+    'M1 第 2 条：agent/disposed 区块里不再有空 catch（失败不许静默）',
+    JSON.stringify(code.match(/\.catch\([^\n]*/) || null))
+  ok(/reportInternal\('agent\/disposed'/.test(code),
+    'M1 第 2 条：失败走 reportInternal 如实记一行', null)
+  ok(!/刻意保持静默/.test(region), 'M1 第 2 条：旧的"刻意保持静默"注释已删除（注释与实现对齐）')
+
+  // 行为面：用最小假 ctx/store 直接驱动处理器，断言**真实失败原因**进了日志。
+  const { installPush } = await import(path.join(ROOT, '../lib/push.js'))
+  const logs = []
+  const driveDisposed = async (mutateImpl) => {
+    const ctxD = new Context()
+    ctxD.provide('logger')
+    ctxD.set('logger', { warn: (m) => logs.push(String(m)) })
+    const storeD = {
+      fs: {},
+      now: () => Date.now(),
+      livenessOf: () => ({ state: 'not-live' }),
+      hname: () => 'Disposed Worker',
+      mutate: mutateImpl
+    }
+    installPush(ctxD, storeD)
+    ctxD.emit('agent/disposed', { agent: { id: 'A' } })
+    await settle()
+  }
+
+  logs.length = 0
+  await driveDisposed(() => Promise.reject(new Error('state disk exploded')))
+  ok(logs.some(l => l.includes('agent/disposed') && l.includes('state disk exploded')),
+    'M1 第 2 条：mutate 拒绝（写盘失败）时日志里有真实原因', JSON.stringify(logs))
+
+  logs.length = 0
+  await driveDisposed(() => Promise.resolve({ ok: false, error: 'concurrent-modification', message: 'state busy' }))
+  ok(logs.some(l => l.includes('concurrent-modification')),
+    'M1 第 2 条：mutate 返回 ok:false（写冲突）时同样留痕，不再无声滑过', JSON.stringify(logs))
+
+  logs.length = 0
+  await driveDisposed(() => Promise.resolve({ ok: true, data: {} }))
+  ok(logs.some(l => l.includes('released=missing')),
+    'M1 第 2 条：成功返回但 released 形状不对（无可投递集合）也如实留痕', JSON.stringify(logs))
+
+  logs.length = 0
+  await driveDisposed(() => Promise.resolve({ ok: true, data: { released: [] } }))
+  ok(logs.length === 0,
+    'M1 第 2 条对照：一切正常（无可释放集合）时**不**报错 —— 不许把成功当失败', JSON.stringify(logs))
 }
 
 console.log('# 源码级：releaseWithNotify 兜底里不再有「不可能抛」的嵌套 try/catch（item 7）')

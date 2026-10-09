@@ -156,7 +156,7 @@ RESULT>>> {"tasks":[{"id":"task-1",…,"status":"in_progress","writeScopes":["in
 | 工具输出 | `src/tools.ts`、`src/store.ts` | `op=claim` 追加 `teamOverlaps`；`op=overview` 追加 `teamTasks` + `teamTasksNote`（**只在服务在场时**，与 `otherProjects` 同一"输出侧附加"纪律） |
 | 反向提示 | `src/gate.ts`、`src/push.ts`、`src/index.ts` | `tools/pre-execute` 上对 `team_task_create` / `team_task_update` 做只提示不阻断的重叠预警；投递走既有的 `agent.inject` + `dsh-collab/notice`，不新造通道、不冒充用户 |
 | 委托纪律 | `src/spec.ts`、`src/delegation.ts` | `ctx.agentTeams` 在场时追加 `TEAM_DISCIPLINE_ADDENDUM`（面向 teammate 的词表），否则一字不变 |
-| 动态形态 | `src/collab-plugin.host.ts` | 三个同名纯函数 + `teamTasks` + overview/claim 的等价改动（无 `tools/pre-execute` 接线 ⇒ 反向提示那一侧退化为文档，§2.15 的已知不对称） |
+| 动态形态 | `src/host-shell.js`（构建期内联 `lib/collab-core.js`） | 三个同名纯函数 + `teamTasks` + overview/claim 的等价改动。**0.14.0 起已接 `tools/pre-execute`（写门控）**；但**反向交叉预警仍未移植** —— 它要 `agent.inject` + `dsh-llm`，受限宿主里没有 ⇒ 那一侧仍退化为文档（§2.15 的已知不对称） |
 | 契约 | `src/schema/collab.schema.json` + `src/types/collab.d.ts` + `scripts/collab_models.py` + `crates/collab-cli/src/main.rs` | 两个新类型进 SSOT 并同步 4 份派生物 |
 | 测试 | `tests/collab-inline-parity.mjs`（同名集合 22 → 25 + 逐输出语料）、`tests/collab-agent-teams.mjs`（新场景 + 负向对照）、`tests/collab-contract-derivation.mjs`（TYPES +2） | 正反两面都断言 |
 

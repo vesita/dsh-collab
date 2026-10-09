@@ -325,17 +325,18 @@ console.log('\n# 9. 静态：reap 只由工具 handler 调用（无自动触发�
 {
   const rel = (p) => readFileSync(join(ROOT, p), 'utf8')
   // 9.1 真正"碰到 reap"（调用或定义，带括号）的文件必须是有限的几个：
-  //     核心定义 + 状态接线 + 工具 handler + 宿主内联副本。注释里提到 reap 的（contract/push）不算。
-  const srcFiles = ['collab-core.ts', 'store.ts', 'tools.ts', 'collab-plugin.host.ts', 'contract.ts', 'index.ts', 'push.ts', 'gate.ts', 'access.ts', 'awareness.ts', 'spec.ts', 'paths.ts', 'delegation.ts', 'client.ts']
+  //     核心定义 + 状态接线 + 工具 handler + 宿主外壳（接线层；纯逻辑已由 collab-core 内联）。
+  //     注释里提到 reap 的（contract/push）不算。
+  const srcFiles = ['collab-core.ts', 'store.ts', 'tools.ts', 'host-shell.js', 'contract.ts', 'index.ts', 'push.ts', 'gate.ts', 'access.ts', 'awareness.ts', 'spec.ts', 'paths.ts', 'delegation.ts', 'client.ts']
   const withReap = srcFiles.filter((f) => /\breap[a-zA-Z]*\s*\(/.test(rel('src/' + f)))
-  ok(JSON.stringify(withReap) === JSON.stringify(['collab-core.ts', 'store.ts', 'tools.ts', 'collab-plugin.host.ts']),
-    '9.1 调用/定义 reap 的 src 文件恰好是核心/状态/工具/宿主四份', JSON.stringify(withReap))
+  ok(JSON.stringify(withReap) === JSON.stringify(['collab-core.ts', 'store.ts', 'tools.ts', 'host-shell.js']),
+    '9.1 调用/定义 reap 的 src 文件恰好是核心/状态/工具/宿主外壳四份', JSON.stringify(withReap))
   // 9.2 sweep() 的函数体里没有 reap（它只能回收过期声明，不得碰未过期的僵尸判定）。
   const coreSrc = rel('src/collab-core.ts')
   const sweepBody = coreSrc.slice(coreSrc.indexOf('export function sweep('), coreSrc.indexOf('// 惰性清理过期声明'))
   ok(sweepBody.length > 0 && !/reap/i.test(sweepBody), '9.2 sweep() 函数体里不含 reap（读/写前的惰性清理不碰僵尸判定）')
-  // 9.3 宿主内联形态同理：只有 handler 里那一处调用，没有定时器/读路径调用。
-  const hostSrc = rel('src/collab-plugin.host.ts')
+  // 9.3 宿主形态同理：只有 handler 里那一处调用，没有定时器/读路径调用。
+  const hostSrc = rel('src/host-shell.js')
   const reapCalls = [...hostSrc.matchAll(/reap\(s, h, a, liveAgentHolderIds\(\), now\(\)\)/g)].length
   ok(reapCalls === 1, '9.3 宿主里 reap 的调用点恰好 1 处（工具 handler 内联的那一句）', String(reapCalls))
   const timerBody = hostSrc.slice(hostSrc.indexOf('ctx.timer.interval'), hostSrc.indexOf('ctx.on(\'agent/disposed\''))

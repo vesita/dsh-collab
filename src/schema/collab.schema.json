@@ -11,7 +11,7 @@
     "Mode": {
       "type": "string",
       "enum": ["exclusive", "shared", "read"],
-      "description": "exclusive 独占（默认，阻塞他人重叠声明）；shared 只声明不排他但会被他人独占挡住；read 只读观测，不排他也不被挡。"
+      "description": "exclusive 独占（默认）：请求它会与**已在场的 exclusive 和 shared 都冲突**（返回冲突清单供协商/等待/换路径 —— 0.14.0 起不再静默抢占共享方）；shared 声明共用：与已在场的 shared 不冲突、被他人的 exclusive 挡住；read 只读观测，不排他也不被挡。"
     },
     "Claim": {
       "type": "object",
@@ -28,7 +28,7 @@
         "note": { "type": "string", "maxLength": 500 },
         "createdAt": { "type": "integer", "description": "创建时刻（Unix 毫秒）。" },
         "readable": { "type": "boolean", "default": true, "description": "可读性（0.8.0 功能 C）：true = 他人可读（默认），false = 他人读取也要先协商；写入对非持有者始终要协商。可选字段，兼容 0.7.0 之前的状态文件（缺省即可读）。" },
-        "readers": { "type": "array", "items": { "type": "string" }, "default": [], "description": "读者（0.8.0 功能 D，反向注册）：被本声明通知过的会话 holderId（agent:<id>）。缺省 []；移除时机只有两处：持有者释放（整条声明消失）、agent/disposed（dropHolder 摘掉登记 —— 会话被 dispose 之后往往还会恢复，故不称「会话结束」）。声明本身不因 dispose 回收。声明有**三条**回收路径：租约到期 expiresAt（sweep）、持有者显式 op=release、以及 0.9.10 起的**循环终止自动释放**（agent/status → idle 且空闲超过宽限期，默认两分钟，可在 settings 关掉；触发者是「循环停了但 agent 还加载着」，不是 dispose，见 src/auto-release.ts）。0.8.3 起 sweep() **不再**按 liveness 清理读者 —— agents.get() 对休眠但可唤回的会话返回 undefined，按它清理会静默丢掉通知。" }
+        "readers": { "type": "array", "items": { "type": "string" }, "default": [], "description": "读者（0.8.0 功能 D，反向注册）：被本声明通知过的会话 holderId（agent:<id>）。缺省 []；移除时机只有两处：持有者释放（整条声明消失）、agent/disposed（dropHolder 摘掉登记 —— 会话被 dispose 之后往往还会恢复，故不称「会话结束」）。声明有**四条**回收路径：① 租约到期 expiresAt（sweep）—— 唯一无条件的一条；② 持有者显式 op=release；③ **句柄结束**（0.13.0，agent/disposed）—— 立即释放该 holder **全部未过期**声明，这一条**推翻了 0.9.6 起的 W7 取舍**（旧口径是「dispose 只回收已过期声明」）；④ 循环终止自动释放（0.9.10，agent/status → idle 且空闲超过宽限期，默认两分钟，可在 settings 关掉；触发者是「循环停了但 agent 还加载着」）。③④ 都留审计留言（频道 agent:<holderId>），恢复工作前必须重新 claim；③ 的残余风险如实记：dispose 后被恢复的会话会以为自己仍持锁。0.8.3 起 sweep() **不再**按 liveness 清理读者 —— agents.get() 对休眠但可唤回的会话返回 undefined，按它清理会静默丢掉通知。" }
       }
     },
     "Message": {
@@ -41,7 +41,7 @@
         "channel": { "type": "string", "default": "general", "description": "频道：general / path:<相对路径> / agent:<holderId>（holderId 本身已含 agent: 前缀，直接写它，不要再加一层）。写什么就得按什么读：精确匹配。" },
         "author": { "type": "string", "description": "作者 holderId。" },
         "ts": { "type": "integer", "description": "发送时刻（Unix 毫秒）。" },
-        "body": { "type": "string", "minLength": 1, "description": "消息正文。" },
+        "body": { "type": "string", "minLength": 1, "maxLength": 8000, "description": "消息正文。上限 8000 字符（与 collab-core 的 MESSAGE_BODY_MAX_CHARS 同值）：只封条数的 MAX_MESSAGES=2000 × 单条上限 ⇒ 最坏约 16MB，而不是「任意大」。超限由 post() 以 bad-request 显式挡回，**不静默截断**。" },
         "replyTo": { "type": "string", "description": "回复的 msgId，可做成线程。" }
       }
     },
@@ -54,7 +54,8 @@
         "name": { "type": "string" },
         "kind": { "type": "string", "enum": ["agent", "human"] },
         "sessionId": { "type": "string" },
-        "lastSeenAt": { "type": "integer", "description": "最近一次活跃（Unix 毫秒）。" }
+        "lastSeenAt": { "type": "integer", "description": "最近一次活跃（Unix 毫秒）。注意：只有 claim / post 会刷新它（release 与 heartbeat 不刷），所以它是「最近一次登记」而不是「最近一次活动」。" },
+        "proc": { "type": "string", "description": "写这一行的进程身份令牌 `<pid>:<开机节拍>`（0.14.0）。名册行的生死按它判：写它的那个进程不在了（被杀的进程没有 agent/disposed 可等）⇒ 下一次 sweep 就删掉这一行，不等 24h。缺省 = 升级前留下的旧行，或该形态拿不到进程身份（受限动态宿主里 process 是 undefined），此时退回 24h TTL。只影响名册行，不改变任何声明（claim）的租约语义。" }
       }
     },
     "StateDocument": {
@@ -136,7 +137,7 @@
       "properties": {
         "op": { "type": "string", "enum": ["post", "read"] },
         "channel": { "type": "string" },
-        "body": { "type": "string" },
+        "body": { "type": "string", "maxLength": 8000, "description": "post 用，消息正文。上限 8000 字符（与 collab-core 的 MESSAGE_BODY_MAX_CHARS 同值）；超限由 post() 以 bad-request 挡回且整条不写入，不静默截断。" },
         "replyTo": { "type": "string" },
         "since": { "type": "integer", "minimum": 0, "description": "read 用：省略或 0 = 读最新 limit 条（tail）；>0 = 从该 seq 往后读 limit 条（forward，旧→新）。返回的 nextSince 是下一次的游标。" },
         "limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 }
