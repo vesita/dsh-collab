@@ -527,9 +527,14 @@ console.log('# M1 第 1 条：pushed 的诚实口径（pushedNote）—— 只�
 
 console.log('# M1 第 5 条：inject 失败不记账，同 claimId 的第二次释放真的重试（不再误报 already-pushed）')
 {
-  const claim = () => mkClaim({ claimId: 'c_idem', holderId: 'agent:owner', holderName: 'Owner', paths: ['src/a/'], readers: ['agent:me'], expiresAt: Date.now() + HOUR })
+  // 第一次用的租约**刻意短**：单元 C 起 release 会把 claimId 记进**终态墓碑**（权威失效，
+  // 不让旧副本翻案），而墓碑的 GC 规则是确定性的"原租约 expiresAt 到点即回收"。要重放同一对
+  // (claimId, reader)，就得等那块墓碑被 sweep 回收 —— 短租约让这里只等一两秒，而**幂等键
+  // 始终是同一个 claimId**（换 id 会把要测的东西绕过去）。
+  const shortLease = () => mkClaim({ claimId: 'c_idem', holderId: 'agent:owner', holderName: 'Owner', paths: ['src/a/'], readers: ['agent:me'], expiresAt: Date.now() + 2000 })
+  const longLease = () => mkClaim({ claimId: 'c_idem', holderId: 'agent:owner', holderName: 'Owner', paths: ['src/a/'], readers: ['agent:me'], expiresAt: Date.now() + HOUR })
   // opts 在 harness 生命周期内可改：liveAgent 每次 inject 现读 opts.injectThrows。
-  const opts = { claims: [claim()], liveSessions: ['me'], injectThrows: true }
+  const opts = { claims: [shortLease()], liveSessions: ['me'], injectThrows: true }
   const h = await makeHarness(opts)
   const r1 = await h.callLock({ op: 'release', claimId: 'c_idem' }, 'owner')
   await settle()
@@ -539,10 +544,16 @@ console.log('# M1 第 5 条：inject 失败不记账，同 claimId 的第二次�
   ok(n1 && String(n1.skipped[0].error || '').includes('inject channel exploded'),
     'M1 第 5 条：失败带本次的真实原因（没被旧记账抹掉）', JSON.stringify(n1 && n1.skipped))
 
-  // 同一条 claim（同 claimId、同 reader）放回状态文件，这次通道恢复：必须真的重投。
+  // 同一条 claim（同 claimId、同 reader）放回状态文件；通道恢复 ⇒ 必须真的重投。
+  // 墓碑在租约到点后由 sweep 回收，所以这里**轮询**到那一刻（失败的那几次 release 返回
+  // not-found，不写盘、不推送、也不记账，因此不影响本断言要测的幂等键）。
   opts.injectThrows = false
-  h.writeState({ schemaVersion: 1, seq: 1, claims: [claim()], messages: [], holders: [] })
-  const r2 = await h.callLock({ op: 'release', claimId: 'c_idem' }, 'owner')
+  h.writeState({ schemaVersion: 1, seq: 1, claims: [longLease()], messages: [], holders: [] })
+  let r2 = null
+  for (let i = 0; i < 50 && !(r2 && r2.ok === true); i++) {
+    await sleep(100)
+    r2 = await h.callLock({ op: 'release', claimId: 'c_idem' }, 'owner')
+  }
   await settle()
   const n2 = r2 && r2.data && r2.data.notify
   ok(n2 && JSON.stringify(n2.pushed) === '["me"]',
@@ -582,15 +593,27 @@ console.log('# 旧通道整体删除：即使读者是"子代理路由托管"的
   ok(sourceShapeOk(injectLog[0] && injectLog[0].message), '(a) 该投递的来源形状同样正确', sourceShapeWhy(injectLog[0] && injectLog[0].message))
 
   // 幂等键 (claimId, reader)：投递成功过的一对，重新放回状态文件再释放也不再投。
-  const restored = { schemaVersion: 1, seq: 1, claims: [claim()], messages: [], holders: [] }
-  h.writeState(restored)
-  const res3 = await h.callLock({ op: 'release', claimId: 'c_lock' }, 'owner')
+  // 单元 C：release 立终态墓碑，同一 claimId 在同一进程里不会复活；墓碑按"原租约到期"
+  // 确定性回收，所以这里用短租约 + 轮询等到墓碑被 sweep 回收，再观测 already-pushed
+  // （换 claimId 会把幂等键换掉，测不到这条）。
+  const shortLock = () => mkClaim({ claimId: 'c_lock', holderId: 'agent:owner', holderName: 'Owner', paths: ['src/a/'], readers: ['agent:me'], expiresAt: Date.now() + 2000 })
+  const hs = await makeHarness({ claims: [shortLock()], liveSessions: ['me'] })
+  const first = await hs.callLock({ op: 'release', claimId: 'c_lock' }, 'owner')
   await settle()
-  ok(h.prompts.length === 0 && h.sends.length === 0 && h.injects.length === 1,
+  ok(first.ok === true && hs.injects.length === 1, '短租约下第一次 release 照常投递', JSON.stringify({ ok: first.ok, injects: hs.injects.length }))
+  const restored = { schemaVersion: 1, seq: 1, claims: [claim()], messages: [], holders: [] }
+  hs.writeState(restored)
+  let res3 = null
+  for (let i = 0; i < 50 && !(res3 && res3.ok === true); i++) {
+    await sleep(100)
+    res3 = await hs.callLock({ op: 'release', claimId: 'c_lock' }, 'owner')
+  }
+  await settle()
+  ok(hs.prompts.length === 0 && hs.sends.length === 0 && hs.injects.length === 1,
     '已投递过的 (claimId, reader) 不再重投，且旧通道仍然零调用',
-    JSON.stringify({ injects: h.injects.length, prompts: h.prompts.length, sends: h.sends.length }))
-  ok(res3.data.notify.skipped.length === 1 && res3.data.notify.skipped[0].reason === 'already-pushed',
-    '第二次 release 如实报 already-pushed', JSON.stringify(res3.data.notify))
+    JSON.stringify({ injects: hs.injects.length, prompts: hs.prompts.length, sends: hs.sends.length }))
+  ok(res3 && res3.data && res3.data.notify && res3.data.notify.skipped.length === 1 && res3.data.notify.skipped[0].reason === 'already-pushed',
+    '第二次 release 如实报 already-pushed', JSON.stringify(res3 && res3.data && res3.data.notify))
 }
 
 console.log('# (b) 解析不到目标 agent：投递数 0 + skipped.reason = agent-not-resolvable（如实跳过，绝不冒充）')
@@ -671,7 +694,9 @@ console.log('# 安全硬约束：冷读者零投递（既不 inject，也不碰�
 
 console.log('# 排除释放者自己 / 同一 (claimId, reader) 只投一次')
 {
-  const foreign = mkClaim({ claimId: 'c_lock', holderId: 'agent:owner', paths: ['src/a/'], readers: ['agent:owner', 'agent:me'], expiresAt: Date.now() + HOUR })
+  // 单元 C：release 立终态墓碑，同一 claimId 在同一进程里不会复活；墓碑按"原租约到期"
+  // 确定性回收 ⇒ 这里用短租约，并**轮询**到墓碑被 sweep 回收（换 id 会把幂等键换掉）。
+  const foreign = mkClaim({ claimId: 'c_lock', holderId: 'agent:owner', paths: ['src/a/'], readers: ['agent:owner', 'agent:me'], expiresAt: Date.now() + 2000 })
   const h = await makeHarness({ claims: [foreign], liveSessions: ['owner', 'me'] })
   const res0 = await h.callLock({ op: 'release', claimId: 'c_lock' }, 'owner')
   await settle()
@@ -682,9 +707,13 @@ console.log('# 排除释放者自己 / 同一 (claimId, reader) 只投一次')
   // 这一对已经推过，必须**不再**推送（幂等键就是 (claimId, reader)）。
   const restored = { schemaVersion: 1, seq: 1, claims: [mkClaim({ claimId: 'c_lock', holderId: 'agent:owner', paths: ['src/a/'], readers: ['agent:me'], expiresAt: Date.now() + HOUR })], messages: [], holders: [] }
   h.writeState(restored)
-  const res2 = await h.callLock({ op: 'release', claimId: 'c_lock' }, 'owner')
+  let res2 = null
+  for (let i = 0; i < 50 && !(res2 && res2.ok === true); i++) {
+    await sleep(100)
+    res2 = await h.callLock({ op: 'release', claimId: 'c_lock' }, 'owner')
+  }
   await settle()
-  ok(res2.ok === true, '第二次 release 也成功')
+  ok(res2 && res2.ok === true, '第二次 release 也成功')
   ok(h.injects.length === 1, '同一 (claimId, reader) 只投一次', JSON.stringify(h.injects.length))
   // 被去重挡下的那条也必须可见，reason 限于 already-pushed
   const n2 = res2.data.notify

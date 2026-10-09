@@ -369,7 +369,9 @@ console.log('# 4. claim 的 teamOverlaps：命中 / 不命中 / 服务缺席三�
     '服务缺席：同一 claim 也没有 teamOverlaps 键', Object.keys(r3.data || {}).join(','))
   const lockShape = (x) => JSON.stringify({
     ok: x.ok,
-    claimId: x.data.claim.claimId,
+    // 单元 C：claimId 带写者戳（`c_1@<writer>`），而写者戳是**环境差异**（两次 installStore
+    // 各有自己的戳，生产里就是两个进程）—— 比较前归一化掉，只比"分到了第几个 id"。
+    claimId: String(x.data.claim.claimId).replace(/@[^@]*$/, ''),
     holderId: x.data.claim.holderId,
     paths: x.data.claim.paths,
     mode: x.data.claim.mode,

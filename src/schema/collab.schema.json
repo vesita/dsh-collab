@@ -28,7 +28,9 @@
         "note": { "type": "string", "maxLength": 500 },
         "createdAt": { "type": "integer", "description": "创建时刻（Unix 毫秒）。" },
         "readable": { "type": "boolean", "default": true, "description": "可读性（0.8.0 功能 C）：true = 他人可读（默认），false = 他人读取也要先协商；写入对非持有者始终要协商。可选字段，兼容 0.7.0 之前的状态文件（缺省即可读）。" },
-        "readers": { "type": "array", "items": { "type": "string" }, "default": [], "description": "读者（0.8.0 功能 D，反向注册）：被本声明通知过的会话 holderId（agent:<id>）。缺省 []；移除时机只有两处：持有者释放（整条声明消失）、agent/disposed（dropHolder 摘掉登记 —— 会话被 dispose 之后往往还会恢复，故不称「会话结束」）。声明有**四条**回收路径：① 租约到期 expiresAt（sweep）—— 唯一无条件的一条；② 持有者显式 op=release；③ **句柄结束**（0.13.0，agent/disposed）—— 立即释放该 holder **全部未过期**声明，这一条**推翻了 0.9.6 起的 W7 取舍**（旧口径是「dispose 只回收已过期声明」）；④ 循环终止自动释放（0.9.10，agent/status → idle 且空闲超过宽限期，默认两分钟，可在 settings 关掉；触发者是「循环停了但 agent 还加载着」）。③④ 都留审计留言（频道 agent:<holderId>），恢复工作前必须重新 claim；③ 的残余风险如实记：dispose 后被恢复的会话会以为自己仍持锁。0.8.3 起 sweep() **不再**按 liveness 清理读者 —— agents.get() 对休眠但可唤回的会话返回 undefined，按它清理会静默丢掉通知。" }
+        "readers": { "type": "array", "items": { "type": "string" }, "default": [], "description": "读者（0.8.0 功能 D，反向注册）：被本声明通知过的会话 holderId（agent:<id>）。缺省 []；移除时机只有两处：持有者释放（整条声明消失）、agent/disposed（dropHolder 摘掉登记 —— 会话被 dispose 之后往往还会恢复，故不称「会话结束」）。声明有**四条**回收路径：① 租约到期 expiresAt（sweep）—— 唯一无条件的一条；② 持有者显式 op=release；③ **句柄结束**（0.13.0，agent/disposed）—— 立即释放该 holder **全部未过期**声明，这一条**推翻了 0.9.6 起的 W7 取舍**（旧口径是「dispose 只回收已过期声明」）；④ 循环终止自动释放（0.9.10，agent/status → idle 且空闲超过宽限期，默认两分钟，可在 settings 关掉；触发者是「循环停了但 agent 还加载着」）。③④ 都留审计留言（频道 agent:<holderId>），恢复工作前必须重新 claim；③ 的残余风险如实记：dispose 后被恢复的会话会以为自己仍持锁。0.8.3 起 sweep() **不再**按 liveness 清理读者 —— agents.get() 对休眠但可唤回的会话返回 undefined，按它清理会静默丢掉通知。" },
+        "seq": { "type": "integer", "minimum": 0, "description": "Lamport 逻辑时钟序号（单元 C）：写时 bump 过所见最大值。可选（0.16.0 之前的状态文件缺省 0）。记录 id 与全序都由 (seq, writer) 决定。" },
+        "writer": { "type": "string", "description": "写者戳（单元 C）：产生这条记录的进程身份。claimId 形如 c_<seq>@<writer>，两个写者撞同一个 seq 也不会撞 id。可选（老状态文件缺省空串）。" }
       }
     },
     "Message": {
@@ -42,7 +44,8 @@
         "author": { "type": "string", "description": "作者 holderId。" },
         "ts": { "type": "integer", "description": "发送时刻（Unix 毫秒）。" },
         "body": { "type": "string", "minLength": 1, "maxLength": 8000, "description": "消息正文。上限 8000 字符（与 collab-core 的 MESSAGE_BODY_MAX_CHARS 同值）：只封条数的 MAX_MESSAGES=2000 × 单条上限 ⇒ 最坏约 16MB，而不是「任意大」。超限由 post() 以 bad-request 显式挡回，**不静默截断**。" },
-        "replyTo": { "type": "string", "description": "回复的 msgId，可做成线程。" }
+        "replyTo": { "type": "string", "description": "回复的 msgId，可做成线程。" },
+        "writer": { "type": "string", "description": "写者戳（单元 C）：产生这条留言的进程身份。msgId 形如 m_<seq>@<writer>，两个写者撞同一个 seq 也不会撞 id。可选（老状态文件缺省空串，游标按 (seq, \"\") 处理）。" }
       }
     },
     "Holder": {
@@ -67,7 +70,9 @@
         "seq": { "type": "integer", "description": "全局单调序号，用于分配 claimId/msgId。" },
         "claims": { "type": "array", "items": { "$ref": "#/$defs/Claim" } },
         "messages": { "type": "array", "items": { "$ref": "#/$defs/Message" } },
-        "holders": { "type": "array", "items": { "$ref": "#/$defs/Holder" } }
+        "holders": { "type": "array", "items": { "$ref": "#/$defs/Holder" } },
+        "writer": { "type": "string", "description": "写者戳（单元 C）：最后一次落盘这份文档的写者身份。写路径每次写入前盖上自己的戳；写后验证据此判断「我的写入是否被别人覆盖了」（覆盖 ⇒ 重读 + 重合并 + 重试）。可选（老状态文件缺省空串 = 观测不到）。" },
+        "released": { "type": "object", "additionalProperties": { "type": "integer" }, "description": "终态墓碑表（单元 C）：claimId → 原租约 expiresAt。release / 自动释放 / reap 不再把声明从数组里删掉，而是记进这里 —— 删除在 join 下不单调（另一份旧副本会把记录带回来），墓碑才单调。claims 仍然只含有效记录，门控与全部视图不受影响。GC 确定性：原租约 expiresAt <= t 时由 sweep 丢掉。可选（老状态文件缺省为空表）。" }
       }
     },
     "ConflictInfo": {
@@ -139,7 +144,7 @@
         "channel": { "type": "string" },
         "body": { "type": "string", "maxLength": 8000, "description": "post 用，消息正文。上限 8000 字符（与 collab-core 的 MESSAGE_BODY_MAX_CHARS 同值）；超限由 post() 以 bad-request 挡回且整条不写入，不静默截断。" },
         "replyTo": { "type": "string" },
-        "since": { "type": "integer", "minimum": 0, "description": "read 用：省略或 0 = 读最新 limit 条（tail）；>0 = 从该 seq 往后读 limit 条（forward，旧→新）。返回的 nextSince 是下一次的游标。" },
+        "since": { "type": ["integer", "string"], "minimum": 0, "description": "read 用：省略或 0 = 读最新 limit 条（tail）；否则从该游标往后读 limit 条（forward，旧→新）。游标是**复合值** (seq, writer)：字符串写法 `<seq>@<writer>`（取返回的 nextCursor），数字写法（向后兼容）解释为 `(seq, \"\")`。返回的 nextCursor 是下一次的精确游标。" },
         "limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 }
       }
     }

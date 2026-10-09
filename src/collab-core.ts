@@ -105,7 +105,11 @@ export interface PostInput {
 /** board read 操作的输入参数。 */
 export interface ReadInput {
   channel?: string
-  since?: number
+  /**
+   * 游标。**复合值** `(seq, writer)`，序列化成 `"<seq>@<writer>"`；
+   * 数字是向后兼容写法，解释为 `(seq, "")`（见 parseCursor）。省略或 0 = tail 模式。
+   */
+  since?: number | string
   limit?: number
 }
 
@@ -219,6 +223,17 @@ export interface FilterMessagesResult {
   hasMore: boolean
   /** 下一次 read 的游标：本次返回的最后一条的 seq（一条都没返回时原样回传 since）。 */
   nextSince: number
+  /**
+   * 本次输入游标的**归一化复合形式** `<seq>@<writer>`。
+   * 数字入参（老调用方）归一化后 writer 为空串，即 `"5@"`。
+   */
+  cursor: string
+  /**
+   * 下一次 read 的**复合**游标 `<seq>@<writer>`：本次返回的最后一条的位置；
+   * 一条都没返回时原样回传输入游标。**无损翻页用它**（`nextSince` 在 seq 相撞时
+   * 不足以定位到"读到哪了"，会把同 seq 的另一位写者的记录再送一遍）。
+   */
+  nextCursor: string
   /** 这个筛选范围内**还留着**的最旧一条的 seq（0 = 一条都没有）。`since < earliestSeq` ⇒ 中间那段已被 MAX_MESSAGES 回收。 */
   earliestSeq: number
   messages: Message[]
@@ -280,7 +295,284 @@ export function cleanName(s: string): string {
   return n
 }
 
-export function init(): StateDocument { return { schemaVersion: 1, seq: 0, claims: [], messages: [], holders: [] } }
+// ---- 收敛层（单元 C）：写者戳、Lamport 序、半格 join ----
+//
+// 病根（2026-10 实测）：状态文件用 replaceIfVersion 写，而它是 probe → rename；dsh-fs-local 的
+// 串行化锁是**实例字段**（只在本进程内排队）⇒ 两个写者可以同时 probe 到同一个 version、各自
+// rename 都成功，后写者静默覆盖先写者（64MB 内容拉开窗口 + 文件屏障对齐，4/4 轮双成功 = 丢更新）。
+// 本单元不再靠锁，改成让状态本身**可收敛**：合并是半格 join —— 取两份副本并进来，谁也不丢。
+//
+// 三条不变量（由 tests/collab-convergence.mjs 正面验证）：
+//   1. `mergeDocs(a, b)` 是 join：交换律 / 结合律 / 幂等律（规范形见 `normalizeDoc`）；
+//   2. 记录 id 全局唯一：`c_<seq>@<writer>` / `m_<seq>@<writer>` —— 两个写者撞上同一个 seq
+//      也不会撞 id（Lamport 时钟只保证"不小于所见最大值"，唯一性靠写者戳）；
+//   3. 游标是 `(seq, writer)` 复合值：只给数字时解释为 `(n, "")`，**不漏**（至多重送同 seq 那批）。
+//
+// 终态（release）不是"从数组里删掉"，而是记进 `released` 墓碑表（claimId → 原 expiresAt）：
+// 删除在 join 下**不单调** —— 另一份旧副本会把记录带回来；墓碑才单调（有墓碑就赢）。
+// `claims` 因此仍然只含**有效**记录，于是门控（gate / host-shell）与全部视图一个字都不用改。
+//
+// 墓碑的 GC 规则必须是**确定性**的（否则两个副本收敛不到同一处）：原租约 `expiresAt <= t`
+// 时丢掉。从那一刻起，任何副本上的那条记录都已过期、在所有视图里不可见 —— 复活它无害。
+
+/** 一个文档的写者戳（写这份文档的进程身份）。缺字段（老状态文件）归一为空串。 */
+export function writerOf(s: StateDocument | null | undefined): string {
+  return s && typeof s.writer === 'string' ? s.writer : ''
+}
+
+/** `(seq, writer)` 全序：先 seq（数字），再 writer（字符串）。游标与记录排序共用这一条判据。 */
+export function compareSeqWriter(aSeq: unknown, aWriter: unknown, bSeq: unknown, bWriter: unknown): number {
+  const x = Number(aSeq) || 0, y = Number(bSeq) || 0
+  if (x !== y) return x < y ? -1 : 1
+  const aw = typeof aWriter === 'string' ? aWriter : ''
+  const bw = typeof bWriter === 'string' ? bWriter : ''
+  if (aw === bw) return 0
+  return aw < bw ? -1 : 1
+}
+
+/**
+ * 记录 id：`<prefix><seq>@<writer>`。
+ * 没有写者戳时（纯逻辑语料、0.16.0 之前写下的老记录）退回老形状 `<prefix><seq>`
+ * —— 老语料与老断言因此一字不变；生产路径上写者戳恒非空，id 因此全局唯一。
+ */
+export function recordId(prefix: string, seq: number, writer: unknown): string {
+  const w = typeof writer === 'string' ? writer : ''
+  return prefix + seq + (w ? '@' + w : '')
+}
+
+// ---- 逐记录 / 逐字段的 join ----
+//
+// 每一类记录都在**每个字段**上各自取一个 join（取大 / 取小 / 求并），而不是"整条记录二选一"。
+// 为什么必须逐字段：整条二选一不是 join —— 当两份记录的排序键不同时，"取键大的那条"会丢掉
+// 另一份独有的字段更新（并发续租的 expiresAt、并发登记的 readers），而且取键大的**不满足
+// 结合律**（a > b 时丢掉 b 的信息，再与 c 合并时的结果与先合并 b、c 不同）。逐字段则天然是
+// 积格（product lattice）：每个字段各自满足交换/结合/幂等 ⇒ 整个合并满足。
+
+/** 数字取大；缺省当 0（`undefined` 视为该字段的底）。 */
+function joinMaxNum(a: unknown, b: unknown): number { return Math.max(Number(a) || 0, Number(b) || 0) }
+
+/** 数字取小；缺省当 0。用于 createdAt（创建时刻只能"更早"，不能被后到的副本推后）。 */
+function joinMinNum(a: unknown, b: unknown): number { return Math.min(Number(a) || 0, Number(b) || 0) }
+
+/** 字符串取大（字典序）；`undefined` 是底，有值的一方胜出。 */
+function joinMaxStr(a: string | undefined, b: string | undefined): string | undefined {
+  if (a === undefined) return b
+  if (b === undefined) return a
+  return a >= b ? a : b
+}
+
+/** 可选布尔取"与"（false 优先 = 更严格的可见性不会被翻松）。 */
+function joinAndBool(a: boolean | undefined, b: boolean | undefined): boolean | undefined {
+  if (a === undefined && b === undefined) return undefined
+  return a !== false && b !== false
+}
+
+/** 字符串集合求并，按字典序排 —— 规范序是交换律/结合律的一部分（数组顺序不能带进结果）。 */
+function joinStrSet(a: string[] | undefined, b: string[] | undefined): string[] | undefined {
+  if (a === undefined && b === undefined) return undefined
+  const out: string[] = []
+  for (const x of (a || []).concat(b || [])) if (typeof x === 'string' && !out.includes(x)) out.push(x)
+  out.sort()
+  return out
+}
+
+/** 可选数字取大；两边都缺省时保持缺省（不凭空造字段，否则幂等律的"规范形"就不唯一）。 */
+function joinOptNum(a: number | undefined, b: number | undefined): number | undefined {
+  if (a === undefined) return b
+  if (b === undefined) return a
+  return Math.max(Number(a) || 0, Number(b) || 0)
+}
+
+/** 声称的逐字段 join（同 claimId 的两份）。 */
+function joinClaim(a: Claim, b: Claim): Claim {
+  const out: Claim = {
+    claimId: a.claimId,
+    holderId: joinMaxStr(a.holderId, b.holderId) || '',
+    paths: joinStrSet(a.paths, b.paths) || [],
+    mode: ((joinMaxStr(a.mode, b.mode) || a.mode || b.mode) || 'exclusive') as Mode,
+    ttlSec: joinMaxNum(a.ttlSec, b.ttlSec),
+    expiresAt: joinMaxNum(a.expiresAt, b.expiresAt),
+    createdAt: joinMinNum(a.createdAt, b.createdAt)
+  }
+  const holderName = joinMaxStr(a.holderName, b.holderName)
+  if (holderName !== undefined) out.holderName = holderName
+  const note = joinMaxStr(a.note, b.note)
+  if (note !== undefined) out.note = note
+  const readable = joinAndBool(a.readable, b.readable)
+  if (readable !== undefined) out.readable = readable
+  const readers = joinStrSet(a.readers, b.readers)
+  if (readers !== undefined) out.readers = readers
+  const seq = joinOptNum(a.seq, b.seq)
+  if (seq !== undefined) out.seq = seq
+  const writer = joinMaxStr(a.writer, b.writer)
+  if (writer !== undefined) out.writer = writer
+  return out
+}
+
+/** 留言的逐字段 join（同 msgId 的两份；生产里内容逐字节相同，这里只求"确定且成律"）。 */
+function joinMessage(a: Message, b: Message): Message {
+  const out: Message = {
+    msgId: a.msgId,
+    seq: joinMaxNum(a.seq, b.seq),
+    channel: joinMaxStr(a.channel, b.channel) || a.channel || b.channel || 'general',
+    author: joinMaxStr(a.author, b.author) || a.author || b.author || '',
+    ts: joinMaxNum(a.ts, b.ts),
+    body: joinMaxStr(a.body, b.body) || a.body || b.body || ''
+  }
+  const replyTo = joinMaxStr(a.replyTo, b.replyTo)
+  if (replyTo !== undefined) out.replyTo = replyTo
+  const writer = joinMaxStr(a.writer, b.writer)
+  if (writer !== undefined) out.writer = writer
+  return out
+}
+
+/** 名册行的逐字段 join（同 holderId 的两份；lastSeenAt 取大，进程章有值者胜出）。 */
+function joinHolder(a: Holder, b: Holder): Holder {
+  const out: Holder = {
+    holderId: a.holderId,
+    name: joinMaxStr(a.name, b.name) || '',
+    kind: ((joinMaxStr(a.kind, b.kind) || a.kind || b.kind) || 'agent') as Holder['kind']
+  }
+  const sessionId = joinMaxStr(a.sessionId, b.sessionId)
+  if (sessionId !== undefined) out.sessionId = sessionId
+  const lastSeenAt = joinOptNum(a.lastSeenAt, b.lastSeenAt)
+  if (lastSeenAt !== undefined) out.lastSeenAt = lastSeenAt
+  const proc = joinMaxStr(a.proc, b.proc)
+  if (proc !== undefined) out.proc = proc
+  return out
+}
+
+/** 按 id 把一组记录折叠成逐字段 join（同一 id 的多份全部并进来，不是二选一）。 */
+function foldBy<T>(rows: T[], idOf: (x: T) => string, join: (a: T, b: T) => T): T[] {
+  const at = new Map<string, number>()
+  const out: T[] = []
+  for (const x of rows) {
+    if (!x || typeof x !== 'object') continue
+    const id = idOf(x)
+    if (!id) continue
+    const i = at.get(id)
+    if (i === undefined) { at.set(id, out.length); out.push(join(x, x)) }
+    else out[i] = join(out[i], x)
+  }
+  return out
+}
+
+/**
+ * 规范形：把任意（可能缺字段、可能是老布局的）文档补成 mergeDocs 的输入/输出形状。
+ *
+ * 规范化包含四件事：① 标量补默认；② 同 id 的记录逐字段 join 折叠（重复 id 不丢字段）；
+ * ③ 剔除墓碑表里那些 id 的声明；④ 全部数组按**确定性顺序**排序（claims/messages 按
+ * `(seq, writer)` 再按 id，holders 按 holderId，记录内的 paths/readers 按字典序）。
+ *
+ * **它就是幂等律里的"规范形"**：`mergeDocs(a, a)` 逐字段等于 `normalizeDoc(a)` —— 因为
+ * mergeDocs 的输出本来就是"对 a 与 b 的所有记录逐字段 join 后再规范化"。
+ */
+export function normalizeDoc(s: StateDocument | null | undefined): StateDocument {
+  const src = (s && typeof s === 'object' ? s : {}) as Record<string, unknown>
+  const released: Record<string, number> = {}
+  const rawRel = src.released
+  if (rawRel && typeof rawRel === 'object' && !Array.isArray(rawRel)) {
+    // 键也要**规范序**（排序）：否则同一组墓碑因插入顺序不同会序列化成不同文本，
+    // 而"合并是 join"要能被逐字节比较（见 mergeDocs 的注释）。
+    for (const id of Object.keys(rawRel as Record<string, unknown>).sort()) {
+      if (!id) continue
+      released[id] = Number((rawRel as Record<string, unknown>)[id]) || 0
+    }
+  }
+  const rawClaims = Array.isArray(src.claims) ? (src.claims as Claim[]) : []
+  const claims = foldBy(rawClaims, c => (typeof c.claimId === 'string' ? c.claimId : ''), joinClaim)
+    .filter(c => !(c.claimId in released))
+  claims.sort((x, y) => compareSeqWriter(x.seq, x.writer, y.seq, y.writer) || (x.claimId < y.claimId ? -1 : x.claimId > y.claimId ? 1 : 0))
+  const rawMessages = Array.isArray(src.messages) ? (src.messages as Message[]) : []
+  const messages = foldBy(rawMessages, m => (typeof m.msgId === 'string' ? m.msgId : ''), joinMessage)
+  messages.sort((x, y) => compareSeqWriter(x.seq, x.writer, y.seq, y.writer) || (x.msgId < y.msgId ? -1 : x.msgId > y.msgId ? 1 : 0))
+  const rawHolders = Array.isArray(src.holders) ? (src.holders as Holder[]) : []
+  const holders = foldBy(rawHolders, h => (typeof h.holderId === 'string' ? h.holderId : ''), joinHolder)
+  holders.sort((x, y) => (x.holderId < y.holderId ? -1 : x.holderId > y.holderId ? 1 : 0))
+  return {
+    schemaVersion: 1,
+    seq: Number(src.seq) || 0,
+    writer: typeof src.writer === 'string' ? src.writer : '',
+    claims, messages, holders, released
+  }
+}
+
+/** 墓碑表求并：同一个 claimId 取**较大**的 expiresAt（join）。 */
+function mergeReleased(a: Record<string, number>, b: Record<string, number>): Record<string, number> {
+  const out: Record<string, number> = {}
+  for (const src of [a, b]) {
+    for (const id of Object.keys(src)) {
+      const v = Number(src[id]) || 0
+      const cur = out[id]
+      out[id] = cur === undefined || v > cur ? v : cur
+    }
+  }
+  return out
+}
+
+/** 给若干条声明立墓碑（claimId → 原 expiresAt）—— **所有**把声明从 `claims` 里拿掉的路径
+ *  都必须走这里，否则"删掉"在 join 下不单调，会被旧副本翻案。
+ *  只加不减、同键取 max，所以它本身也是单调的。 */
+function bury(s: StateDocument, claims: Claim[]): void {
+  if (!Array.isArray(claims) || !claims.length) return
+  if (!s.released || typeof s.released !== 'object') s.released = {}
+  for (const c of claims) {
+    if (!c || typeof c.claimId !== 'string' || !c.claimId) continue
+    const exp = Number(c.expiresAt) || 0
+    const cur = s.released[c.claimId]
+    s.released[c.claimId] = cur === undefined || exp > cur ? exp : cur
+  }
+}
+
+/**
+ * **半格 join**：`mergeDocs(a, b)` = a 与 b 的最小上界。
+ *
+ * 实现只有两步：把两边的记录**直接拼接**，再交给 `normalizeDoc`（它按 id 逐字段 join 折叠、
+ * 剔除墓碑、排成规范序）。于是三条律由构造保证，而不是靠逐例验证：
+ *   · 交换律 —— 拼接的顺序不影响结果（逐字段 join 与排序都与顺序无关）；
+ *   · 结合律 —— 逐字段 join 结合，而"折叠 + 规范化"是这组 join 的一个截面；
+ *   · 幂等律 —— `mergeDocs(a, a)` = 对 a 的记录各自自并 = `normalizeDoc(a)`。
+ *
+ * 分量语义：`seq` 取 max（Lamport：不小于两边所见最大）；`writer` 取字典序 max（只为确定性，
+ * 写盘前由写路径盖上**本次写者**的戳）；`released` 求并（墓碑单调：一旦终态就永远终态，
+ * 因此"已释放"不会被还握着旧副本的写者翻案）；claims/messages/holders 按 id 逐字段 join
+ * （见 joinClaim / joinMessage / joinHolder）。输出是规范序，可直接逐字节比较。
+ */
+export function mergeDocs(a: StateDocument, b: StateDocument): StateDocument {
+  const A = normalizeDoc(a), B = normalizeDoc(b)
+  return normalizeDoc({
+    schemaVersion: 1,
+    seq: joinMaxNum(A.seq, B.seq),
+    writer: joinMaxStr(A.writer, B.writer) || '',
+    claims: (A.claims || []).concat(B.claims || []),
+    messages: (A.messages || []).concat(B.messages || []),
+    holders: (A.holders || []).concat(B.holders || []),
+    released: mergeReleased(A.released || {}, B.released || {})
+  })
+}
+
+/** 复合游标 `(seq, writer)`：按这个位置读"严格在其后"的记录。 */
+export interface Cursor { seq: number; writer: string }
+
+/**
+ * 解析游标。`number`（老调用方）⇒ `(n, "")`；`"<seq>@<writer>"` ⇒ 原样；
+ * 无法解析（空串、乱写）⇒ `(0, "")`（= tail 模式）。**绝不抛**：游标是输入，不是不变量。
+ */
+export function parseCursor(v: unknown): Cursor {
+  if (typeof v === 'number' && Number.isFinite(v)) return { seq: Math.max(0, Math.floor(v)), writer: '' }
+  const s = typeof v === 'string' ? v.trim() : ''
+  if (!s) return { seq: 0, writer: '' }
+  const at = s.indexOf('@')
+  const head = at < 0 ? s : s.slice(0, at)
+  const n = Number(head)
+  if (!Number.isFinite(n) || n < 0) return { seq: 0, writer: '' }
+  return { seq: Math.floor(n), writer: at < 0 ? '' : s.slice(at + 1) }
+}
+
+/** 把游标序列化成磁盘/返回值上的形状：`"<seq>@<writer>"`。 */
+export function cursorKey(c: Cursor): string { return c.seq + '@' + c.writer }
+
+export function init(): StateDocument { return { schemaVersion: 1, seq: 0, writer: '', claims: [], messages: [], holders: [], released: {} } }
 
 // 状态膨胀上限：留言保留最近 MAX_MESSAGES 条，holder 在无活跃声明且 24h 未出现时回收。
 // 两者都由 sweep() 在每次读/写前惰性执行，保证状态文件不会无限增长。
@@ -370,6 +662,14 @@ export function sweep(s: StateDocument, t: number, opts: SweepOptions = {}): Swe
   const beforeClaims = s.claims.length
   s.claims = s.claims.filter(c => c.expiresAt > t)
   const expiredClaims = beforeClaims - s.claims.length
+  // 终态墓碑的**确定性** GC（见收敛层注释）：原租约 `expiresAt <= t` ⇒ 丢掉墓碑。
+  // 判据只看"数据里的 expiresAt"与传入的 t，不看本地计数/插入顺序/随机 —— 同一份数据
+  // 在任何副本上得到同一结果。丢掉的那一刻起，任何副本上的那条记录都已过期、在所有视图里
+  // 不可见（gate 与 list/overview/wait 都按 expiresAt 过滤），复活它无害。
+  const rel = s.released
+  if (rel && typeof rel === 'object') {
+    for (const id of Object.keys(rel)) if (!(Number(rel[id]) > t)) delete rel[id]
+  }
 
   let droppedMessages = 0
   if (s.messages.length > maxMessages) {
@@ -768,7 +1068,7 @@ export function dropHolder(state: StateDocument, holderId: string, t: number): O
   const expired = (c: Claim): boolean => c.holderId === holderId && c.expiresAt <= t
   const rel = state.claims.filter(expired)
   let changed = rel.length > 0
-  if (rel.length) state.claims = state.claims.filter(c => !expired(c))
+  if (rel.length) { state.claims = state.claims.filter(c => !expired(c)); bury(state, rel) }
   for (const c of state.claims) {
     const list = readersOf(c)
     if (!list.includes(holderId)) continue
@@ -830,15 +1130,18 @@ export function releaseOnLoopEnd(state: StateDocument, holderId: string, holderN
   const mine = state.claims.filter(c => c.holderId === holderId && c.expiresAt > t)
   if (!mine.length) return { ok: true, changed: false, data: { released: [] } }
   state.claims = state.claims.filter(c => !mine.includes(c))
+  bury(state, mine)
   const released = mine.map(publish)
   // 路径去重保序后折叠：与通知文案同一口径（最多列 3 条，其余计数）。
   const uniq: string[] = []
   for (const c of released) for (const p of c.paths) if (!uniq.includes(p)) uniq.push(p)
   const shown = uniq.slice(0, 3).join(' ') + (uniq.length > 3 ? ' 等 ' + uniq.length + ' 条' : '')
   const who = holderLabel(holderId, holderName)
+  const w = writerOf(state)
+  const n = ++state.seq
   const m: Message = {
-    msgId: 'm_' + (++state.seq),
-    seq: state.seq,
+    msgId: recordId('m_', n, w),
+    seq: n,
     channel: holderId,
     author: AUTO_RELEASE_AUTHOR,
     ts: t,
@@ -848,6 +1151,7 @@ export function releaseOnLoopEnd(state: StateDocument, holderId: string, holderN
       : '[自动释放] ' + who + ' 的会话循环已结束（空闲超过 ' + graceSec + ' 秒），其对 ' + shown +
         ' 的声明已被自动释放。恢复工作前如需写入这些路径，请重新 collab_lock op=claim。'
   }
+  if (w) m.writer = w
   state.messages.push(m)
   return { ok: true, changed: true, state, data: { released, notice: m } }
 }
@@ -987,27 +1291,41 @@ export function claim(state: StateDocument, h: HolderInput, a: ClaimInput, tNow:
     if (a.readable !== undefined && a.readable !== null) own.readable = readable
     cl = own
   }
-  else { cl = { claimId: 'c_' + (++state.seq), holderId: h.holderId, holderName: h.name, paths, mode, ttlSec: ttl, expiresAt, note, createdAt: t, readable, readers: [] }; state.claims.push(cl) }
+  else {
+    // Lamport：`state.seq` 在写路径上已经是「盘上 ∪ 我的副本」的最大值（见 state-core 的
+    // merge 基），这里 +1 就是"写时 bump 过所见最大值"。唯一性另由写者戳保证：两个写者
+    // 即使撞上同一个 seq，id 也因 `@<writer>` 而不同。
+    const w = writerOf(state)
+    const n = ++state.seq
+    cl = { claimId: recordId('c_', n, w), holderId: h.holderId, holderName: h.name, paths, mode, ttlSec: ttl, expiresAt, note, createdAt: t, readable, readers: [], seq: n, writer: w }
+    state.claims.push(cl)
+  }
   let warn: string | null = null
   if (ttl < 60) warn = 'short-lease: ttl=' + ttl + 's（<60s）; 请按时 heartbeat 续租，避免过期' + (merged ? '；已并入你现有声明' : '')
   return { ok: true, changed: true, state, tNow, data: { claim: publish(cl), serverTime: t, merged, warning: warn } }
 }
 
 // 释放。a = {claimId?} 或 {paths?}。返回 {ok,changed,state,data}。
+//
+// **终态化**（单元 C）：释放不再"从数组里删掉"，而是把命中的声明从 `claims` 移到
+// `released` 墓碑表（claimId → 原 expiresAt）。理由见收敛层注释：删除在 join 下不单调 ——
+// 另一份还握着旧副本的写者会把那条声明并回盘上；墓碑才单调（有墓碑就赢）。
+// 对外形状一字不变：`claims` 里不再有它，`data.released` 仍是那几条的公开视图。
 export function release(state: StateDocument, h: HolderInput, a: ReleaseInput, tNow: Clock): OpResult {
   const t = tNow(); let rel: Claim[] = []
   if (a.claimId) {
     const c = state.claims.find(x => x.claimId === a.claimId)
     if (!c) return { ok: false, changed: false, state, tNow, data: { error: 'not-found', message: 'no claim ' + a.claimId } }
     if (c.holderId !== h.holderId) return { ok: false, changed: false, state, tNow, data: { error: 'forbidden', message: 'only holder can release' } }
-    state.claims = state.claims.filter(x => x.claimId !== a.claimId); rel = [c]
+    rel = [c]
   } else {
     const paths = (Array.isArray(a.paths) ? a.paths : []).map(norm).filter(Boolean)
     if (!paths.length) return { ok: false, changed: false, state, tNow, data: { error: 'bad-request', message: 'claimId or paths required' } }
     rel = state.claims.filter(c => c.holderId === h.holderId && c.paths.some(cp => paths.some(p => ov(p, cp))))
     if (!rel.length) return { ok: true, changed: false, state, tNow, data: { released: [], serverTime: t } }
-    state.claims = state.claims.filter(c => !rel.includes(c))
   }
+  state.claims = state.claims.filter(c => !rel.includes(c))
+  bury(state, rel)
   return { ok: true, changed: true, state, tNow, data: { released: rel.map(publish), serverTime: t } }
 }
 
@@ -1092,6 +1410,8 @@ export function reap(s: StateDocument, h: HolderInput, a: ReapInput, liveHolderI
     return { ok: true, changed: false, state: s, data: Object.assign({ dryRun: false }, base, { reaped: [], reapedHolders: [] }) }
   }
   s.claims = s.claims.filter(c => !hits.includes(c))
+  // reap（显式回收僵尸）也是"把声明拿掉"，同样立墓碑：否则被回收的声明会被另一份旧副本并回来。
+  bury(s, hits)
   const reapedHolders: string[] = []
   if (!unknown) {
     s.holders = s.holders.filter(hh => {
@@ -1141,7 +1461,10 @@ export function post(state: StateDocument, h: HolderInput, a: PostInput, tNow: C
     return { ok: false, changed: false, state, tNow, data: { error: 'bad-request', message: 'body 过长：' + body.length + ' 字符 > 上限 ' + MESSAGE_BODY_MAX_CHARS + '；本条**没有写入**，超限不截断，请精简或拆分后重发' } }
   }
   holder(state, h, h.name, tNow)
-  const m: Message = { msgId: 'm_' + (++state.seq), seq: state.seq, channel: (typeof a.channel === 'string' && a.channel.trim()) ? a.channel.trim() : 'general', author: h.holderId, ts: tNow(), body }
+  const w = writerOf(state)
+  const n = ++state.seq
+  const m: Message = { msgId: recordId('m_', n, w), seq: n, channel: (typeof a.channel === 'string' && a.channel.trim()) ? a.channel.trim() : 'general', author: h.holderId, ts: tNow(), body }
+  if (w) m.writer = w
   if (typeof a.replyTo === 'string' && a.replyTo) m.replyTo = a.replyTo
   state.messages.push(m)
   return { ok: true, changed: true, state, tNow, data: { msgId: m.msgId, seq: state.seq, ts: m.ts, channel: m.channel, delivered: false, deliveryNote: BOARD_NO_DELIVERY_HINT } }
@@ -1181,14 +1504,25 @@ export function related(state: StateDocument, paths: string[]): Claim[] {
 // `hasMore` = 沿本模式的方向**还有更多没返回**（tail 是"更早的还有"，forward 是"更新的还有"）；
 // `earliestSeq` / `latestSeq` 是可用范围的下界/上界，调用方据此知道窗口落在哪一段。
 export function filterMessages(state: StateDocument, a: ReadInput): FilterMessagesResult {
-  const since = Number(a.since) || 0, limit = Math.max(1, Math.min(200, Number(a.limit) || 50))
+  const cur = parseCursor(a.since)
+  const since = cur.seq
+  const limit = Math.max(1, Math.min(200, Number(a.limit) || 50))
   const ch = typeof a.channel === 'string' && a.channel.trim() ? a.channel.trim() : null
   const l = ch ? state.messages.filter(m => m.channel === ch) : state.messages
-  const matched = l.filter(m => m.seq > since)
+  // 游标是**复合**的 `(seq, writer)` 全序位置，"严格在其后"。数字入参归一成 `(n, "")`
+  // —— 与老语义（`seq > n`）在"记录没有写者戳"时逐条一致；带写者戳的记录若 seq 恰好等于 n，
+  // 会被**再送一遍**（不丢，至多重送）。要精确定位"读到哪了"，用返回的 nextCursor。
+  const matched = l.filter(m => compareSeqWriter(m.seq, m.writer, cur.seq, cur.writer) > 0)
   const mode: 'tail' | 'forward' = since > 0 ? 'forward' : 'tail'
   const returned = mode === 'forward' ? matched.slice(0, limit) : matched.slice(-limit)
   const hasMore = matched.length > returned.length
-  const nextSince = returned.length ? returned[returned.length - 1].seq : since
+  const last = returned.length ? returned[returned.length - 1] : null
+  const nextSince = last ? (Number(last.seq) || 0) : since
+  // 无损翻页要用 nextCursor：`nextSince` 只带 seq，seq 相撞时定位不到"读到哪一位写者了"。
+  const cursor = cursorKey(cur)
+  const nextCursor = last
+    ? cursorKey({ seq: Number(last.seq) || 0, writer: typeof last.writer === 'string' ? last.writer : '' })
+    : (typeof a.since === 'string' && a.since ? a.since : String(since))
   // earliestSeq = 这个筛选范围内**还留着**的最旧一条（0 = 一条都没有）。调用方 `since` 小于它，
   // 说明那段已被 sweep 的 MAX_MESSAGES 回收 —— 与"那段时间没人留言"在返回值上可区分。
   const earliestSeq = l.length ? l[0].seq : 0
@@ -1196,7 +1530,7 @@ export function filterMessages(state: StateDocument, a: ReadInput): FilterMessag
   // 文档写 `agent:<holderId>` 而 holderId 本身已是 `agent:…`（于是读 0 条）、path 频道少个尾斜杠
   // （于是读 0 条）。空结果时把现有频道如实列出来，调用方一眼看出自己该写哪个。
   const channelNote = ch && matched.length === 0 && state.messages.length ? channelRosterNote(state) : undefined
-  const out: FilterMessagesResult = { since, mode, returned: returned.length, total: matched.length, hasMore, nextSince, earliestSeq, latestSeq: state.messages.length ? state.messages[state.messages.length - 1].seq : 0, messages: returned }
+  const out: FilterMessagesResult = { since, mode, returned: returned.length, total: matched.length, hasMore, nextSince, cursor, nextCursor, earliestSeq, latestSeq: state.messages.length ? state.messages[state.messages.length - 1].seq : 0, messages: returned }
   if (channelNote) out.channelNote = channelNote
   return out
 }

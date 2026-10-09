@@ -46,6 +46,10 @@ export interface StateCorePure {
   blockers(s: StateDocument, t: number, h: HolderInput, paths: string[]): Claim[]
   reap(s: StateDocument, h: HolderInput, a: ReapInput, liveHolderIds: string[] | null, t: number): OpResult
   norm(p: string): string | null
+  /** 单元 C：半格 join（收敛的唯一事实源在 collab-core）。 */
+  mergeDocs(a: StateDocument, b: StateDocument): StateDocument
+  /** 单元 C：规范形（补字段、规范序、墓碑表归一）。 */
+  normalizeDoc(s: StateDocument | null | undefined): StateDocument
   HOLDER_VIEW_LIMIT: number
 }
 
@@ -83,6 +87,15 @@ export interface StateCorePorts {
   /** collab-core 的纯函数面（唯一事实源）。 */
   core: StateCorePure
   now(): number
+  /**
+   * **本写者的身份戳**（单元 C）：每进程稳定、唯一。它有两个用处，缺一不可 ——
+   *   1. 记录 id 的全局唯一性（`c_<seq>@<writer>`）：Lamport 时钟只保证"不小于所见最大值"，
+   *      两个写者撞同一个 seq 是正常的，唯一性只能靠写者戳；
+   *   2. **写后验证**：落盘成功不代表内容还在盘上（replaceIfVersion 是 probe → rename，
+   *      两个写者可以同时 probe 成功），所以写完要重读主文件、确认盘上的写者戳还是我自己。
+   * 空串 = 该形态给不出身份（此时写后验证自动跳过，行为退回到不验证）。
+   */
+  writerId: string
   targetFor(agentId: string | null, agent?: AgentLike): Promise<StateTarget>
   /**
    * 历史落点的候选列表（按优先级）。包形态给三代落点；外壳只有第一代项目内单文件；
@@ -147,12 +160,14 @@ export function sidecarNameOf(fileName: string): string {
 
 /** 主文件那一半。**不含 messages**：迁移之后主文件里永远不会再有这个键。 */
 function mainDocOf(s: StateDocument): Record<string, unknown> {
-  return { schemaVersion: s.schemaVersion, seq: s.seq, claims: s.claims, holders: s.holders }
+  // 单元 C：写者戳（写后验证的判据）与终态墓碑表都属于"锁状态"这一半 —— 放进主文件，
+  // 与 claims 一起被每次写盘带上。
+  return { schemaVersion: s.schemaVersion, seq: s.seq, writer: s.writer || '', claims: s.claims, holders: s.holders, released: s.released || {} }
 }
 
 /** 旁挂那一半。 */
 function sideDocOf(s: StateDocument): Record<string, unknown> {
-  return { schemaVersion: s.schemaVersion, seq: s.seq, messages: s.messages }
+  return { schemaVersion: s.schemaVersion, seq: s.seq, writer: s.writer || '', messages: s.messages }
 }
 
 /**
@@ -172,29 +187,19 @@ function msgFingerprint(msgs: Message[]): string {
 }
 
 /**
- * 两份留言按 `msgId` 求**并集**、按 `seq` 升序（0.16.0，R2 残留修）。
+ * 两份留言按 `msgId` 求**并集**、按 `(seq, writer)` 升序（0.16.0，R2 残留修；单元 C 起直接
+ * 复用 `core.mergeDocs` 的 messages 分量 —— 求并的胜负判据只有一份实现，不再手抄）。
  *
  * 为什么不是"主文件说了算"：滚动升级期间**同一份状态会被两个版本交替写** —— 旧版把留言写主文件、
  * 新版写旁挂。任何"以某一边为准"的加载都会在下次写盘时把另一边的留言整批覆盖掉（= 静默丢留言）。
- * 同 msgId 以**先出现**的那份为准（本插件的 msgId 唯一，内容应当逐字节相同，这里只是取一个确定值）；
- * 没有 msgId 的条目（不该出现）原样保留，不参与去重。
+ * 同 msgId 取 `(seq, writer)` 较大者（本插件的 msgId 唯一，内容应当逐字节相同，这里只是取一个
+ * 确定值）；没有 msgId 的条目（不该出现）原样保留，不参与去重。
  */
-function unionMessages(first: Message[], second: Message[]): Message[] {
-  const seen = new Set<string>()
-  const out: Message[] = []
-  const add = (m: Message): void => {
-    if (!m || typeof m !== 'object') return
-    const id = typeof m.msgId === 'string' && m.msgId ? m.msgId : null
-    if (id !== null) {
-      if (seen.has(id)) return
-      seen.add(id)
-    }
-    out.push(m)
-  }
-  for (const m of first) add(m)
-  for (const m of second) add(m)
-  out.sort((x, y) => (Number(x.seq) || 0) - (Number(y.seq) || 0))
-  return out
+function unionMessages(core: StateCorePure, first: Message[], second: Message[]): Message[] {
+  return core.mergeDocs(
+    Object.assign(core.init(), { messages: first }),
+    Object.assign(core.init(), { messages: second })
+  ).messages
 }
 
 /** 把任意抛出物转成一行可读文本（warning 里要带真实原因，不能只写「失败了」）。 */
@@ -322,6 +327,10 @@ export function createStateCore(ports: StateCorePorts): StateCore {
   // 老口径（fail-closed：漏收只是维持现状，误收会删掉活会话的行）。
   // 受限动态宿主给不出这个能力 ⇒ 注入面返回 null，外壳的行为与"拿不到进程身份"完全一致。
   const PROC_TOKEN = typeof ports.selfProcToken === 'function' ? ports.selfProcToken() : null
+
+  // 本实例的写者戳（单元 C）：由环境面注入，每进程稳定唯一。空串 ⇒ 该形态给不出身份，
+  // 记录 id 退回老形状、写后验证也自动跳过（行为退回到"不验证"，但绝不误报被覆盖）。
+  const WRITER_ID: string = typeof ports.writerId === 'string' ? ports.writerId : ''
 
   // 每次 sweep **现算**：判据只看 state 里实际出现过的那几个进程，不引入定时器、不做全表扫描。
   const sweepOpts = (state: StateDocument): SweepOptions => {
@@ -465,12 +474,24 @@ export function createStateCore(ports: StateCorePorts): StateCore {
     // R2 残留修）：跨版本滚动升级期间，旧版写主文件、新版写旁挂，任何"以某一边为准"都会
     // 在下次写盘时把另一边整批覆盖掉。同 msgId 以主文件那份为准，顺序按 seq 升序。
     const messagesInMain = !!(parsed && Array.isArray(parsed.messages))
-    if (messagesInMain && sideMessages) s.messages = unionMessages(parsed.messages, sideMessages)
+    if (messagesInMain && sideMessages) s.messages = unionMessages(core, parsed.messages, sideMessages)
     else if (messagesInMain) s.messages = parsed.messages
     else if (sideMessages) s.messages = sideMessages
     else s.messages = []
     // seq 是 claimId 与 msgId 共用的计数器：取两边的较大值，避免复用已发过的 id。
     s.seq = Math.max(Number(parsed && parsed.seq) || 0, sideSeq)
+    // 写者戳（单元 C）：主文件那一半说了算；缺字段（老状态文件）归一为空串 = "观测不到"。
+    s.writer = parsed && typeof parsed.writer === 'string' ? parsed.writer : ''
+    // 终态墓碑表（单元 C）：缺字段（老状态文件）归一为空表。只认纯数字值，坏值当 0（= 立即可回收）。
+    const relRaw = parsed && parsed.released
+    const released: Record<string, number> = {}
+    if (relRaw && typeof relRaw === 'object' && !Array.isArray(relRaw)) {
+      for (const id of Object.keys(relRaw as Record<string, unknown>)) {
+        if (!id) continue
+        released[id] = Number((relRaw as Record<string, unknown>)[id]) || 0
+      }
+    }
+    s.released = released
     s.claims = Array.isArray(s.claims) ? s.claims : []
     s.messages = Array.isArray(s.messages) ? s.messages : []
     s.holders = Array.isArray(s.holders) ? s.holders : []
@@ -505,18 +526,26 @@ export function createStateCore(ports: StateCorePorts): StateCore {
   }
 
   /**
-   * 读改写事务：load → sweep → op → writeState，写失败按乐观并发冲突重读重试（最多 5 轮）。
+   * 读改写事务：load → merge(盘上, 我的副本) → sweep → op → 写盘 → **写后验证**；
+   * 写失败（乐观并发冲突）或验证发现被覆盖时，重读 + 重合并 + 重试（最多 5 轮）。
    *
    * 0.15.0（R2 残留）：`sweep()` 在**读路径**只清内存、在**写路径**把清理结果落盘 —— 包括
    * 该 op 自己 `changed:false` 的情形（否则反复 release 不存在的路径 / reap dry-run / reader
    * 已登记这几条路径会让磁盘长期留着已清理的内容，**视图与磁盘长期不一致**）。
    * 这一条过去**只有包形态**有，外壳形态漏了；现在两形态共用本函数，不再有第二个口径。
+   *
+   * 单元 C（载荷收敛）：合并与截断的**顺序**是硬约束 —— 先 join、**再**截断留言。反过来
+   * （各自先截一半）会让两个副本截出不同的尾巴，来回抖动、永不收敛。合并之后的截断由
+   * `sweep()` 用同一条确定性规则（条数 / 字节预算，都丢最旧）施加，因此两边结果相同。
    */
   async function mutate(fn: (s: StateDocument) => OpResult, agentId: string | null, agent?: AgentLike): Promise<ToolResult> {
     for (let i = 0; i < 5; i++) {
       const { state, version, target, sidecar, sideVersion, messagesInMain } = await load(agentId, agent)
       // 跑 op **之前**取留言指纹：sweep() 也会截断留言（条数/字节上限），所以要在它之前取，
       // 否则"这次只清掉了旧留言"会被判成"留言没变"而丢掉截断结果。
+      // 单元 C：盖上**本次写者**的戳 —— 本事务里 claim / post / releaseOnLoopEnd 分配 id 时读它
+      // （id 形如 `c_<seq>@<writer>`：Lamport 只保证 seq 不小于所见最大值，唯一性靠写者戳）。
+      state.writer = WRITER_ID
       const fpBefore = msgFingerprint(state.messages)
       const swept = core.sweep(state, now(), sweepOpts(state))
       let out: OpResult | undefined

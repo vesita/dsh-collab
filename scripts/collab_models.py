@@ -28,6 +28,9 @@ class Claim:
     readable: bool = True
     # 0.8.0：读者反向注册（被本声明通知过的会话 holderId）
     readers: List[str] = field(default_factory=list)
+    # 单元 C：Lamport 序号 + 写者戳（id = c_<seq>@<writer>；两个写者撞 seq 也不撞 id）
+    seq: int = 0
+    writer: str = ""
 
 @dataclass
 class Message:
@@ -40,6 +43,8 @@ class Message:
     # 同值常量见 collab-core 的 MESSAGE_BODY_MAX_CHARS；超限由 post() 以 bad-request 挡回，不截断）
     body: str
     replyTo: Optional[str] = None
+    # 单元 C：写者戳（msgId = m_<seq>@<writer>）
+    writer: str = ""
 
 @dataclass
 class Holder:
@@ -57,6 +62,9 @@ class StateDocument:
     claims: List[Claim]
     messages: List[Message]
     holders: List[Holder]
+    # 单元 C：最后一次落盘的写者戳（写后验证用）+ 终态墓碑表（claimId -> 原 expiresAt）
+    writer: str = ""
+    released: dict = field(default_factory=dict)
 
 @dataclass
 class ConflictInfo:

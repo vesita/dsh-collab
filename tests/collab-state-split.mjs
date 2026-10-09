@@ -162,8 +162,8 @@ console.log('# 1. 迁移：主文件带 messages 的旧布局')
   const mainRaw = env.store.get(STATE)
   const main = JSON.parse(mainRaw)
   ok(!('messages' in main), '迁移后主文件里**没有** messages 键', Object.keys(main).join(','))
-  ok(JSON.stringify(Object.keys(main)) === JSON.stringify(['schemaVersion', 'seq', 'claims', 'holders']),
-    '主文件恰是 {schemaVersion, seq, claims, holders}', JSON.stringify(Object.keys(main)))
+  ok(JSON.stringify(Object.keys(main)) === JSON.stringify(['schemaVersion', 'seq', 'writer', 'claims', 'holders', 'released']),
+    '主文件恰是 {schemaVersion, seq, writer, claims, holders, released}（单元 C：写者戳 + 终态墓碑表都在锁状态这一半）', JSON.stringify(Object.keys(main)))
   ok(Array.isArray(main.claims) && main.claims.length === 1, '声明仍在主文件里', JSON.stringify(main.claims.length))
 
   ok(env.store.has(SIDE), '留言旁挂文件已生成', SIDE)
@@ -296,8 +296,8 @@ console.log('# 4a. 动态外壳形态写出同构布局')
   ok(claim.ok === true, '外壳形态 claim 成功', JSON.stringify(claim))
   const main = JSON.parse(store.get(STATE))
   ok(!('messages' in main), '外壳形态：主文件里**没有** messages 键（与包形态同构）', Object.keys(main).join(','))
-  ok(JSON.stringify(Object.keys(main)) === JSON.stringify(['schemaVersion', 'seq', 'claims', 'holders']),
-    '外壳形态：主文件恰是 {schemaVersion, seq, claims, holders}', JSON.stringify(Object.keys(main)))
+  ok(JSON.stringify(Object.keys(main)) === JSON.stringify(['schemaVersion', 'seq', 'writer', 'claims', 'holders', 'released']),
+    '外壳形态：主文件恰是 {schemaVersion, seq, writer, claims, holders, released}', JSON.stringify(Object.keys(main)))
   ok(store.has(SIDE), '外壳形态：留言旁挂文件已生成')
   const side = JSON.parse(store.get(SIDE) || '{}')
   ok(JSON.stringify(side.messages) === JSON.stringify(LEGACY_MSGS), '外壳形态：旁挂内容与迁移前逐字节一致')
@@ -365,8 +365,11 @@ console.log('# 4c. 混合版本：主文件 [m1,m2] + 旁挂 [m2,m3] ⇒ 并集 
   ok(JSON.stringify(idsBefore) === JSON.stringify(['m_1', 'm_2', 'm_3']),
     '两边的留言按 msgId 求并集、按 seq 升序（不是"主文件说了算"）', JSON.stringify(idsBefore))
   const dup = before.data.messages.find((x) => x.msgId === 'm_2')
-  ok(dup && dup.body === 'main-2',
-    '同 msgId 以主文件那一份为准（内容应逐字节相同，这里只钉住确定的取值）',
+  // 同 msgId 的胜负判据是 (seq, writer) 再比规范 JSON 文本 —— 一个**全序**（交换律/结合律
+  // 因此成立）。这里两侧 seq/writer 完全相同，故取 JSON 文本较大者（'side-2' > 'main-2'）。
+  // 生产里 msgId 全局唯一，同一 msgId 的两份内容逐字节相同，这个判据只是"确定取一个"。
+  ok(dup && dup.body === 'side-2',
+    '同 msgId 按全序判据确定取胜者（seq → writer → 规范 JSON 文本）',
     JSON.stringify(before.data.messages.map((x) => x.body)))
 
   const claim = await lock.execute({ op: 'claim', paths: ['src/union/'], ttlSec: 600 }, A)
@@ -486,8 +489,8 @@ console.log('# 4f. 两形态等价（claim → post → release → list）')
   // ---- 磁盘布局一致 ----
   const pKeys = Object.keys(JSON.parse(pEnv.store.get(STATE)))
   const hKeys = Object.keys(JSON.parse(hStore.get(STATE)))
-  ok(JSON.stringify(pKeys) === JSON.stringify(['schemaVersion', 'seq', 'claims', 'holders']),
-    '包形态主文件键集合恰是 {schemaVersion, seq, claims, holders}', JSON.stringify(pKeys))
+  ok(JSON.stringify(pKeys) === JSON.stringify(['schemaVersion', 'seq', 'writer', 'claims', 'holders', 'released']),
+    '包形态主文件键集合恰是 {schemaVersion, seq, writer, claims, holders, released}', JSON.stringify(pKeys))
   ok(JSON.stringify(hKeys) === JSON.stringify(pKeys),
     '外壳形态主文件键集合与包形态逐个相同', JSON.stringify({ pkg: pKeys, host: hKeys }))
   ok(!pKeys.includes('messages') && !hKeys.includes('messages'), '两形态的主文件都不含 messages')
@@ -499,14 +502,17 @@ console.log('# 4f. 两形态等价（claim → post → release → list）')
   ok((pSide.messages || []).length === 1, '旁挂里就是本次 post 的那一条', String((pSide.messages || []).length))
 
   // ---- 逻辑状态一致（时间戳、进程章与显示名按环境面归一化：它们本来就是注入的差异） ----
+  // 记录 id 带写者戳（单元 C，`c_1@<writer>`）：写者戳是**环境差异**（与 proc / holderName 同类），
+  // 所以比较前把 `@<writer>` 归一化掉，只比"这条记录是谁的、说了什么"。
+  const stripWriter = (id) => String(id).replace(/@[^@]*$/, '')
   const norm = (doc) => ({
     schemaVersion: doc.schemaVersion,
     seq: doc.seq,
     claims: (doc.claims || []).map((c) => ({
-      claimId: c.claimId, holderId: c.holderId, paths: c.paths, mode: c.mode, ttlSec: c.ttlSec,
+      claimId: stripWriter(c.claimId), holderId: c.holderId, paths: c.paths, mode: c.mode, ttlSec: c.ttlSec,
       readable: c.readable, createdAtType: typeof c.createdAt, expiresAtType: typeof c.expiresAt
     })),
-    messages: (doc.messages || []).map((x) => ({ msgId: x.msgId, seq: x.seq, channel: x.channel, author: x.author, body: x.body, replyTo: x.replyTo || null })),
+    messages: (doc.messages || []).map((x) => ({ msgId: stripWriter(x.msgId), seq: x.seq, channel: x.channel, author: x.author, body: x.body, replyTo: x.replyTo || null })),
     holders: (doc.holders || []).map((x) => x.holderId).sort()
   })
   const pMid = norm(pRun.afterPost)

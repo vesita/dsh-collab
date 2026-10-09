@@ -69,6 +69,18 @@ export function installStore(ctx: CollabContext): StateStore {
   const sessionTitle = ctx.get('sessionTitle') as SessionTitleService | undefined
   const now = (): number => Date.now()
 
+  // ---- 写者戳（单元 C）----
+  // 每进程（每次 installStore）稳定、唯一：进程身份令牌 + 随机后缀。
+  // 为什么必须唯一：记录 id `c_<seq>@<writer>` / `m_<seq>@<writer>` 的全局唯一性靠它
+  // —— Lamport 时钟只保证"不小于所见最大值"，两个写者撞上同一个 seq 是正常的。
+  // 拿不到进程身份令牌时（非 Linux）退化为 pid + 随机；两处都不会为空。
+  const WRITER_ID = ((): string => {
+    const tok = selfProcToken()
+    const rand = Math.random().toString(36).slice(2, 10)
+    const base = (tok || ('p' + process.pid)).replace(/[^A-Za-z0-9_.:-]/g, '')
+    return (base || 'w') + '-' + rand
+  })()
+
   /**
    * 静默旁路的**错误留痕**（0.16.0）。状态核心里有几条**故意降级**的旁路（损坏备份清理、
    * 列举其他项目）：它们失败不该影响主路径，但也不该无声无息。优先用注册进来的 `logger`
@@ -338,6 +350,7 @@ export function installStore(ctx: CollabContext): StateStore {
     fs,
     core: pure,
     now,
+    writerId: WRITER_ID,
     targetFor,
     legacyTargets,
     liveProcsOf,

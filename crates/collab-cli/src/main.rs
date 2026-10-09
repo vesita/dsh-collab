@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -42,6 +43,12 @@ pub struct Claim {
     /// **必须参与反序列化**，否则本 CLI 的一次 claim/release 回写就会静默抹掉全部读者的登记。
     #[serde(default)]
     pub readers: Vec<String>,
+    /// 单元 C：Lamport 逻辑时钟序号（写时 bump 过所见最大值）。id = `c_<seq>@<writer>`。
+    #[serde(default)]
+    pub seq: i64,
+    /// 单元 C：写者戳（本 CLI 进程的身份）。两个写者撞上同一个 seq 也不会撞 id。
+    #[serde(default)]
+    pub writer: String,
 }
 
 /// 缺省可读（与 TS 侧 `isReadable` 的归一一致）。
@@ -63,6 +70,9 @@ pub struct Message {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<String>,
+    /// 单元 C：写者戳（msgId = `m_<seq>@<writer>`）。
+    #[serde(default)]
+    pub writer: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -87,6 +97,13 @@ pub struct StateDocument {
     pub claims: Vec<Claim>,
     pub messages: Vec<Message>,
     pub holders: Vec<Holder>,
+    /// 单元 C：最后一次落盘这份文档的写者戳（写后验证用）。老状态文件缺省空串。
+    #[serde(default)]
+    pub writer: String,
+    /// 单元 C：终态墓碑表（claimId -> 原租约 expiresAt）。release / 自动释放 / reap 走这里，
+    /// 而不是把声明从数组里删掉 —— 删除在 join 下不单调，墓碑才单调。
+    #[serde(default)]
+    pub released: HashMap<String, i64>,
 }
 
 impl Default for StateDocument {
@@ -97,6 +114,8 @@ impl Default for StateDocument {
             claims: vec![],
             messages: vec![],
             holders: vec![],
+            writer: String::new(),
+            released: HashMap::new(),
         }
     }
 }
@@ -166,6 +185,18 @@ pub fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+
+/// 本 CLI 进程的**写者戳**（单元 C）：每进程稳定、唯一。
+///
+/// 为什么不是随机数了事：它决定记录 id 的全局唯一性（`c_<seq>@<writer>`）与写后验证的判据。
+/// 这里用 `<pid>-<启动毫秒>-<进程内计数器>`：pid 把不同进程分开，毫秒与计数器把同一 pid
+/// 在不同时刻/不同调用点分开（内核会复用 pid，单比 pid 不够）。不读 /proc，跨平台都拿得到。
+/// 令牌里不含白名单外的字符，因此可以安全地嵌进 `id` 与 `"<seq>@<writer>"` 游标。
+pub fn writer_id() -> String {
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    let n = CALLS.fetch_add(1, Ordering::Relaxed);
+    format!("{}-{}-{}", std::process::id(), now_ms(), n)
 }
 
 pub fn norm_path(p: &str) -> Option<String> {
@@ -539,9 +570,13 @@ fn main() -> Result<()> {
         raw: loaded_raw,
     } = load_state(&state_file)?;
     let now = now_ms();
+    // 本进程的写者戳（单元 C）：所有 id 都带它，写盘前也把它盖在文档上（写后验证的判据）。
+    let writer = writer_id();
 
     // 惰性过期
     state.claims.retain(|c| c.expires_at > now);
+    // 墓碑的**确定性** GC（与 TS 侧 sweep 同一条规则）：原租约已过期 ⇒ 丢掉墓碑。
+    state.released.retain(|_, exp| *exp > now);
 
     match cli.command {
         Commands::List => {
@@ -662,7 +697,9 @@ fn main() -> Result<()> {
             }
 
             state.seq += 1;
-            let claim_id = format!("c_{}", state.seq);
+            state.writer = writer.clone();
+            // Lamport + 写者戳：seq 可能与另一个写者相撞，id 因 `@<writer>` 而仍然唯一。
+            let claim_id = format!("c_{}@{}", state.seq, writer);
             let claim = Claim {
                 claim_id: claim_id.clone(),
                 holder_id: holder.clone(),
@@ -675,6 +712,8 @@ fn main() -> Result<()> {
                 created_at: now,
                 readable: true,
                 readers: Vec::new(),
+                seq: state.seq,
+                writer: writer.clone(),
             };
             state.claims.push(claim.clone());
             save_state(&state_file, &state, loaded_raw.as_deref())?;
@@ -691,10 +730,22 @@ fn main() -> Result<()> {
             holder,
         } => {
             let before = state.claims.len();
+            // 单元 C：release 不再"从数组里删掉就完事"，而是**立墓碑**（claimId -> 原 expiresAt）。
+            // 删除在 join 下不单调：另一份还握着旧副本的写者会把这条声明并回盘上；墓碑才单调。
+            let mut buried: Vec<(String, i64)> = Vec::new();
             if let Some(cid) = claim_id {
+                for c in state.claims.iter().filter(|c| c.claim_id == cid && c.holder_id == holder) {
+                    buried.push((c.claim_id.clone(), c.expires_at));
+                }
                 state.claims.retain(|c| !(c.claim_id == cid && c.holder_id == holder));
             } else if !paths.is_empty() {
                 let npaths: Vec<String> = paths.iter().filter_map(|p| norm_path(p)).collect();
+                for c in state.claims.iter().filter(|c| {
+                    c.holder_id == holder
+                        && c.paths.iter().any(|cp| npaths.iter().any(|p| overlaps(p, cp)))
+                }) {
+                    buried.push((c.claim_id.clone(), c.expires_at));
+                }
                 state.claims.retain(|c| {
                     !(c.holder_id == holder
                         && c.paths.iter().any(|cp| npaths.iter().any(|p| overlaps(p, cp))))
@@ -703,6 +754,13 @@ fn main() -> Result<()> {
                 anyhow::bail!("claim_id or paths required for release");
             }
             let released = before - state.claims.len();
+            state.writer = writer.clone();
+            for (id, exp) in &buried {
+                let cur = state.released.get(id).copied();
+                if cur.is_none() || *exp > cur.unwrap_or(i64::MIN) {
+                    state.released.insert(id.clone(), *exp);
+                }
+            }
             save_state(&state_file, &state, loaded_raw.as_deref())?;
             println!("Released {} claim(s)", released);
         }
@@ -715,23 +773,27 @@ fn main() -> Result<()> {
         } => {
             if let Some(body) = post {
                 state.seq += 1;
+                state.writer = writer.clone();
                 let msg = Message {
-                    msg_id: format!("m_{}", state.seq),
+                    msg_id: format!("m_{}@{}", state.seq, writer),
                     seq: state.seq,
                     channel: channel.clone(),
                     author,
                     ts: now,
                     body,
                     reply_to: None,
+                    writer: writer.clone(),
                 };
                 state.messages.push(msg.clone());
                 save_state(&state_file, &state, loaded_raw.as_deref())?;
                 println!("Posted message [{}] to #{}", msg.msg_id, channel);
             } else {
+                // 游标是复合值 (seq, writer)：数字 --since 解释为 (since, "")，与 TS 侧同一条判据
+                // （不漏；seq 恰好等于 since 且带写者戳的记录会被再送一遍）。
                 let msgs: Vec<&Message> = state
                     .messages
                     .iter()
-                    .filter(|m| m.channel == channel && m.seq > since)
+                    .filter(|m| m.channel == channel && (m.seq, m.writer.as_str()) > (since, ""))
                     .take(limit)
                     .collect();
                 println!("=== Channel #{} Messages ===", channel);
@@ -951,6 +1013,8 @@ mod tests {
             created_at: 1,
             readable: true,
             readers: vec![],
+            seq: 1,
+            writer: "test".into(),
         }
     }
 

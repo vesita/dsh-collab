@@ -29,6 +29,9 @@ return {
     // 所以这是环境限制，不是遗漏。包形态见 src/index.ts：它按 import.meta.url 解析 ../skills/ 后注册。
     const LEGACY_FILE = '.dsh-collab.json'
     const now = () => Date.now()
+    // 写者戳（单元 C）：受限宿主拿不到进程身份（没有 process），退化为"随机 + 毫秒"。
+    // 每次装载稳定、唯一即可 —— 它只用来让记录 id 全局唯一、并做写后验证，不参与任何门控。
+    const WRITER_ID = 'h-' + Math.random().toString(36).slice(2, 10) + '-' + Date.now().toString(36)
     // 状态目录（**绝对路径**）惰性解析 + 闭包缓存：null=未解析/失败，string=成功。
     // 受限动态宿主里拿不到 os/process；唯一可信锚点是 settings.prepareDocument() 返回的
     // 绝对文档路径（实测形如 /home/vesita/.dsh/settings.yaml），取其 dirname 再拼
@@ -112,11 +115,12 @@ return {
     // state-core，与包形态 src/store.ts 是**同一份源码**（构建期内联）。这里只把外壳的
     // 环境面递进去，并把内联进本作用域的核心函数收成一个命名空间 —— 状态层因此不需要
     // import（受限宿主里没有 import），两形态也不会各有一份实现。
-    const CORE = { init, sweep, publish, holderView, holderRosterNote, overview, related, filterMessages, blockers, reap, norm, HOLDER_VIEW_LIMIT }
+    const CORE = { init, sweep, publish, holderView, holderRosterNote, overview, related, filterMessages, blockers, reap, norm, HOLDER_VIEW_LIMIT, normalizeDoc, mergeDocs }
     const store = createStateCore({
       fs: fs,
       core: CORE,
       now: now,
+      writerId: WRITER_ID,
       targetFor: targetFor,
       legacyTargets: legacyTargets,
       // 受限宿主没有 /proc 与进程身份：两个平台能力都退化（= "拿不到进程判据"的保守口径，
