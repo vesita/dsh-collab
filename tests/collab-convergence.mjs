@@ -200,8 +200,8 @@ console.log('# 游标是 (seq, writer) 复合值：撞 seq 时按游标迭代一
   // 因此 `since = nextSince` 的翻页**一定前进**。旧实现一律按复合全序比较，裸数字归一成 `(n, "")`
   // 会把 seq 恰好为 n 的那条**永远再送** —— 于是"按 nextSince 翻页"成了死循环
   // （现场实测：`since=379` 又返回 m_379、`nextSince` 仍是 379）。
-  // **代价（刻意记在这里）**：seq 相撞时数字游标定位不到是哪一位写者，可能**跳过同 seq 的另一位**；
-  // 上面那条 RED 就是这个形态。要一条不漏必须用返回的 `nextCursor`（复合值）—— 即上一段断言的那条路。
+  // 那个"重送还是跳过"的取舍**已经不存在**：分页**从不切开同一个 seq 组**（见下面两条断言），
+  // 所以数字游标既不重送（游标一定前进）也不漏（组是完整的）。上面那条 RED 是"切开组"会怎样。
   const numeric = filterMessages(st, { since: 2, limit: 10 })
   ok(same(numeric.messages.map(m => m.msgId), ['m_3@wB']),
     '数字 since=2 = 严格在 seq 2 之后：不再重送（旧实现重送 ⇒ nextSince 翻页死循环）；同 seq 的另一位要 nextCursor 才不漏',
@@ -210,12 +210,34 @@ console.log('# 游标是 (seq, writer) 复合值：撞 seq 时按游标迭代一
   ok(same(numericAt1.messages.map(m => m.msgId), ['m_2@wA', 'm_2@wB', 'm_3@wB']),
     '数字 since=1 = 严格在 seq 1 之后（seq=1 那条不在窗口内 —— 读它靠 tail 模式）',
     show(numericAt1.messages.map(m => m.msgId)))
+  // 组完整性：limit=1 也不会切开 seq=2 那组（整组返回，页长 2 > limit）
+  const one = filterMessages(st, { since: 1, limit: 1 })
+  ok(same(one.messages.map(m => m.msgId), ['m_2@wA', 'm_2@wB']),
+    '不切开同 seq 组：limit=1 时 seq=2 那组整组返回 ⇒ 数字游标既不重送也不漏',
+    show(one.messages.map(m => m.msgId)))
+  // 数字游标迭代：有限轮 + 不重不漏（旧实现死循环；只做严格大于则会跳过同 seq 的另一位 —— 现在两者都成立）
+  let nc = 1, rounds = 0
+  const seenNumeric = []
+  for (;;) {
+    const r = filterMessages(st, { since: nc, limit: 1 })
+    if (!r.returned) break
+    seenNumeric.push(...r.messages.map(m => m.msgId))
+    nc = r.nextSince
+    if (++rounds > 9) break
+  }
+  ok(rounds <= 9 && same(seenNumeric, ['m_2@wA', 'm_2@wB', 'm_3@wB']),
+    '数字游标 limit=1 迭代：有限轮、不重不漏', show({ rounds, seenNumeric }))
+  // 从头读：复合写法 "0@" 是一个**位置** ⇒ forward 从最开始（省略/0 仍是 tail）
+  const fromStart = filterMessages(st, { since: '0@', limit: 10 })
+  ok(same(fromStart.messages.map(m => m.msgId), ['m_1@wA', 'm_2@wA', 'm_2@wB', 'm_3@wB']) && fromStart.mode === 'forward',
+    '从头读：since="0@" ⇒ forward（全历史可达），而省略/0 仍是 tail', show(fromStart.messages.map(m => m.msgId)))
   ok(
     same(parseCursor(3), { seq: 3, writer: '', bare: true }) &&
       same(parseCursor('3'), { seq: 3, writer: '', bare: true }) &&
-      same(parseCursor('3@wA'), { seq: 3, writer: 'wA' }),
-    'parseCursor：裸 seq（数字，或无 @ 的字符串）⇒ 标 bare（按 seq 严格大于）；`<seq>@<writer>` ⇒ 原样复合值',
-    show([parseCursor(3), parseCursor('3'), parseCursor('3@wA')]))
+      same(parseCursor('3@wA'), { seq: 3, writer: 'wA', explicit: true }) &&
+      same(parseCursor('0@'), { seq: 0, writer: '', explicit: true }),
+    'parseCursor：裸 seq（数字，或无 @ 的字符串）⇒ 标 bare（按 seq 严格大于）；`<seq>@<writer>` ⇒ 复合**位置**（explicit，含 `"0@"` = 从头）',
+    show([parseCursor(3), parseCursor('3'), parseCursor('3@wA'), parseCursor('0@')]))
 }
 
 console.log('# release 终态化：墓碑让"已释放"不被旧副本翻案，且 GC 规则确定性')

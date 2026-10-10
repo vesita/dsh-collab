@@ -148,7 +148,7 @@
         "wakeToken": { "type": "string", "description": "post 用（可选，单元 E）：首次 idle 探活返回的 confirmToken，原样回传以二次确认唤醒。带它时只唤醒、不再写留言（留言永远只落一条）；令牌绑定同一目标 + 同一留言、一次性、有有效期（默认 120 秒）。校验不过一律拒绝且不唤醒。" },
         "push": { "type": "boolean", "description": "post 用（可选，单元 F）：广播推送意图（true = 推送；false / 省略 = 只落板）。受众由频道**现算**（不落状态文件）：general = 本项目全部持有人（state.holders），path:<相对路径> = 声明与该路径重叠的持有人（claimsCovering 判据）；都排除投递方自己。逐个探活：全部在跑 ⇒ 直接整批 steer（不发令牌）；有任一 idle/unknown ⇒ 一个都不投递、返回受众预览 + 一次性 pushToken；受众为空 ⇒ 不推送、如实说明（留言只落板）；受众数超上限（默认 12，env DSH_COLLAB_PUSH_MAX）⇒ 拒绝（不推送、不发令牌、不写留言），不做静默推一半。与 wake 互斥。" },
         "pushToken": { "type": "string", "description": "post 用（可选，单元 F）：首次广播推送返回的 confirmToken，原样回传以确认整批投递。带它时只推送、不再写留言（留言永远只落一条），对每个可达受众各 steer 恰好一次；令牌绑定本次广播的**频道 + 受众集合 + 投递方 + 到期** —— 受众变了（有人新 claim / 有人消失）、换频道、过期、乱造、他人令牌一律拒绝且不 steer；一次性（成功投递才消耗，失败可重试）。" },
-        "since": { "type": ["integer", "string"], "minimum": 0, "description": "read 用：省略或 0 = 读最新 limit 条（tail）；否则从该游标往后读 limit 条（forward，旧→新）。游标是**复合值** (seq, writer)：字符串写法 `<seq>@<writer>`（取返回的 nextCursor），数字写法（向后兼容）解释为 `(seq, \"\")`。返回的 nextCursor 是下一次的精确游标。" },
+        "since": { "type": ["integer", "string"], "minimum": 0, "description": "read 用：**省略或 0** = 读最新 limit 条（tail）；**给了游标** = 从该位置往后读 limit 条（forward，旧→新）。游标是**复合值** (seq, writer)：字符串写法 `<seq>@<writer>`（取返回的 nextCursor），裸 seq（数字或无 @ 的字符串）按 seq 严格大于匹配。**`since: \"0@\"` = 从头读**（全历史可达）；省略/0 仍是 tail。**一页不会切开同一个 seq 组**，故 limit 是软上限：一页可能短于它，单组更大时整组返回。返回的 nextCursor 是下一次的精确游标。" },
         "limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 }
       }
     }

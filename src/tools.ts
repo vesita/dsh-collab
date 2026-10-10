@@ -736,7 +736,7 @@ export function installTools(ctx: CollabContext, store: StateStore, push: PushAp
 
   const boardTool: ToolDefinition = {
     name: 'collab_board',
-    description: '跨会话协作留言板：post 往共享状态文件留痕 / read 增量读取。用于同一仓库上互不相识的会话之间交接进度与协商。**默认不投递、不唤醒任何会话**：对方只在它自己 read 时才看得到。可选**广播推送** `push:true`：受众由频道现算（general = 本项目全部持有人，path:<相对路径> = 声明与该路径重叠的持有人；都排除你自己），逐个探活后**全部在跑就整批 steer 投递**（在跑不需要确认），**有任一 idle 就一个都不投递**、返回受众预览 + 一个绑定本次广播的一次性 `pushToken`，你**必须再调一次 op=post 并回传 `pushToken`**（确认步只推送、不再写留言）；受众为空就不推送、如实说明；受众数超过上限（默认 12，env DSH_COLLAB_PUSH_MAX）直接拒绝（不推送、不发令牌、不写留言，不做"静默推一半"）。推送给每个人的是一条**短通知**（频道 + 作者 + 正文摘要，长正文留在板上），由本插件经真实的 dsh-llm 构造、来源显式非 user（kind:dsh-collab, form:notice），不冒充用户。另有**定向唤醒** `wake`（单个目标会话 id）：与 push 互斥；目标在跑就直接 steer，idle 就返回 confirmToken 等你再确认（回传 wakeToken），探不到只落板。read 两种模式：不给 since（或 0）读**最新** limit 条（追平用）；否则从该游标**往后**读 limit 条（增量用，旧→新）——按返回的 nextCursor 继续调、直到 hasMore=false 才算读完（nextCursor 是复合游标 seq@writer；只按数字 nextSince 翻页在 seq 相撞时会把同 seq 的记录再送一遍）。',
+    description: '跨会话协作留言板：post 往共享状态文件留痕 / read 增量读取。用于同一仓库上互不相识的会话之间交接进度与协商。**默认不投递、不唤醒任何会话**：对方只在它自己 read 时才看得到。可选**广播推送** `push:true`：受众由频道现算（general = 本项目全部持有人，path:<相对路径> = 声明与该路径重叠的持有人；都排除你自己），逐个探活后**全部在跑就整批 steer 投递**（在跑不需要确认），**有任一 idle 就一个都不投递**、返回受众预览 + 一个绑定本次广播的一次性 `pushToken`，你**必须再调一次 op=post 并回传 `pushToken`**（确认步只推送、不再写留言）；受众为空就不推送、如实说明；受众数超过上限（默认 12，env DSH_COLLAB_PUSH_MAX）直接拒绝（不推送、不发令牌、不写留言，不做"静默推一半"）。推送给每个人的是一条**短通知**（频道 + 作者 + 正文摘要，长正文留在板上），由本插件经真实的 dsh-llm 构造、来源显式非 user（kind:dsh-collab, form:notice），不冒充用户。另有**定向唤醒** `wake`（单个目标会话 id）：与 push 互斥；目标在跑就直接 steer，idle 就返回 confirmToken 等你再确认（回传 wakeToken），探不到只落板。read 两种模式：不给 since（或 0）读**最新** limit 条（追平用）；否则从该游标**往后**读 limit 条（增量用，旧→新）——按返回的 nextCursor（或数字 nextSince，两者都无损）继续调、直到 hasMore=false 才算读完；**一页不会切开同一个 seq 组**，所以 limit 是软上限（一页可能短于它）。要从头读传 `since:\"0@\"`（省略或 0 是 tail = 读最新）。',
     parameters: {
       type: 'object',
       properties: {
@@ -748,7 +748,7 @@ export function installTools(ctx: CollabContext, store: StateStore, push: PushAp
         pushToken: { type: 'string', description: 'post 用（可选）：首次广播推送返回的 confirmToken，原样回传以**确认整批投递**。带它时**只推送、不再写留言**（留言永远只落一条），且对每个受众各 steer 恰好一次；令牌绑定本次广播的**频道 + 受众集合 + 投递方 + 到期** —— 受众变了（有人新 claim / 有人消失）、换频道、过期、乱造、他人令牌一律拒绝且不 steer；一次性（成功投递才消耗，失败可重试）。' },
         wake: { type: 'string', description: 'post 用（可选）：**定向唤醒**的目标会话 id（可带 agent: 前缀）。投递前先探活：目标在跑（非 idle）⇒ 直接 steer 投递、不需确认；目标 idle ⇒ **不投递**、返回预览 + 一次性 confirmToken，需再调一次并回传才唤醒；探不到 ⇒ 不投递、如实说明（留言只落板）。省略则只落板、不投递。与 push 互斥。' },
         wakeToken: { type: 'string', description: 'post 用（可选）：首次 idle 探活返回的 confirmToken，原样回传以**二次确认**唤醒。带它时**只唤醒、不再写留言**（留言永远只落一条）；令牌绑定同一目标 + 同一留言、一次性、有有效期。校验不过一律拒绝且不唤醒。' },
-        since: { type: ['number', 'string'], description: 'read 用：省略或 0 = 读最新 limit 条（tail）；否则从该游标往后读 limit 条（forward，旧→新）。游标是复合值 (seq, writer)：字符串写法 `<seq>@<writer>`（取返回的 nextCursor），数字写法（向后兼容）解释为 `(seq, "")`。' },
+        since: { type: ['number', 'string'], description: 'read 用：**省略或 0** = 读最新 limit 条（tail）；**给了游标** = 从该位置往后读 limit 条（forward，旧→新）。游标是复合值 (seq, writer)：字符串写法 `<seq>@<writer>`（取返回的 nextCursor），裸 seq（数字或无 @ 的字符串）按 seq 严格大于匹配。**`since: "0@"` = 从头读**（全历史可达）；省略/0 仍是 tail。**一页不会切开同一个 seq 组**，故 limit 是软上限：一页可能短于它，单组更大时整组返回（保证游标一定前进）。' },
         limit: { type: 'number', description: 'read 用，最多条数，默认 50，上限 200' }
       },
       additionalProperties: true,

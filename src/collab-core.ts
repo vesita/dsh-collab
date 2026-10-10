@@ -209,9 +209,10 @@ export interface OverviewResult {
  *
  * `total` 是本次筛选（channel + since）命中的总条数；`latestSeq` / `earliestSeq` 是**可用窗口**的
  * 上下界，两者**同范围**（都只按 channel 收窄、不看 since）—— 一个全局一个按筛选，会让按频道读的
- * 调用方以为自己永远没追平。`hasMore` / `nextSince` 是 0.13.0 加的**有损读的出口**：把 `nextSince`
- * 当下一次 read 的 `since`，循环到 `hasMore === false` 即可追平（数字游标按 seq **严格大于**匹配，
- * 所以游标一定前进）；一条都没返回时 `nextSince` 原样回传 `since`。
+ * 调用方以为自己永远没追平。`hasMore` / `nextSince` 是 0.13.0 加的**追平出口**：把 `nextSince`
+ * 当下一次 read 的 `since`，循环到 `hasMore === false` 即可**无损**追平 —— 裸 seq 游标按
+ * **seq 严格大于**匹配（游标一定前进），且分页**从不切开同一个 seq 组**（所以也不会漏掉撞 seq 的
+ * 那一位）。`limit` 因此是软上限：一页可能短于它，单组大于它时整组返回。
  */
 export interface FilterMessagesResult {
   since: number
@@ -566,7 +567,7 @@ export function mergeDocs(a: StateDocument, b: StateDocument): StateDocument {
 }
 
 /** 复合游标 `(seq, writer)`：按这个位置读"严格在其后"的记录。 */
-export interface Cursor { seq: number; writer: string; bare?: boolean }
+export interface Cursor { seq: number; writer: string; bare?: boolean; explicit?: boolean }
 
 /**
  * 解析游标。**裸 seq**（`number`，或没有 `@` 的字符串）⇒ `(n, "")` 且标记 `bare`：按
@@ -588,7 +589,9 @@ export function parseCursor(v: unknown): Cursor {
   }
   const n = Number(s.slice(0, at))
   if (!Number.isFinite(n) || n < 0) return { seq: 0, writer: '' }
-  return { seq: Math.floor(n), writer: s.slice(at + 1) }
+  // 含 `@` 的复合写法 = 一个**位置**（哪怕 seq 是 0）⇒ 模式按"给了位置"判定为 forward，
+  // 于是 `"0@"` 就是"从头读"，而 `0`/省略仍是 tail。模式不再由数值**大小**决定。
+  return { seq: Math.floor(n), writer: s.slice(at + 1), explicit: true }
 }
 
 /** 把游标序列化成磁盘/返回值上的形状：`"<seq>@<writer>"`。 */
@@ -1585,6 +1588,47 @@ export function related(state: StateDocument, paths: string[]): Claim[] {
 //
 // `hasMore` = 沿本模式的方向**还有更多没返回**（tail 是"更早的还有"，forward 是"更新的还有"）；
 // `earliestSeq` / `latestSeq` 是可用范围的下界/上界，调用方据此知道窗口落在哪一段。
+/**
+ * 按 `seq` 分组后**整组**取前 `limit` 条（forward）。
+ *
+ * 为什么必须整组取：`seq` 只是 Lamport 时钟，**两个写者可以撞同一个 seq**。若一页把某组切成两半，
+ * 调用方拿数字游标（"我已经读到 n 了"）继续翻页时，剩下那半就**永远读不到**；不切的话，
+ * 数字游标既不需要重送（游标一定前进）也不会漏（组是完整的）—— 「无损」与「可终止」同时成立。
+ * `limit` 因此是**软上限**：单组大于 `limit` 时整组返回（否则永远前进不了）。
+ */
+function takeGroupsForward(matched: Message[], limit: number): Message[] {
+  const out: Message[] = []
+  let i = 0
+  while (i < matched.length) {
+    const g = Number(matched[i].seq)
+    let j = i
+    while (j < matched.length && Number(matched[j].seq) === g) j++
+    const group = matched.slice(i, j)
+    if (out.length && out.length + group.length > limit) break
+    out.push(...group)
+    if (out.length >= limit) break
+    i = j
+  }
+  return out
+}
+
+/** 同上，从**尾部**整组取（tail 模式：读最新 limit 条，且不切开最旧那一组）。 */
+function takeGroupsTail(matched: Message[], limit: number): Message[] {
+  const out: Message[] = []
+  let i = matched.length
+  while (i > 0) {
+    const g = Number(matched[i - 1].seq)
+    let j = i
+    while (j > 0 && Number(matched[j - 1].seq) === g) j--
+    const group = matched.slice(j, i)
+    if (out.length && out.length + group.length > limit) break
+    out.unshift(...group)
+    if (out.length >= limit) break
+    i = j
+  }
+  return out
+}
+
 export function filterMessages(state: StateDocument, a: ReadInput): FilterMessagesResult {
   const cur = parseCursor(a.since)
   const since = cur.seq
@@ -1597,8 +1641,11 @@ export function filterMessages(state: StateDocument, a: ReadInput): FilterMessag
   const matched = l.filter(m => (cur.bare
     ? Number(m.seq) > cur.seq
     : compareSeqWriter(m.seq, m.writer, cur.seq, cur.writer) > 0))
-  const mode: 'tail' | 'forward' = since > 0 ? 'forward' : 'tail'
-  const returned = mode === 'forward' ? matched.slice(0, limit) : matched.slice(-limit)
+  // 模式由**游标的形式**决定，不由数值大小：省略 `since` ⇒ tail（读最新 limit 条）；
+  // 给了位置（复合写法，或裸 seq>0）⇒ forward。于是 `since:"0@"` = **从头读**（全历史可达），
+  // 而 `since:0` / 省略仍是 tail —— 老用法一字不变。
+  const mode: 'tail' | 'forward' = cur.explicit || since > 0 ? 'forward' : 'tail'
+  const returned = mode === 'forward' ? takeGroupsForward(matched, limit) : takeGroupsTail(matched, limit)
   const hasMore = matched.length > returned.length
   const last = returned.length ? returned[returned.length - 1] : null
   const nextSince = last ? (Number(last.seq) || 0) : since

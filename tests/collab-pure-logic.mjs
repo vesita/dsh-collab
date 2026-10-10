@@ -241,7 +241,7 @@ console.log('# expire / sweep')
   ok(b2.length > 0 && !b2.some(b => b1.includes(b)),
     'filterMessages: 带写者戳时按 nextSince 翻页**不重送**（旧实现会把 seq 相等的那条再送一遍）',
     JSON.stringify({ page1: b1, nextSince: a1.nextSince, page2: b2 }))
-  let cur = 1, rounds = 0
+  let cur = '0@', rounds = 0
   const seen = new Set()
   for (;;) {
     const r = filterMessages(st, { since: cur, limit: 4 })
@@ -250,12 +250,11 @@ console.log('# expire / sweep')
     cur = r.nextSince
     if (++rounds > 20) break
   }
-  // 要保的性质是**有限轮 + 不重复 + 覆盖游标之后的全部**：`since=1` 按"严格大于"匹配，
-  // 所以 seq=1 那条本身不在 forward 窗口内（读它要靠 tail 模式）—— 故期望 total-1。
-  // 旧实现下这个循环**永不终止**（rounds > 20），这才是被挡住的回归。
-  ok(rounds <= 20 && seen.size === st.messages.length - 1,
-    'filterMessages: 按 nextSince 迭代**有限轮读完且不重复**（旧实现在此死循环）',
-    JSON.stringify({ rounds, seen: seen.size, expected: st.messages.length - 1, total: st.messages.length }))
+  // 从 `"0@"`（= 从头读）开始按 nextSince 迭代：要**有限轮 + 一条不漏 + 不重复**。
+  // 旧实现下这个循环**永不终止**（rounds > 20）；只做"严格大于"而不做组完整性则会漏掉撞 seq 的那位。
+  ok(rounds <= 20 && seen.size === st.messages.length,
+    'filterMessages: 从 "0@" 起按 nextSince 迭代**有限轮读完且不重不漏**（旧实现在此死循环）',
+    JSON.stringify({ rounds, seen: seen.size, total: st.messages.length }))
 }
 {
   // 单元 G：latestSeq 与 earliestSeq **同范围**（都只按 channel 收窄，不看 since）。旧实现取整个文件的
