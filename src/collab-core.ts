@@ -207,10 +207,11 @@ export interface OverviewResult {
 /**
  * filterMessages 的返回结构。
  *
- * `total` 是本次筛选（channel + since）命中的总条数，`latestSeq` 是状态文件里最后一条消息的 seq
- * （**全局**，不按 channel 收窄）。`hasMore` / `nextSince` 是 0.13.0 加的**有损读的出口**：
- * 把 `nextSince` 当下一次 read 的 `since`，循环到 `hasMore === false` 即可无损追平；
- * 一条都没返回时 `nextSince` 原样回传 `since`（游标不前进，也不会跳段）。
+ * `total` 是本次筛选（channel + since）命中的总条数；`latestSeq` / `earliestSeq` 是**可用窗口**的
+ * 上下界，两者**同范围**（都只按 channel 收窄、不看 since）—— 一个全局一个按筛选，会让按频道读的
+ * 调用方以为自己永远没追平。`hasMore` / `nextSince` 是 0.13.0 加的**有损读的出口**：把 `nextSince`
+ * 当下一次 read 的 `since`，循环到 `hasMore === false` 即可追平（数字游标按 seq **严格大于**匹配，
+ * 所以游标一定前进）；一条都没返回时 `nextSince` 原样回传 `since`。
  */
 export interface FilterMessagesResult {
   since: number
@@ -218,10 +219,11 @@ export interface FilterMessagesResult {
   mode: 'tail' | 'forward'
   returned: number
   total: number
+  /** 这个筛选范围（只按 channel 收窄）内**最新**一条的 seq，与 `earliestSeq` 同范围（0 = 一条都没有）。 */
   latestSeq: number
   /** 沿本模式的方向还有更多没返回。 */
   hasMore: boolean
-  /** 下一次 read 的游标：本次返回的最后一条的 seq（一条都没返回时原样回传 since）。 */
+  /** 下一次 read 的游标：本次返回的最后一条的 seq（一条都没返回时原样回传 since）。数字游标按 seq **严格大于**匹配，故翻页一定前进。 */
   nextSince: number
   /**
    * 本次输入游标的**归一化复合形式** `<seq>@<writer>`。
@@ -234,7 +236,7 @@ export interface FilterMessagesResult {
    * 不足以定位到"读到哪了"，会把同 seq 的另一位写者的记录再送一遍）。
    */
   nextCursor: string
-  /** 这个筛选范围内**还留着**的最旧一条的 seq（0 = 一条都没有）。`since < earliestSeq` ⇒ 中间那段已被 MAX_MESSAGES 回收。 */
+  /** 这个筛选范围（只按 channel 收窄）内**还留着**的最旧一条的 seq（0 = 一条都没有）。`since < earliestSeq` ⇒ 中间那段已被 MAX_MESSAGES 回收。 */
   earliestSeq: number
   messages: Message[]
   /** 只在「给了 channel 但一条都没命中，且板里确实有消息」时出现：列出**现有频道**。 */
@@ -564,21 +566,29 @@ export function mergeDocs(a: StateDocument, b: StateDocument): StateDocument {
 }
 
 /** 复合游标 `(seq, writer)`：按这个位置读"严格在其后"的记录。 */
-export interface Cursor { seq: number; writer: string }
+export interface Cursor { seq: number; writer: string; bare?: boolean }
 
 /**
- * 解析游标。`number`（老调用方）⇒ `(n, "")`；`"<seq>@<writer>"` ⇒ 原样；
+ * 解析游标。**裸 seq**（`number`，或没有 `@` 的字符串）⇒ `(n, "")` 且标记 `bare`：按
+ * **seq 严格大于 n** 匹配（= 老语义 `seq > n`），因此把 `nextSince` 当下一次 `since` 的翻页循环
+ * **一定前进**。旧实现一律按复合全序比较，而 0.17 起记录都带写者戳，`(n, "")` 会把 seq 恰好为 n 的
+ * 那条**永远再送一遍**（现场实测：`since=379` 又返回 m_379、`nextSince` 仍是 379 ⇒ 死循环）。
+ * **复合**写法 `"<seq>@<writer>"`（= 返回的 `nextCursor`）⇒ 原样、按复合全序比较，seq 相撞时也定位得到。
  * 无法解析（空串、乱写）⇒ `(0, "")`（= tail 模式）。**绝不抛**：游标是输入，不是不变量。
  */
 export function parseCursor(v: unknown): Cursor {
-  if (typeof v === 'number' && Number.isFinite(v)) return { seq: Math.max(0, Math.floor(v)), writer: '' }
+  if (typeof v === 'number' && Number.isFinite(v)) return { seq: Math.max(0, Math.floor(v)), writer: '', bare: true }
   const s = typeof v === 'string' ? v.trim() : ''
   if (!s) return { seq: 0, writer: '' }
   const at = s.indexOf('@')
-  const head = at < 0 ? s : s.slice(0, at)
-  const n = Number(head)
+  if (at < 0) {
+    const n = Number(s)
+    if (!Number.isFinite(n) || n < 0) return { seq: 0, writer: '' }
+    return { seq: Math.floor(n), writer: '', bare: true }
+  }
+  const n = Number(s.slice(0, at))
   if (!Number.isFinite(n) || n < 0) return { seq: 0, writer: '' }
-  return { seq: Math.floor(n), writer: at < 0 ? '' : s.slice(at + 1) }
+  return { seq: Math.floor(n), writer: s.slice(at + 1) }
 }
 
 /** 把游标序列化成磁盘/返回值上的形状：`"<seq>@<writer>"`。 */
@@ -1581,10 +1591,12 @@ export function filterMessages(state: StateDocument, a: ReadInput): FilterMessag
   const limit = Math.max(1, Math.min(200, Number(a.limit) || 50))
   const ch = typeof a.channel === 'string' && a.channel.trim() ? a.channel.trim() : null
   const l = ch ? state.messages.filter(m => m.channel === ch) : state.messages
-  // 游标是**复合**的 `(seq, writer)` 全序位置，"严格在其后"。数字入参归一成 `(n, "")`
-  // —— 与老语义（`seq > n`）在"记录没有写者戳"时逐条一致；带写者戳的记录若 seq 恰好等于 n，
-  // 会被**再送一遍**（不丢，至多重送）。要精确定位"读到哪了"，用返回的 nextCursor。
-  const matched = l.filter(m => compareSeqWriter(m.seq, m.writer, cur.seq, cur.writer) > 0)
+  // 游标是**复合**的 `(seq, writer)` 全序位置，"严格在其后"。**裸 seq** 游标（`nextSince`）按
+  // `seq > n` 匹配 —— 它必须**严格前进**，否则"按 nextSince 翻页"会永远重读同一条；
+  // 代价是 seq 相撞时定位不到是哪一位写者（会跳过同 seq 的另一位）⇒ 精确翻页用 `nextCursor`。
+  const matched = l.filter(m => (cur.bare
+    ? Number(m.seq) > cur.seq
+    : compareSeqWriter(m.seq, m.writer, cur.seq, cur.writer) > 0))
   const mode: 'tail' | 'forward' = since > 0 ? 'forward' : 'tail'
   const returned = mode === 'forward' ? matched.slice(0, limit) : matched.slice(-limit)
   const hasMore = matched.length > returned.length
@@ -1598,11 +1610,14 @@ export function filterMessages(state: StateDocument, a: ReadInput): FilterMessag
   // earliestSeq = 这个筛选范围内**还留着**的最旧一条（0 = 一条都没有）。调用方 `since` 小于它，
   // 说明那段已被 sweep 的 MAX_MESSAGES 回收 —— 与"那段时间没人留言"在返回值上可区分。
   const earliestSeq = l.length ? l[0].seq : 0
+  // latestSeq 与 earliestSeq **同范围**：都只看 channel 收窄、不看 since。旧实现取整个文件的最后一条，
+  // 于是按频道读的调用方拿 nextSince(379) 与 latestSeq(403) 比会永远以为自己还差 24 条（现场实测）。
+  const latestSeq = l.length ? l[Number(l.length) - 1].seq : 0
   // channel 是**精确匹配**的自由字符串（写什么就得按什么读）。实测踩过两种写法不一致：
   // 文档写 `agent:<holderId>` 而 holderId 本身已是 `agent:…`（于是读 0 条）、path 频道少个尾斜杠
   // （于是读 0 条）。空结果时把现有频道如实列出来，调用方一眼看出自己该写哪个。
   const channelNote = ch && matched.length === 0 && state.messages.length ? channelRosterNote(state) : undefined
-  const out: FilterMessagesResult = { since, mode, returned: returned.length, total: matched.length, hasMore, nextSince, cursor, nextCursor, earliestSeq, latestSeq: state.messages.length ? state.messages[state.messages.length - 1].seq : 0, messages: returned }
+  const out: FilterMessagesResult = { since, mode, returned: returned.length, total: matched.length, hasMore, nextSince, cursor, nextCursor, earliestSeq, latestSeq, messages: returned }
   if (channelNote) out.channelNote = channelNote
   return out
 }

@@ -228,6 +228,49 @@ console.log('# expire / sweep')
   const p1 = filterMessages(big, { since: 1, limit: 3 })
   ok(p1.messages.map(m => m.body).join(',') === 'y1,y2,y3', 'filterMessages: since>0 时取的是游标后最早 3 条（旧实现取最新 3 条 ⇒ 中间 4 条永久丢）', JSON.stringify(p1.messages.map(m => m.body)))
 }
+{
+  // 单元 G：裸 seq 游标必须**严格前进**。0.17 起记录都带写者戳，旧实现一律按复合全序比较 ⇒ 裸数字
+  // 归一成 `(n, "")` 会把 seq 恰好为 n 的那条**永远再送**，`since = nextSince` 的翻页成了死循环
+  // （现场实测：`since=379` 又返回 m_379、nextSince 仍是 379）。上面那段语料**不带写者戳**，
+  // 所以它当年看不见这个 bug —— 这里刻意带上（照 post() 的真形状）。
+  const st = init()
+  for (const w of ['w1', 'w2']) { st.writer = w; for (let i = 0; i < 6; i++) post(st, { holderId: 'agent:' + w, name: w }, { body: w + i }, () => 1000) }
+  const a1 = filterMessages(st, { since: 1, limit: 4 })
+  const a2 = filterMessages(st, { since: a1.nextSince, limit: 4 })
+  const b1 = a1.messages.map(m => m.body), b2 = a2.messages.map(m => m.body)
+  ok(b2.length > 0 && !b2.some(b => b1.includes(b)),
+    'filterMessages: 带写者戳时按 nextSince 翻页**不重送**（旧实现会把 seq 相等的那条再送一遍）',
+    JSON.stringify({ page1: b1, nextSince: a1.nextSince, page2: b2 }))
+  let cur = 1, rounds = 0
+  const seen = new Set()
+  for (;;) {
+    const r = filterMessages(st, { since: cur, limit: 4 })
+    if (!r.returned) break
+    for (const m of r.messages) seen.add(m.msgId)
+    cur = r.nextSince
+    if (++rounds > 20) break
+  }
+  // 要保的性质是**有限轮 + 不重复 + 覆盖游标之后的全部**：`since=1` 按"严格大于"匹配，
+  // 所以 seq=1 那条本身不在 forward 窗口内（读它要靠 tail 模式）—— 故期望 total-1。
+  // 旧实现下这个循环**永不终止**（rounds > 20），这才是被挡住的回归。
+  ok(rounds <= 20 && seen.size === st.messages.length - 1,
+    'filterMessages: 按 nextSince 迭代**有限轮读完且不重复**（旧实现在此死循环）',
+    JSON.stringify({ rounds, seen: seen.size, expected: st.messages.length - 1, total: st.messages.length }))
+}
+{
+  // 单元 G：latestSeq 与 earliestSeq **同范围**（都只按 channel 收窄，不看 since）。旧实现取整个文件的
+  // 最后一条，于是按频道读的调用方拿 nextSince 与 latestSeq 比会以为自己**永远没追平**
+  // （现场：general 的 379 vs 全文件的 403 —— 差的 24 条全在别的频道）。
+  const st = init()
+  st.writer = 'w1'
+  post(st, { holderId: 'agent:a', name: 'A' }, { body: 'a1', channel: 'ch-a' }, () => 1000)
+  post(st, { holderId: 'agent:a', name: 'A' }, { body: 'b1', channel: 'ch-b' }, () => 1000)
+  post(st, { holderId: 'agent:a', name: 'A' }, { body: 'b2', channel: 'ch-b' }, () => 1000)
+  const ra = filterMessages(st, { channel: 'ch-a' })
+  ok(ra.latestSeq === ra.nextSince,
+    'filterMessages: 频道过滤下 latestSeq 与 nextSince 同范围（相等即已追平；旧实现取全局最大 ⇒ 永远"没追平"）',
+    JSON.stringify({ latestSeq: ra.latestSeq, nextSince: ra.nextSince, earliestSeq: ra.earliestSeq }))
+}
 
 // ===== 8. blockers（wait 使用） =====
 console.log('# blockers')

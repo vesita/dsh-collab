@@ -196,18 +196,26 @@ console.log('# 游标是 (seq, writer) 复合值：撞 seq 时按游标迭代一
     '负向对照（RED）：旧的纯数字游标在 since=2 时把两条 seq=2 全漏掉（只剩 m_3@wB）',
     show(after.map(m => m.msgId)))
 
-  // 数字入参向后兼容：解释为 (n, "") —— 它是 (n) 这一格里的**最小**位置，所以 seq 恰好等于 n
-  // 的记录会**再送一次**（不漏，至多重送），这正是"无损优先于不重"的口径。
+  // 数字入参（向后兼容写法）按 **seq 严格大于 n** 匹配：语义是"我已经读到 n 了"，
+  // 因此 `since = nextSince` 的翻页**一定前进**。旧实现一律按复合全序比较，裸数字归一成 `(n, "")`
+  // 会把 seq 恰好为 n 的那条**永远再送** —— 于是"按 nextSince 翻页"成了死循环
+  // （现场实测：`since=379` 又返回 m_379、`nextSince` 仍是 379）。
+  // **代价（刻意记在这里）**：seq 相撞时数字游标定位不到是哪一位写者，可能**跳过同 seq 的另一位**；
+  // 上面那条 RED 就是这个形态。要一条不漏必须用返回的 `nextCursor`（复合值）—— 即上一段断言的那条路。
   const numeric = filterMessages(st, { since: 2, limit: 10 })
-  ok(same(numeric.messages.map(m => m.msgId), ['m_2@wA', 'm_2@wB', 'm_3@wB']),
-    '数字 since=2 ⇒ (2, "") 之后：两条 seq=2 都还在（不漏），只是被重送一次',
+  ok(same(numeric.messages.map(m => m.msgId), ['m_3@wB']),
+    '数字 since=2 = 严格在 seq 2 之后：不再重送（旧实现重送 ⇒ nextSince 翻页死循环）；同 seq 的另一位要 nextCursor 才不漏',
     show(numeric.messages.map(m => m.msgId)))
   const numericAt1 = filterMessages(st, { since: 1, limit: 10 })
-  ok(same(numericAt1.messages.map(m => m.msgId), ['m_1@wA', 'm_2@wA', 'm_2@wB', 'm_3@wB']),
-    '数字 since=1 ⇒ (1, "") 之后：一条都不漏（seq=1 的那条也被重送）',
+  ok(same(numericAt1.messages.map(m => m.msgId), ['m_2@wA', 'm_2@wB', 'm_3@wB']),
+    '数字 since=1 = 严格在 seq 1 之后（seq=1 那条不在窗口内 —— 读它靠 tail 模式）',
     show(numericAt1.messages.map(m => m.msgId)))
-  ok(same(parseCursor(3), { seq: 3, writer: '' }) && same(parseCursor('3@wA'), { seq: 3, writer: 'wA' }),
-    'parseCursor：数字 ⇒ (n, "")；字符串 ⇒ 原样复合值', show([parseCursor(3), parseCursor('3@wA')]))
+  ok(
+    same(parseCursor(3), { seq: 3, writer: '', bare: true }) &&
+      same(parseCursor('3'), { seq: 3, writer: '', bare: true }) &&
+      same(parseCursor('3@wA'), { seq: 3, writer: 'wA' }),
+    'parseCursor：裸 seq（数字，或无 @ 的字符串）⇒ 标 bare（按 seq 严格大于）；`<seq>@<writer>` ⇒ 原样复合值',
+    show([parseCursor(3), parseCursor('3'), parseCursor('3@wA')]))
 }
 
 console.log('# release 终态化：墓碑让"已释放"不被旧副本翻案，且 GC 规则确定性')
