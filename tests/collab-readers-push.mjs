@@ -81,6 +81,12 @@ const mkClaim = (o) => Object.assign({
 const deliveries = []
 /** 全文件共享的 notify 账本：末尾用它做"旧 reason 取值彻底消失"的全局扫描。 */
 const allNotifies = []
+/**
+ * 全文件共享的 **steer** 账本（单元 E 的定向唤醒 + 单元 F 的广播推送）：这些消息经
+ * `agent.steer` 投递（会唤醒会话），与 `deliveries`（`agent.inject`，不唤醒）是两条通道；
+ * 末尾的 (a) 断言对**两条通道的每一条**都做来源形状检查 —— "投递出去的每条消息"一个字不少。
+ */
+const steerDeliveries = []
 
 /**
  * (a) 来源形状：客户端分流只看 `source.kind`（dsh-client-ui-chat/lib/client.js:6058），
@@ -1040,7 +1046,7 @@ console.log('# 定向唤醒：探活三分支 + idle 二次确认 + 令牌校验
     id,
     session: { header: { cwd: CWD } },
     status,
-    steer: (message) => steers.push({ id, message }),
+    steer: (message) => { steers.push({ id, message }); steerDeliveries.push({ sessionId: id, message }) },
     inject: (message) => steers.push({ id, inject: message })
   })
   const RUN = mkTarget('run-target', 'running')
@@ -1156,6 +1162,215 @@ console.log('# 定向唤醒：探活三分支 + idle 二次确认 + 令牌校验
 }
 
 // ════════════════════════════════════════════════════════════════════════
+// 3c. 单元 F：广播推送（push）—— 受众 + 门控三分支 + 令牌绑定受众集合
+// ════════════════════════════════════════════════════════════════════════
+// 用户实测的硬伤：广播没有出口（`src/awareness.ts` 只渲染 claims、完全不碰 messages），
+// 于是除了读者主动 op=read，没有一条广播会进任何人的上下文 —— 这就是"改成推送制"的由来。
+// 这一节把三件事各钉死：① 受众怎么算（general / path，都排除自己）；② 门控三分支
+// （全在跑 ⇒ 直接整批 steer / 有任一 idle ⇒ 一个都不投递 + 一个令牌 / 超上限 ⇒ 拒绝）；
+// ③ 令牌绑定"这一次广播"（频道 + 受众集合）—— 受众变了即失效。
+console.log('# 广播推送：受众（general / path）+ 门控三分支 + 令牌绑定受众集合')
+{
+  let steers = []
+  const resetSteers = () => { steers = [] }
+  const mkTarget = (id, status) => ({
+    id,
+    session: { header: { cwd: CWD } },
+    status,
+    steer: (m) => { steers.push({ id, message: m }); steerDeliveries.push({ sessionId: id, message: m }) }
+  })
+  const RUN_A = mkTarget('push-run-a', 'running')
+  const RUN_B = mkTarget('push-run-b', 'running')
+  const IDLE_C = mkTarget('push-idle-c', 'idle')
+  const AGENTS = { [RUN_A.id]: RUN_A, [RUN_B.id]: RUN_B, [IDLE_C.id]: IDLE_C }
+  const exec = (id) => ({ agent: { id, session: { header: { cwd: CWD } } } })
+  const boardOf = (h) => h.tools.find((t) => t.name === 'collab_board')
+  const countSteers = (id) => steers.filter((s) => s.id === id).length
+  const steerIds = () => steers.map((s) => s.id)
+  const audienceIds = (rep) => (rep && rep.audience ? rep.audience.map((e) => e.target) : [])
+
+  // ① general 受众 = 全部持有人（排除自己）+ 全部在跑 ⇒ 直接整批 steer、不发令牌
+  {
+    const h = await makeHarness({ liveSessions: [RUN_A.id, RUN_B.id], agentObjects: AGENTS })
+    await h.callLock({ op: 'claim', paths: ['src/a/'], ttlSec: 600 }, RUN_A.id)
+    await h.callLock({ op: 'claim', paths: ['src/b/'], ttlSec: 600 }, RUN_B.id)
+    resetSteers()
+    const res = await boardOf(h).execute({ op: 'post', channel: 'general', body: '全在跑广播', push: true }, exec('me'))
+    const rep = res.data && res.data.push
+    ok(res.ok === true && rep && rep.supported === true, '① push 返回 supported:true 的 push 报告', JSON.stringify(rep))
+    ok(JSON.stringify(audienceIds(rep).slice().sort()) === JSON.stringify(['agent:' + RUN_A.id, 'agent:' + RUN_B.id]),
+      '①【受众】general = 全部持有人且**排除投递方自己**', JSON.stringify(audienceIds(rep)))
+    ok(rep.audienceCount === 2 && rep.idleCount === 0 && rep.runningCount === 2,
+      '① general 受众恰好 A/B 两人、全在跑', JSON.stringify({ n: rep.audienceCount, idle: rep.idleCount, run: rep.runningCount }))
+    ok(rep.delivered === true && rep.confirmToken === undefined && rep.pending === undefined,
+      '① 全在跑 ⇒ 直接投递、**不发令牌**', JSON.stringify({ delivered: rep.delivered, tok: rep.confirmToken }))
+    ok(countSteers(RUN_A.id) === 1 && countSteers(RUN_B.id) === 1 && steers.length === 2,
+      '①【门控】每人 steer 恰好 1 次（共 2 次）', 'ids=' + JSON.stringify(steerIds()))
+    ok(steers.every((s) => sourceShapeOk(s.message)),
+      '① 广播推送消息 source 显式非 user（kind/form + 非空 summary）', JSON.stringify(steers.map((s) => s.message && s.message.source)))
+    const txt = steers[0] && steers[0].message && steers[0].message.content[0] && steers[0].message.content[0].text
+    ok(/general/.test(String(txt)) && /全在跑广播/.test(String(txt)) && /Push Worker/.test(String(txt)),
+      '① 短通知带频道 + 作者 + 正文摘要', JSON.stringify(txt))
+    ok(h.readState().messages.length === 1, '①【不重复】留言恰好 1 条（推送不改留言数）', 'messages=' + h.readState().messages.length)
+  }
+
+  // ② path 受众 = 声明重叠者（含后代），排除自己、排除不重叠者
+  {
+    const h = await makeHarness({ liveSessions: [RUN_A.id, RUN_B.id, IDLE_C.id], agentObjects: AGENTS })
+    await h.callLock({ op: 'claim', paths: ['src/a/x/'], ttlSec: 600 }, RUN_A.id)      // 重叠
+    await h.callLock({ op: 'claim', paths: ['src/a/y/sub/'], ttlSec: 600 }, RUN_B.id)  // 后代 ⇒ 重叠（与 x/ 不冲突）
+    await h.callLock({ op: 'claim', paths: ['src/b/'], ttlSec: 600 }, IDLE_C.id)       // 不重叠
+    resetSteers()
+    const res = await boardOf(h).execute({ op: 'post', channel: 'path:src/a/', body: '路径广播', push: true }, exec('me'))
+    const rep = res.data && res.data.push
+    ok(JSON.stringify(audienceIds(rep).slice().sort()) === JSON.stringify(['agent:' + RUN_A.id, 'agent:' + RUN_B.id]),
+      '②【受众】path:src/a/ 只含重叠持有人（含后代 src/a/y/sub/）', JSON.stringify(audienceIds(rep)))
+    ok(!audienceIds(rep).includes('agent:' + IDLE_C.id), '② path 受众排除不重叠的 src/b/ 持有人', JSON.stringify(audienceIds(rep)))
+  }
+
+  // ③ 有任一 idle ⇒ **一个都不投递** + 受众预览 + 一个令牌；确认步对每人 steer 恰好 1 次
+  {
+    const h = await makeHarness({ liveSessions: [RUN_A.id, RUN_B.id, IDLE_C.id], agentObjects: AGENTS })
+    await h.callLock({ op: 'claim', paths: ['src/a/'], ttlSec: 600 }, RUN_A.id)
+    await h.callLock({ op: 'claim', paths: ['src/b/'], ttlSec: 600 }, RUN_B.id)
+    await h.callLock({ op: 'claim', paths: ['src/c/'], ttlSec: 600 }, IDLE_C.id)
+    resetSteers()
+    const r1 = await boardOf(h).execute({ op: 'post', channel: 'general', body: '有 idle 的广播', push: true }, exec('me'))
+    const w1 = r1.data && r1.data.push
+    ok(r1.ok === true && w1 && w1.delivered === false && w1.mode === 'idle',
+      '③ 有任一 idle ⇒ **不投递**（delivered:false, mode:idle）', JSON.stringify({ d: w1 && w1.delivered, m: w1 && w1.mode }))
+    ok(steers.length === 0, '③【门控】未确认前 steer 次数恰好 0', 'ids=' + JSON.stringify(steerIds()))
+    ok(w1.idleCount === 1 && w1.runningCount === 2, '③ 受众预览如实统计 idle/running', JSON.stringify({ idle: w1.idleCount, run: w1.runningCount }))
+    ok(w1.willDeliverCount === 3 && w1.willWakeIdleCount === 1,
+      '③ 如实给出"总计将投递 / 将唤醒几个"（3 人，其中 idle 1）', JSON.stringify({ d: w1.willDeliverCount, w: w1.willWakeIdleCount }))
+    ok((w1.audience || []).every((e) => typeof e.target === 'string' && typeof e.status === 'string' && typeof e.name === 'string'),
+      '③ 受众预览逐个列出 {目标, 状态, name}', JSON.stringify(w1.audience))
+    const byTarget = Object.fromEntries((w1.audience || []).map((e) => [e.target, e.status]))
+    ok(byTarget['agent:' + IDLE_C.id] === 'idle' && byTarget['agent:' + RUN_A.id] === 'running',
+      '③ 预览里每个目标的真实状态（idle / running）', JSON.stringify(byTarget))
+    ok(typeof w1.confirmToken === 'string' && w1.confirmToken.length > 20,
+      '③ 返回**一个**覆盖本次广播的一次性令牌', JSON.stringify(w1.confirmToken))
+    ok(h.readState().messages.length === 1, '③【不重复】首次调用留言恰好 1 条', 'messages=' + h.readState().messages.length)
+
+    const r2 = await boardOf(h).execute({ op: 'post', channel: 'general', push: true, pushToken: w1.confirmToken }, exec('me'))
+    ok(r2.ok === true && r2.data.push && r2.data.push.mode === 'confirmed' && r2.data.push.confirmed === true,
+      '③ 确认步 ⇒ 整批投递（mode:confirmed）', JSON.stringify(r2.data && r2.data.push))
+    ok(countSteers(RUN_A.id) === 1 && countSteers(RUN_B.id) === 1 && countSteers(IDLE_C.id) === 1,
+      '③【门控】确认步对每个收件人 steer 恰好 1 次', 'ids=' + JSON.stringify(steerIds()))
+    ok(h.readState().messages.length === 1, '③【不重复】确认步**不再写留言**：板上恰好 1 条', 'messages=' + h.readState().messages.length)
+    const r3 = await boardOf(h).execute({ op: 'post', pushToken: w1.confirmToken }, exec('me'))
+    ok(r3.ok === false && /used/.test(String(r3.message)), '③ 令牌一次性：用过再传被拒（used）', JSON.stringify(r3))
+    ok(steers.length === 3, '③ 一次性：被拒时不再 steer（仍是 3 次）', 'ids=' + JSON.stringify(steerIds()))
+  }
+
+  // ④ 受众为空 ⇒ 不推送、如实说明，留言只落板
+  {
+    const h = await makeHarness({ liveSessions: [], agentObjects: AGENTS })
+    resetSteers()
+    const res = await boardOf(h).execute({ op: 'post', channel: 'general', body: '没有别人', push: true }, exec('me'))
+    const rep = res.data && res.data.push
+    ok(res.ok === true && rep && rep.mode === 'empty' && rep.audienceCount === 0 && rep.delivered === false,
+      '④【受众】空交集 ⇒ 不推送（mode:empty）', JSON.stringify(rep))
+    ok(/没有其他持有人|未推送/.test(String(rep.note)), '④ 空受众如实说明', String(rep.note))
+    ok(steers.length === 0, '④ 空受众：一次都不 steer', 'ids=' + JSON.stringify(steerIds()))
+    ok(h.readState().messages.length === 1, '④ 空受众：留言只落板且恰好 1 条', 'messages=' + h.readState().messages.length)
+  }
+
+  // ⑤ 受众数超上限 ⇒ 拒绝（不推送、不发令牌、不写留言、不静默推一半）
+  {
+    const prev = process.env.DSH_COLLAB_PUSH_MAX
+    process.env.DSH_COLLAB_PUSH_MAX = '1'
+    const h = await makeHarness({ liveSessions: [RUN_A.id, RUN_B.id], agentObjects: AGENTS })
+    if (prev === undefined) delete process.env.DSH_COLLAB_PUSH_MAX
+    else process.env.DSH_COLLAB_PUSH_MAX = prev
+    await h.callLock({ op: 'claim', paths: ['src/a/'], ttlSec: 600 }, RUN_A.id)
+    await h.callLock({ op: 'claim', paths: ['src/b/'], ttlSec: 600 }, RUN_B.id)
+    resetSteers()
+    const res = await boardOf(h).execute({ op: 'post', channel: 'general', body: '超限广播', push: true }, exec('me'))
+    ok(res.ok === false && res.error === 'bad-request', '⑤【上限】超上限 ⇒ 拒绝（bad-request）', JSON.stringify({ ok: res.ok, error: res.error }))
+    const rep = res.push
+    ok(!!rep && rep.reason === 'audience-over-limit' && rep.audienceCount === 2 && rep.maxAudience === 1,
+      '⑤ 如实列出受众与上限', JSON.stringify(rep))
+    ok(steers.length === 0, '⑤【上限】拒绝时 steer 0 次（不做"静默推一半"）', 'ids=' + JSON.stringify(steerIds()))
+    ok(h.readState().messages.length === 0, '⑤ 拒绝发生在写入之前：留言 0 条', 'messages=' + h.readState().messages.length)
+  }
+
+  // ⑥ 令牌绑定"这一次广播"：受众变化 / 换频道 / 乱造 / 过期 / 他人令牌 ⇒ 一律拒绝且不 steer
+  {
+    // (a) 受众**新增一人** ⇒ 失效
+    const hAdd = await makeHarness({ liveSessions: [RUN_A.id, IDLE_C.id], agentObjects: AGENTS })
+    await hAdd.callLock({ op: 'claim', paths: ['src/a/'], ttlSec: 600 }, RUN_A.id)
+    await hAdd.callLock({ op: 'claim', paths: ['src/c/'], ttlSec: 600 }, IDLE_C.id)
+    resetSteers()
+    const rMintAdd = await boardOf(hAdd).execute({ op: 'post', channel: 'general', body: '绑定-新增', push: true }, exec('me'))
+    const tokAdd = rMintAdd.data.push.confirmToken
+    await hAdd.callLock({ op: 'claim', paths: ['src/d/'], ttlSec: 600 }, RUN_B.id) // 受众 +1
+    const rAdd = await boardOf(hAdd).execute({ op: 'post', pushToken: tokAdd }, exec('me'))
+    ok(rAdd.ok === false && rAdd.error === 'bad-request' && /audience-changed/.test(String(rAdd.message)),
+      '⑥a【绑定受众】受众新增一人 ⇒ 拒绝（audience-changed）', JSON.stringify(rAdd))
+    ok(steers.length === 0, '⑥a 受众变化被拒时不 steer', 'ids=' + JSON.stringify(steerIds()))
+    ok(hAdd.readState().messages.length === 1, '⑥a 被拒的确认步不写留言（仍 1 条）', 'messages=' + hAdd.readState().messages.length)
+
+    // (b) 受众**减一人**（path 频道：持有人释放声明）⇒ 失效
+    const hDel = await makeHarness({ liveSessions: [RUN_A.id, IDLE_C.id], agentObjects: AGENTS })
+    await hDel.callLock({ op: 'claim', paths: ['src/a/x/'], ttlSec: 600 }, RUN_A.id)
+    await hDel.callLock({ op: 'claim', paths: ['src/a/y/'], ttlSec: 600 }, IDLE_C.id) // 与 x/ 不冲突 ⇒ 两条都在
+    resetSteers()
+    const rMintDel = await boardOf(hDel).execute({ op: 'post', channel: 'path:src/a/', body: '绑定-减少', push: true }, exec('me'))
+    const tokDel = rMintDel.data.push.confirmToken
+    const lr = await hDel.callLock({ op: 'list' }, RUN_A.id)
+    const cid = ((lr.data && lr.data.claims) || []).find((c) => c.holderId === 'agent:' + RUN_A.id).claimId
+    ok(typeof cid === 'string' && cid.length > 0, '⑥b setup: 拿到 run-a 的 claimId', JSON.stringify(cid))
+    await hDel.callLock({ op: 'release', claimId: cid }, RUN_A.id) // 受众 -1
+    const rDel = await boardOf(hDel).execute({ op: 'post', pushToken: tokDel }, exec('me'))
+    ok(rDel.ok === false && rDel.error === 'bad-request' && /audience-changed/.test(String(rDel.message)),
+      '⑥b【绑定受众】受众少一人 ⇒ 拒绝（audience-changed）', JSON.stringify(rDel))
+    ok(steers.length === 0, '⑥b 受众减少被拒时不 steer', 'ids=' + JSON.stringify(steerIds()))
+
+    // (c) 换频道 / 乱造 / 他人令牌 / 有效确认 / 重放
+    const hTok = await makeHarness({ liveSessions: [RUN_A.id, IDLE_C.id], agentObjects: AGENTS })
+    await hTok.callLock({ op: 'claim', paths: ['src/a/'], ttlSec: 600 }, RUN_A.id)
+    await hTok.callLock({ op: 'claim', paths: ['src/c/'], ttlSec: 600 }, IDLE_C.id)
+    resetSteers()
+    const rMintTok = await boardOf(hTok).execute({ op: 'post', channel: 'general', body: '绑定-令牌', push: true }, exec('me'))
+    const tok = rMintTok.data.push.confirmToken
+    const rChan = await boardOf(hTok).execute({ op: 'post', channel: 'path:src/a/', pushToken: tok }, exec('me'))
+    ok(rChan.ok === false && /channel-mismatch/.test(String(rChan.message)),
+      '⑥c 换频道 ⇒ 拒绝（channel-mismatch）', JSON.stringify(rChan))
+    ok(steers.length === 0, '⑥c 换频道被拒时不 steer', 'ids=' + JSON.stringify(steerIds()))
+    const rFake = await boardOf(hTok).execute({ op: 'post', pushToken: 'not.a.real.token' }, exec('me'))
+    ok(rFake.ok === false && rFake.error === 'bad-request', '⑥c 乱造令牌 ⇒ 拒绝', JSON.stringify(rFake))
+    ok(steers.length === 0, '⑥c 乱造被拒时不 steer', 'ids=' + JSON.stringify(steerIds()))
+    const rOther = await boardOf(hTok).execute({ op: 'post', pushToken: tok }, exec('other-holder'))
+    ok(rOther.ok === false && /caller-mismatch/.test(String(rOther.message)), '⑥c 他人令牌 ⇒ 拒绝（caller-mismatch）', JSON.stringify(rOther))
+    ok(steers.length === 0, '⑥c 他人令牌被拒时不 steer', 'ids=' + JSON.stringify(steerIds()))
+
+    const rOk = await boardOf(hTok).execute({ op: 'post', pushToken: tok }, exec('me'))
+    ok(rOk.ok === true && rOk.data.push && rOk.data.push.pushed && rOk.data.push.pushed.length === 2,
+      '⑥c 有效令牌 ⇒ 对两个受众各投一次', JSON.stringify(rOk.data && rOk.data.push))
+    ok(countSteers(RUN_A.id) === 1 && countSteers(IDLE_C.id) === 1, '⑥c 每个收件人 steer 恰好 1 次', 'ids=' + JSON.stringify(steerIds()))
+    ok(hTok.readState().messages.length === 1, '⑥c【不重复】确认成功后留言仍恰好 1 条', 'messages=' + hTok.readState().messages.length)
+
+    // (d) 过期 ⇒ 拒绝且不 steer（TTL 调到 20ms）
+    const prevTtl = process.env.DSH_COLLAB_WAKE_TTL_SEC
+    process.env.DSH_COLLAB_WAKE_TTL_SEC = '0.02'
+    const hExp = await makeHarness({ liveSessions: [RUN_A.id, IDLE_C.id], agentObjects: AGENTS })
+    if (prevTtl === undefined) delete process.env.DSH_COLLAB_WAKE_TTL_SEC
+    else process.env.DSH_COLLAB_WAKE_TTL_SEC = prevTtl
+    await hExp.callLock({ op: 'claim', paths: ['src/a/'], ttlSec: 600 }, RUN_A.id)
+    await hExp.callLock({ op: 'claim', paths: ['src/c/'], ttlSec: 600 }, IDLE_C.id)
+    resetSteers()
+    const rMintExp = await boardOf(hExp).execute({ op: 'post', channel: 'general', body: '绑定-过期', push: true }, exec('me'))
+    const tokExp = rMintExp.data.push.confirmToken
+    await new Promise((r) => setTimeout(r, 80))
+    const rExp = await boardOf(hExp).execute({ op: 'post', pushToken: tokExp }, exec('me'))
+    ok(rExp.ok === false && /expired/.test(String(rExp.message)), '⑥d 过期令牌 ⇒ 拒绝（expired）', JSON.stringify(rExp))
+    ok(steers.length === 0, '⑥d 过期被拒时不 steer', 'ids=' + JSON.stringify(steerIds()))
+    ok(hExp.readState().messages.length === 1, '⑥d 过期确认步不写留言（仍 1 条）', 'messages=' + hExp.readState().messages.length)
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════
 // 4. 全局断言：(a) 每条投递的来源形状 + 旧通道/旧 reason 的彻底消失
 // ════════════════════════════════════════════════════════════════════════
 console.log('# (a) 投递出去的**每一条**消息来源都显式非 user')
@@ -1167,6 +1382,14 @@ console.log('# (a) 投递出去的**每一条**消息来源都显式非 user')
     bad.map(d => d.sessionId + ' -> ' + sourceShapeWhy(d.message)).join(' | '))
   const texts = deliveries.map(d => noticeText(d))
   ok(texts.every(t => t.includes('[dsh-collab]')), '(a) 每条投递的正文都带 dsh-collab 前缀（可追溯）', JSON.stringify(texts.slice(0, 2)))
+  // steer 是另一条通道（会唤醒会话）：定向唤醒（E）与广播推送（F）的每一条也都要显式来源。
+  ok(steerDeliveries.length > 0, '(a) 本次至少 steer 投递过一条（否则下面的"每一条"是空断言）', 'steers=' + steerDeliveries.length)
+  const badSteer = steerDeliveries.filter(d => !sourceShapeOk(d.message))
+  ok(badSteer.length === 0,
+    '(a) 每条 steer 投递的 source 也都是 {kind:dsh-collab, form:notice} 且 summary 非空 ≤120',
+    badSteer.map(d => d.sessionId + ' -> ' + sourceShapeWhy(d.message)).join(' | '))
+  const steerTexts = steerDeliveries.map(d => noticeText(d))
+  ok(steerTexts.every(t => t.includes('[dsh-collab]')), '(a) 每条 steer 投递的正文都带 dsh-collab 前缀', JSON.stringify(steerTexts.slice(0, 2)))
 }
 
 console.log('# 旧通道的 reason 取值不再出现在任何一次 notify 里')

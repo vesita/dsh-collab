@@ -325,12 +325,12 @@ return {
       if (a.op === 'reap') return store.reapOp(a, h, aId, agent)
       return { ok: false, error: 'bad-request', message: '未知操作：' + String(a.op) }
     })
-    // ---- 定向唤醒（单元 E）在本形态**如实降级** ----
+    // ---- 定向唤醒（单元 E）与广播推送（单元 F）在本形态**如实降级** ----
     // 受限动态宿主（code.host 是纯文本、不接受 import）没有 @deepseek-ai/dsh-llm，构造不出
     // 「显式来源的 UserMessage」；也没有可依赖的 agent.steer 面。AGENTS.md §1 禁止手抄构造函数
     // 副本、也禁止退回任何会冒充用户的通道，所以这里**不投递**：留言照常落板（只落一条），
-    // wake 一侧如实返回"本形态不支持唤醒，已落板"。包形态（src/tools.ts）才有完整能力。
-    const WAKE_UNSUPPORTED_NOTE = '本形态（受限动态宿主）不支持定向唤醒：没有 @deepseek-ai/dsh-llm，构造不出显式来源的 UserMessage，也没有 agent.steer 面。本条留言已落板（只落一条），对方下次 collab_board op=read 时可见。'
+    // 投递意图一侧如实返回"本形态不支持"，绝不假装投递成功。包形态（src/tools.ts）才有完整能力。
+    const DELIVERY_UNSUPPORTED_NOTE = '本形态（受限动态宿主）不支持投递（定向唤醒 / 广播推送）：没有 @deepseek-ai/dsh-llm，构造不出显式来源的 UserMessage，也没有 agent.steer 面。本条留言已落板（只落一条），对方下次 collab_board op=read 时可见。'
     const board = exec((a, h, name, aId, agent) => {
       if (a.op === 'post') return postBoard(a, h, aId, agent)
       if (a.op === 'read') return store.msgs(a, aId, agent)
@@ -338,21 +338,45 @@ return {
     })
     async function postBoard(a, h, aId, agent) {
       const hasWake = a.wake !== undefined
-      const hasToken = a.wakeToken !== undefined
-      if (!hasWake && !hasToken) return store.mutate(s => post(s, h, a, now), aId, agent)
+      const hasWakeToken = a.wakeToken !== undefined
+      const hasPushParam = a.push !== undefined
+      const hasPushToken = a.pushToken !== undefined
+      if (!hasWake && !hasWakeToken && !hasPushParam && !hasPushToken) return store.mutate(s => post(s, h, a, now), aId, agent)
+      // push 只认布尔（与包形态同一判据）：字符串 / 数字一律挡回，不写留言。
+      if (hasPushParam && a.push !== true && a.push !== false) {
+        return { ok: false, error: 'bad-request', message: 'push 必须是布尔值（true = 广播推送；false / 省略 = 只落板）；本条**没有写入**。' }
+      }
+      if ((hasWake || hasWakeToken) && (a.push === true || hasPushToken)) {
+        return { ok: false, error: 'bad-request', message: 'wake（定向唤醒）与 push（广播推送）是两条互斥的投递路径：本条**没有写入**，请只选一条。' }
+      }
+      // 广播确认步：**只推送、不再写留言**；本形态不投递 ⇒ 既不改状态、也绝不写第二条留言。
+      if (hasPushToken) {
+        return { ok: true, changed: false, data: { delivered: false, deliveryNote: DELIVERY_UNSUPPORTED_NOTE, push: { supported: false, mode: 'unsupported-host', reason: 'unsupported-host', delivered: false, pending: false, note: DELIVERY_UNSUPPORTED_NOTE } } }
+      }
+      // 广播第一次调用：照常落板（恰好一条），推送侧如实降级。
+      if (a.push === true) {
+        const res = await store.mutate(s => post(s, h, a, now), aId, agent)
+        if (res && res.ok === true && res.data) {
+          res.data.push = { supported: false, mode: 'unsupported-host', reason: 'unsupported-host', delivered: false, pending: false, note: DELIVERY_UNSUPPORTED_NOTE }
+          res.data.delivered = false
+          res.data.deliveryNote = DELIVERY_UNSUPPORTED_NOTE
+        }
+        return res
+      }
+      if (hasPushParam) return store.mutate(s => post(s, h, a, now), aId, agent) // push:false 且无令牌 ⇒ 纯落板
       if (typeof a.wake !== 'string' || !a.wake.trim()) {
         return { ok: false, error: 'bad-request', message: 'wake 必须是目标会话 id（非空字符串，可带 agent: 前缀）；本条**没有写入**。' }
       }
       const target = a.wake.trim().replace(/^agent:/, '')
-      if (hasToken) {
+      if (hasWakeToken) {
         // 确认步**只做唤醒**；本形态不投递，所以既不改状态、也绝不写第二条留言。
-        return { ok: true, changed: false, data: { target: target, delivered: false, deliveryNote: WAKE_UNSUPPORTED_NOTE, wake: { target: target, delivered: false, pending: false, supported: false, reason: 'unsupported-host', note: WAKE_UNSUPPORTED_NOTE } } }
+        return { ok: true, changed: false, data: { target: target, delivered: false, deliveryNote: DELIVERY_UNSUPPORTED_NOTE, wake: { target: target, delivered: false, pending: false, supported: false, reason: 'unsupported-host', note: DELIVERY_UNSUPPORTED_NOTE } } }
       }
       const res = await store.mutate(s => post(s, h, a, now), aId, agent)
       if (res && res.ok === true && res.data) {
-        res.data.wake = { target: target, delivered: false, pending: false, supported: false, reason: 'unsupported-host', note: WAKE_UNSUPPORTED_NOTE }
+        res.data.wake = { target: target, delivered: false, pending: false, supported: false, reason: 'unsupported-host', note: DELIVERY_UNSUPPORTED_NOTE }
         res.data.delivered = false
-        res.data.deliveryNote = WAKE_UNSUPPORTED_NOTE
+        res.data.deliveryNote = DELIVERY_UNSUPPORTED_NOTE
       }
       return res
     }
@@ -382,7 +406,7 @@ return {
     })
     const boardTool = harness.defineTool({
       name: 'collab_board',
-      description: '跨会话协作留言板：post 往共享状态文件留痕 / read 增量读取。用于同一仓库上互不相识的会话之间交接进度与协商。**不投递、不唤醒任何会话**：对方只在它自己 read 时才看得到。本形态是受限动态宿主：可选参数 wake / wakeToken 在契约里存在，但**一律如实降级**为"不支持唤醒，已落板"（本形态没有 dsh-llm，构造不出显式来源消息，也没有 steer 面）；确有 wake 需求请改用包形态。read 两种模式：不给 since（或 0）读**最新** limit 条（追平用）；给 since>0 从该游标**往后**读 limit 条（增量用，旧→新）——按返回的 nextSince 继续调、直到 hasMore=false 才算读完。',
+      description: '跨会话协作留言板：post 往共享状态文件留痕 / read 增量读取。用于同一仓库上互不相识的会话之间交接进度与协商。**不投递、不唤醒任何会话**：对方只在它自己 read 时才看得到。本形态是受限动态宿主：可选参数 push / pushToken / wake / wakeToken 在契约里存在，但**一律如实降级**为"不支持投递，已落板"（本形态没有 dsh-llm，构造不出显式来源消息，也没有 steer 面）；确有推送 / 唤醒需求请改用包形态。read 两种模式：不给 since（或 0）读**最新** limit 条（追平用）；给 since>0 从该游标**往后**读 limit 条（增量用，旧→新）——按返回的 nextSince 继续调、直到 hasMore=false 才算读完。',
       parameters: {
         type: 'object',
         additionalProperties: true,
@@ -391,8 +415,10 @@ return {
           channel: { type: 'string', description: '频道，默认 general；**精确匹配**的自由字符串（写什么就得按什么读，path: 频道与 claim 用同一套相对路径写法），未命中时返回会列出既有频道' },
           body: { type: 'string', maxLength: 8000, description: 'post 用，消息正文。上限 8000 字符（与 collab-core 的 MESSAGE_BODY_MAX_CHARS 同值）；超限由 post() 以 bad-request 挡回且**整条不写入**，不静默截断' },
           replyTo: { type: 'string', description: '回复的 msgId' },
-          wake: { type: 'string', description: 'post 用（可选）：定向唤醒的目标会话 id。**本形态（受限动态宿主）不支持唤醒**：带它时留言照常落板，wake 一侧如实返回 supported:false / reason:unsupported-host。' },
-          wakeToken: { type: 'string', description: 'post 用（可选）：二次确认令牌。本形态不支持唤醒，带它时**不写留言**、如实返回不支持（绝不会产生第二条留言）。' },
+          wake: { type: 'string', description: 'post 用（可选）：定向唤醒的目标会话 id。**本形态（受限动态宿主）不支持投递**：带它时留言照常落板，wake 一侧如实返回 supported:false / reason:unsupported-host。与 push 互斥。' },
+          wakeToken: { type: 'string', description: 'post 用（可选）：二次确认令牌。本形态不支持投递，带它时**不写留言**、如实返回不支持（绝不会产生第二条留言）。' },
+          push: { type: 'boolean', description: 'post 用（可选）：广播推送意图（true = 推送；false / 省略 = 只落板）。**本形态（受限动态宿主）不支持投递**：带 true 时留言照常落板（恰好一条），push 一侧如实返回 supported:false / reason:unsupported-host。与 wake 互斥。' },
+          pushToken: { type: 'string', description: 'post 用（可选）：广播确认令牌。本形态不支持投递，带它时**不写留言**、如实返回不支持（绝不会产生第二条留言）。' },
           since: { type: 'number', description: 'read 用：省略或 0 = 读最新 limit 条（tail）；>0 = 从该 seq 往后读 limit 条（forward，旧→新）。返回的 nextSince 是下一次的游标' },
           limit: { type: 'number', description: 'read 用，最多条数，默认 50，上限 200' }
         },

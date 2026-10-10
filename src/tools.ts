@@ -7,11 +7,16 @@
 // 单元 E 起，`collab_board op=post` 多了一条**定向唤醒**（`wake`）的可选路径：投递前先
 // 探活（`store.probeAgent`，真判据 `agent.status`），目标 idle 时必须由投递方**二次确认**
 // 才真的 steer。自动通知（access / push）一律**保持 inject（不唤醒）**，见各自模块。
+//
+// 单元 F 起，`op=post` 另有**广播推送**（`push: true`）：受众由频道现算（general = 全部持有人，
+// path:<p> = 声明重叠者，都排除自己），逐个探活后**全部在跑就整批 steer**；有任一 idle/unknown
+// 就一个都不投递、返回受众预览 + **一个绑定本次广播**的一次性令牌；受众超上限直接拒绝。
+// 令牌载荷绑定「频道 + 受众集合 + 投递方 + 到期」—— 受众变了即失效。
 
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
 import { boundContextSummary, createUserMessage } from '@deepseek-ai/dsh-llm'
-import { claim, release, heartbeat, post, teamScopeOverlaps, BOARD_NO_DELIVERY_HINT } from './collab-core.js'
-import type { HolderInput, PublishedClaim } from './collab-core.js'
+import { claim, release, heartbeat, post, teamScopeOverlaps, pushAudience, BOARD_NO_DELIVERY_HINT } from './collab-core.js'
+import type { HolderInput, PublishedClaim, PushAudience } from './collab-core.js'
 import type {
   AgentLike, CollabArgs, CollabContext, OpHandler, ToolDefinition, ToolExecContext, ToolResult
 } from './contract.js'
@@ -172,8 +177,11 @@ export function installTools(ctx: CollabContext, store: StateStore, push: PushAp
 
   /** 本实例的签名密钥（进程内、每次 installTools 现生成；重启即失效 —— 见上面的取舍）。 */
   const WAKE_SECRET = randomBytes(32)
-  /** 已被成功用掉的一次性令牌 → 到期时刻（GC 判据与令牌自己的 `e` 同源）。 */
-  const wakeUsed = new Map<string, number>()
+  /**
+   * 已被成功用掉的一次性令牌 → 到期时刻（GC 判据与令牌自己的 `e` 同源）。
+   * 定向唤醒（E）与广播推送（F）**共用这一张表**：键是完整的令牌串，天然不撞。
+   */
+  const usedTokens = new Map<string, number>()
 
   /** 令牌载荷：每一个字段都被签名覆盖，所以任何一项被改都过不了校验。 */
   interface WakePayload {
@@ -218,16 +226,16 @@ export function installTools(ctx: CollabContext, store: StateStore, push: PushAp
     return { ok: true, payload: { m: p.m, t: p.t, b: p.b, e: p.e, c: p.c, x: p.x } }
   }
 
-  /** 令牌 GC：`wakeUsed` 只保留未到期的条目（有界，与 sweep 同一"确定性规则只看数据"口径）。 */
-  function pruneWakeUsed(now: number): void {
-    for (const [k, exp] of wakeUsed) if (!(exp > now)) wakeUsed.delete(k)
+  /** 令牌 GC：`usedTokens` 只保留未到期的条目（有界，与 sweep 同一"确定性规则只看数据"口径）。 */
+  function pruneUsedTokens(now: number): void {
+    for (const [k, exp] of usedTokens) if (!(exp > now)) usedTokens.delete(k)
   }
 
   /** 完整校验：格式/签名 → 一次性 → 过期 → 目标一致 → 投递方一致。任何一条不过即拒绝。 */
   function verifyWakeToken(token: unknown, target: string, by: string, now: number): { ok: boolean; payload?: WakePayload; reason?: string } {
     const parsed = parseWakeToken(token)
     if (!parsed.ok) return parsed
-    if (wakeUsed.has(String(token).trim())) return { ok: false, reason: 'used' }
+    if (usedTokens.has(String(token).trim())) return { ok: false, reason: 'used' }
     if (!(parsed.payload.e > now)) return { ok: false, reason: 'expired' }
     if (parsed.payload.t !== target) return { ok: false, reason: 'target-mismatch' }
     if (parsed.payload.b !== by) return { ok: false, reason: 'caller-mismatch' }
@@ -299,7 +307,7 @@ export function installTools(ctx: CollabContext, store: StateStore, push: PushAp
     }
     if (probe.state === 'idle' || probe.state === 'unknown') {
       const now = store.now()
-      pruneWakeUsed(now)
+      pruneUsedTokens(now)
       const exp = now + WAKE_TTL_MS
       const token = mintWakeToken({ m: msgId, t: target, b: byHolder, e: exp, c: channel, x: excerpt })
       return {
@@ -327,7 +335,7 @@ export function installTools(ctx: CollabContext, store: StateStore, push: PushAp
    */
   async function confirmWake(target: string, token: string, h: HolderInput & { agent?: AgentLike }): Promise<ToolResult> {
     const now = store.now()
-    pruneWakeUsed(now)
+    pruneUsedTokens(now)
     const v = verifyWakeToken(token, target, h.holderId, now)
     if (!v.ok) {
       return { ok: false, error: 'bad-request', message: '唤醒令牌被拒绝（' + v.reason + '）：**未投递、未写留言**。令牌必须与首次返回的 confirmToken 一致，绑定同一目标与同一留言，且未过期、未被用过。' }
@@ -339,7 +347,7 @@ export function installTools(ctx: CollabContext, store: StateStore, push: PushAp
     const parts = wakeNoticeParts(h.name || h.holderId, v.payload.c, v.payload.x)
     const r = steerTarget(probe.agent, parts.text, parts.summary)
     if (!r.ok) return { ok: false, error: 'internal', message: 'steer 失败（' + r.error + '）：**未投递**，令牌未消耗，可重试。' }
-    wakeUsed.set(token.trim(), v.payload.e)
+    usedTokens.set(token.trim(), v.payload.e)
     return {
       ok: true,
       data: {
@@ -351,28 +359,298 @@ export function installTools(ctx: CollabContext, store: StateStore, push: PushAp
     }
   }
 
+  // ════════════════════════════════════════════════════════════════════════
+  // 单元 F：广播推送（push: true）+ 受众 + 门控 + 一次性令牌
+  // ════════════════════════════════════════════════════════════════════════
+  //
+  // 用户实测的硬伤：广播（`op=post`，不带 wake）**没有出口** —— 留言只写共享状态文件，
+  // 而 `src/awareness.ts` 每轮摘要只渲染 active claims、完全不碰 messages，所以除了读者
+  // 主动 `op=read`，没有一条广播会进任何人的上下文。单元 F 把广播改成**推送制**。
+  //
+  // 语义（照用户定的做，不加戏）：
+  //   · 受众由**频道**现算（`pushAudience`）：general = 全部持有人，path:<p> = 声明重叠者，
+  //     都排除投递方自己；受众里没有可投递的人 ⇒ 不推送、如实说明，留言只落板。
+  //   · 逐个探活（复用 `store.probeAgent`）：**全部在跑 ⇒ 直接整批 steer**（在跑就不需要
+  //     确认）；**有任一 idle/unknown ⇒ 一个都不投递**，返回受众预览 + 一次性令牌；
+  //     **受众数超上限 ⇒ 拒绝**（不推送、不发令牌，也不做"静默推一半"）。
+  //   · 令牌沿用单元 E 的 HMAC 方案，但载荷绑定「**频道 + 受众集合 + 投递方 + 到期**」：
+  //     受众变了（有人新 claim / 有人消失）⇒ 失效。一次性：成功投递才消耗，失败可重试。
+  //   · 内容是一条**短通知**（复用 E 的 notice 构造：真实 dsh-llm、显式非 user 来源），
+  //     带频道 + 作者 + 正文摘要（截断 160 字）；长正文留在板上。
+  //   · **不落状态文件**：受众与令牌都是本进程内存里的现算量，不进 SSOT、不参与 mergeDocs。
+
+  /** 广播受众上限。`DSH_COLLAB_PUSH_MAX` 可覆盖（正整数），默认 12 —— 超限**拒绝**而不是静默推一半。 */
+  const PUSH_MAX = ((): number => {
+    const n = Number(process.env.DSH_COLLAB_PUSH_MAX)
+    return Number.isFinite(n) && n > 0 ? Math.floor(n) : 12
+  })()
+
+  /** 令牌载荷：每个字段都被签名覆盖。受众 `a` 是**排序后**的 holderId 集合（确定性）。 */
+  interface PushPayload {
+    ch: string    // 频道（受众规则 + 通知文案都用它）
+    a: string[]   // 受众集合（holderId，排序）：受众一变，这个集合就不等了
+    b: string     // 投递方 holderId：只有发起人能确认
+    e: number     // 到期时刻（epoch ms）
+    m: string     // msgId：绑定这一条留言（可追溯）
+    n: string     // 投递方显示名（通知文案用）
+    x: string     // 正文摘要（通知文案用）
+  }
+
+  /** holderId → sessionId；非 `agent:` 前缀（如 `human:console`）返回 null（不可 steer）。 */
+  const holderToSession = (holderId: string): string | null => {
+    const m = /^agent:(.+)$/.exec(typeof holderId === 'string' ? holderId : '')
+    return m && m[1] ? m[1] : null
+  }
+
+  /** 频道归一：与 `post()` 同口径（空 / 非串 ⇒ `general`）。 */
+  const channelOf = (a: CollabArgs): string => (typeof a.channel === 'string' && a.channel.trim() ? a.channel.trim() : 'general')
+
+  function mintPushToken(p: PushPayload): string {
+    const body = b64url(JSON.stringify(p))
+    return body + '.' + b64url(wakeSig(body))
+  }
+
+  /** 只做"格式 + 签名"校验（字段逐个查类型）。**不抛**：令牌是输入，不是不变量。 */
+  function parsePushToken(token: unknown): { ok: boolean; payload?: PushPayload; reason?: string } {
+    const s = typeof token === 'string' ? token.trim() : ''
+    const at = s.indexOf('.')
+    if (at <= 0 || at >= s.length - 1) return { ok: false, reason: 'malformed' }
+    const body = s.slice(0, at)
+    const sig = s.slice(at + 1)
+    let got: Buffer
+    try { got = Buffer.from(sig, 'base64url') } catch (e) { return { ok: false, reason: 'malformed' } }
+    const expect = wakeSig(body)
+    if (got.length !== expect.length || !timingSafeEqual(got, expect)) return { ok: false, reason: 'bad-signature' }
+    let payload: any
+    try { payload = JSON.parse(Buffer.from(body, 'base64url').toString('utf8')) } catch (e) { return { ok: false, reason: 'malformed' } }
+    const p = payload as Partial<PushPayload>
+    if (!p || typeof p.ch !== 'string' || !p.ch || !Array.isArray(p.a) ||
+        !p.a.every((x): x is string => typeof x === 'string' && !!x) ||
+        typeof p.b !== 'string' || !p.b || typeof p.e !== 'number' ||
+        typeof p.m !== 'string' || typeof p.n !== 'string' || typeof p.x !== 'string') {
+      return { ok: false, reason: 'malformed' }
+    }
+    return { ok: true, payload: { ch: p.ch, a: p.a.slice(), b: p.b, e: p.e, m: p.m, n: p.n, x: p.x } }
+  }
+
+  /** 完整校验：格式/签名 → 一次性 → 过期 → 投递方一致。受众一致性要读盘，在 confirmPush 里比。 */
+  function verifyPushToken(token: unknown, by: string, now: number): { ok: boolean; payload?: PushPayload; reason?: string } {
+    const parsed = parsePushToken(token)
+    if (!parsed.ok) return parsed
+    if (usedTokens.has(String(token).trim())) return { ok: false, reason: 'used' }
+    if (!(parsed.payload.e > now)) return { ok: false, reason: 'expired' }
+    if (parsed.payload.b !== by) return { ok: false, reason: 'caller-mismatch' }
+    return { ok: true, payload: parsed.payload }
+  }
+
+  /** 集合相等（受众绑定判据）：两边排序后逐元素比；长度不同即不等。 */
+  function sameHolderSet(a: unknown, b: unknown): boolean {
+    const x = Array.isArray(a) ? a.map(String).sort() : []
+    const y = Array.isArray(b) ? b.map(String).sort() : []
+    if (x.length !== y.length) return false
+    for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return false
+    return true
+  }
+
+  /** 广播通知文案（**短通知**：频道 + 作者 + 正文摘要；长正文留在板上）。 */
+  function pushNoticeParts(byName: string, channel: string, excerpt: string, count: number): { text: string; summary: string } {
+    const text = '[dsh-collab] ' + byName + ' 向频道 ' + channel + ' 广播了一条留言（本次推送 ' + count +
+      ' 人）：' + excerpt + '。用 collab_board op=read（channel: ' + channel +
+      '）读取。本条是广播推送（steer），来源为 dsh-collab，不是真人输入。'
+    return { text, summary: boundContextSummary('collab 广播 · ' + byName + ' · ' + excerpt) }
+  }
+
+  /** 一次广播的现场快照（在 `mutate` 的回调里从**当轮状态**现算）。 */
+  interface PushCapture { channel: string; audience: PushAudience; names: Map<string, string> }
+
   /**
-   * `op=post` 的完整路径：
-   *   · 不带 wake / wakeToken ⇒ 原样（纯落板，`delivered:false` + deliveryNote 一字不变）；
-   *   · 带 wakeToken（确认步）⇒ **不写留言**，只校验令牌并 steer；
-   *   · 只带 wake ⇒ 先落板（恰好一条），再探活决定直接投递 / 出令牌 / 如实说明。
+   * 投递前的探活 + 门控。留言**已经落板**，本函数只决定要不要、以及怎么投递。
+   * 分支：全部在跑 → 整批 steer；有 idle/unknown → 一个都不投递 + 预览 + 令牌；
+   * 探不到的人 → 逐个如实记，不静默丢。
    */
-  async function postWithWake(a: CollabArgs, h: HolderInput & { agent?: AgentLike }, aId: string | null, agent?: AgentLike): Promise<ToolResult> {
-    const rawWake = (a as unknown as Record<string, unknown>).wake
-    const rawToken = (a as unknown as Record<string, unknown>).wakeToken
+  async function beginPush(cap: PushCapture, msgId: string, body: string, h: HolderInput & { agent?: AgentLike }): Promise<Record<string, unknown>> {
+    const ids = cap.audience.holderIds
+    const excerpt = wakeExcerpt(body)
+    if (!ids.length) {
+      const why = cap.audience.kind === 'unsupported-channel'
+        ? '频道 ' + cap.channel + ' 没有受众规则（只有 general 与 path:<相对路径> 会推送给持有人）'
+        : (cap.audience.reason === 'empty-path' ? 'path: 频道没给出可用路径' : '本项目此刻没有其他持有人')
+      return {
+        supported: true, mode: 'empty', reason: cap.audience.reason || 'audience-empty',
+        audience: [], audienceCount: 0, idleCount: 0, runningCount: 0, unreachableCount: 0,
+        maxAudience: PUSH_MAX, delivered: false, pushed: [],
+        note: '广播受众为空（' + why + '）：**未推送**，留言只落板。'
+      }
+    }
+    const probed = ids.map(holderId => {
+      const sid = holderToSession(holderId)
+      const probe = sid ? store.probeAgent(sid) : { state: 'absent' as const, agent: undefined }
+      return { holderId, sid, name: cap.names.get(holderId) || holderId, status: probe.state, agent: probe.agent }
+    })
+    const idle = probed.filter(p => p.status === 'idle' || p.status === 'unknown')
+    const running = probed.filter(p => p.status === 'running')
+    const unreachable = probed.filter(p => p.status === 'absent' || p.status === 'failed')
+    const preview = probed.map(p => ({ target: p.holderId, sessionId: p.sid, name: p.name, status: p.status }))
+    const base = {
+      supported: true, audience: preview, audienceCount: ids.length,
+      idleCount: idle.length, runningCount: running.length, unreachableCount: unreachable.length,
+      maxAudience: PUSH_MAX, delivered: false, pushed: [] as Array<Record<string, unknown>>
+    }
+    // 有任一 idle/unknown ⇒ **一个都不投递**（保守侧：唤醒 idle 会立刻起一轮，必须先确认）。
+    if (idle.length) {
+      const now = store.now()
+      pruneUsedTokens(now)
+      const exp = now + WAKE_TTL_MS
+      const token = mintPushToken({ ch: cap.channel, a: ids, b: h.holderId, e: exp, m: msgId, n: h.name || h.holderId, x: excerpt })
+      return Object.assign(base, {
+        mode: 'idle', reason: 'idle-confirm-required', confirmToken: token, expiresAt: exp,
+        expiresInSec: Math.round(WAKE_TTL_MS / 1000),
+        // 「总计将唤醒几个」= 确认后会被 steer 的收件人数（其中 idle/unknown 的那部分会真的起一轮）。
+        willDeliverCount: ids.length, willWakeIdleCount: idle.length,
+        note: '广播受众 ' + ids.length + ' 人里有 ' + idle.length + ' 个 idle/unknown：**一个都没投递**（唤醒 idle 会立刻起一轮，需要你确认）。' +
+          '二次确认请再调一次 collab_board op=post，带同一 pushToken（可带同一 channel）；确认步**只推送、不再写留言**。' +
+          '令牌绑定本次广播的频道 + 受众集合（' + ids.length + ' 人），受众一变即失效；一次性、' +
+          Math.round(WAKE_TTL_MS / 1000) + ' 秒内有效。'
+      })
+    }
+    // 没有 idle/unknown：可投递的就是在跑的那些；absent/failed 逐个如实记（不静默）。
+    const results: Array<Record<string, unknown>> = []
+    for (const p of probed) {
+      if (p.status === 'running') {
+        const parts = pushNoticeParts(h.name || h.holderId, cap.channel, excerpt, ids.length)
+        const r = steerTarget(p.agent, parts.text, parts.summary)
+        results.push({ target: p.holderId, sessionId: p.sid, ok: r.ok, error: r.error })
+      } else {
+        results.push({ target: p.holderId, sessionId: p.sid, ok: false, error: p.status === 'failed' ? 'probe-failed' : 'not-found' })
+      }
+    }
+    const okCount = results.filter(r => r.ok === true).length
+    const allOk = okCount === ids.length
+    return Object.assign(base, {
+      mode: running.length ? 'running' : 'unreachable',
+      delivered: allOk,
+      pushed: results,
+      reason: allOk ? undefined : (running.length ? 'partial-unreachable' : 'no-reachable-audience'),
+      note: allOk
+        ? '广播受众 ' + ids.length + ' 人全部在跑：已直接整批 steer 投递（在跑就不需要二次确认）。'
+        : (running.length
+          ? '广播受众 ' + ids.length + ' 人里 ' + running.length + ' 人在跑（已 steer）、' + unreachable.length + ' 人探不到（未投递，已逐个记在 pushed 里）：没有 idle，所以不发令牌。'
+          : '广播受众 ' + ids.length + ' 人都探不到（不在本进程 / 无此会话）：**未投递**，留言只落板。')
+    })
+  }
+
+  /**
+   * 确认那一步：**只推送、不再写留言**（"留言只落一次"），所以整段不碰 `post`。
+   * 校验不过一律拒绝且绝不 steer；受众与令牌绑定不符同样拒绝。至少投递成功一个才消耗令牌
+   * （一个都没成 ⇒ 不消耗、可重试；部分成功也消耗 —— 否则重试会对已投的人重复 steer）。
+   */
+  async function confirmPush(token: string, h: HolderInput & { agent?: AgentLike }, a: CollabArgs, aId: string | null, agent?: AgentLike): Promise<ToolResult> {
+    const now = store.now()
+    pruneUsedTokens(now)
+    const v = verifyPushToken(token, h.holderId, now)
+    if (!v.ok) {
+      return { ok: false, error: 'bad-request', message: '广播令牌被拒绝（' + v.reason + '）：**未投递、未写留言**。令牌必须是首次返回的 pushToken 原样，绑定本次广播的频道 + 受众集合，且未过期、未被用过。' }
+    }
+    // 确认步可以带 channel：与令牌里的频道不一致即拒绝（"换频道"必须被挡回而不是被忽略）。
+    const rawCh = typeof a.channel === 'string' && a.channel.trim() ? a.channel.trim() : null
+    if (rawCh && rawCh !== v.payload.ch) {
+      return { ok: false, error: 'bad-request', message: '广播令牌绑定频道 ' + v.payload.ch + '，与本次 channel ' + rawCh + ' 不一致（channel-mismatch）：**未投递、未写留言**。' }
+    }
+    // 受众**现算**：与令牌里绑定的集合不等 ⇒ 失效（有人新 claim / 有人消失都算）。
+    const { state } = await store.load(aId, agent)
+    const cur = pushAudience(state, v.payload.ch, h.holderId, now)
+    if (!sameHolderSet(cur.holderIds, v.payload.a)) {
+      return {
+        ok: false, error: 'bad-request',
+        message: '广播受众已变化（令牌绑定 ' + v.payload.a.length + ' 人，此刻 ' + cur.holderIds.length + ' 人；audience-changed）：**未投递、未写留言**。受众一变令牌即失效，请重新 op=post 发起广播。',
+        data: { push: { supported: true, mode: 'stale', reason: 'audience-changed', audienceCount: v.payload.a.length, currentAudienceCount: cur.holderIds.length, delivered: false, pushed: [] } }
+      }
+    }
+    const results: Array<Record<string, unknown>> = []
+    for (const holderId of v.payload.a) {
+      const sid = holderToSession(holderId)
+      if (!sid) { results.push({ target: holderId, sessionId: null, ok: false, error: 'not-steerable' }); continue }
+      const probe = store.probeAgent(sid)
+      if (probe.state === 'absent' || probe.state === 'failed') {
+        results.push({ target: holderId, sessionId: sid, ok: false, error: probe.state === 'failed' ? 'probe-failed' : 'not-found' })
+        continue
+      }
+      const parts = pushNoticeParts(v.payload.n, v.payload.ch, v.payload.x, v.payload.a.length)
+      const r = steerTarget(probe.agent, parts.text, parts.summary)
+      results.push({ target: holderId, sessionId: sid, ok: r.ok, error: r.error })
+    }
+    const okCount = results.filter(r => r.ok === true).length
+    if (okCount === 0) {
+      return {
+        ok: false, error: 'internal',
+        message: '广播确认：受众里没有一个能 steer（' + JSON.stringify(results.map(r => r.error)) + '）：**未投递**，令牌未消耗，可重试。',
+        data: { push: { supported: true, mode: 'unreachable', reason: 'no-reachable-audience', audienceCount: v.payload.a.length, delivered: false, pushed: results } }
+      }
+    }
+    usedTokens.set(token.trim(), v.payload.e)
+    return {
+      ok: true,
+      data: {
+        msgId: v.payload.m,
+        delivered: okCount === v.payload.a.length,
+        deliveryNote: '广播推送已投递：对每个可达受众各 steer 了一条显式来源（dsh-collab/notice）的短通知，确认步不再写留言。',
+        push: {
+          supported: true, mode: 'confirmed', channel: v.payload.ch, reason: undefined,
+          audienceCount: v.payload.a.length, delivered: okCount === v.payload.a.length,
+          pushed: results, confirmed: true, msgId: v.payload.m,
+          note: '已对 ' + okCount + '/' + v.payload.a.length + ' 个受众各 steer 恰好一次；留言仍只有原来的那一条。'
+        }
+      }
+    }
+  }
+
+  /**
+   * `op=post` 的完整路径（单元 F 统一收口）：
+   *   · 不带 wake / wakeToken / push / pushToken ⇒ 原样（纯落板，deliveryNote 一字不变）；
+   *   · 带 wakeToken（定时确认）⇒ **不写留言**，只校验令牌并 steer；
+   *   · 只带 wake ⇒ 先落板（恰好一条），再探活决定直接投递 / 出令牌 / 如实说明；
+   *   · 带 pushToken（广播确认）⇒ **不写留言**，校验令牌 + 受众绑定后逐个 steer；
+   *   · 只带 push:true ⇒ 先按受众上限决定是否落板，再逐个探活决定整批投递 / 出令牌 / 如实说明。
+   */
+  async function postWithDelivery(a: CollabArgs, h: HolderInput & { agent?: AgentLike }, aId: string | null, agent?: AgentLike): Promise<ToolResult> {
+    const raw = a as unknown as Record<string, unknown>
+    const rawWake = raw.wake
+    const rawWakeToken = raw.wakeToken
+    const rawPush = raw.push
+    const rawPushToken = raw.pushToken
     const hasWake = rawWake !== undefined
-    const hasToken = rawToken !== undefined
-    if (!hasWake && !hasToken) return store.mutate(s => post(s, h, a, store.now), aId, agent)
+    const hasWakeToken = rawWakeToken !== undefined
+    const hasPushParam = rawPush !== undefined
+    const hasPushToken = rawPushToken !== undefined
+    const pushIntent = rawPush === true
+    if (!hasWake && !hasWakeToken && !hasPushParam && !hasPushToken) return store.mutate(s => post(s, h, a, store.now), aId, agent)
+    // push 只认布尔：字符串 / 数字一律挡回（不写留言），而不是猜一个真假。
+    if (hasPushParam && rawPush !== true && rawPush !== false) {
+      return { ok: false, error: 'bad-request', message: 'push 必须是布尔值（true = 广播推送；false / 省略 = 只落板）；本条**没有写入**。' }
+    }
+    if ((hasWake || hasWakeToken) && (pushIntent || hasPushToken)) {
+      return { ok: false, error: 'bad-request', message: 'wake（定向唤醒）与 push（广播推送）是两条互斥的投递路径：本条**没有写入**，请只选一条。' }
+    }
+    // ---- 广播推送 ----
+    if (hasPushToken) {
+      if (typeof rawPushToken !== 'string' || !rawPushToken.trim()) {
+        return { ok: false, error: 'bad-request', message: 'pushToken 必须是非空字符串（首次返回的 confirmToken 原样回传）；本条**没有写入**。' }
+      }
+      return confirmPush(rawPushToken.trim(), h, a, aId, agent)
+    }
+    if (pushIntent) return broadcastPush(a, h, aId, agent)
+    if (hasPushParam) return store.mutate(s => post(s, h, a, store.now), aId, agent) // push:false 且无令牌 ⇒ 纯落板
+    // ---- 定向唤醒（单元 E，一字不动） ----
     // 参数校验在任何写入之前：wake 必须是目标会话 id（可带 `agent:` 前缀）。
     if (typeof rawWake !== 'string' || !rawWake.trim()) {
       return { ok: false, error: 'bad-request', message: 'wake 必须是目标会话 id（非空字符串，可带 agent: 前缀）；本条**没有写入**。' }
     }
     const target = rawWake.trim().replace(/^agent:/, '')
-    if (hasToken) {
-      if (typeof rawToken !== 'string' || !rawToken.trim()) {
+    if (hasWakeToken) {
+      if (typeof rawWakeToken !== 'string' || !rawWakeToken.trim()) {
         return { ok: false, error: 'bad-request', message: 'wakeToken 必须是非空字符串（首次返回的 confirmToken 原样回传）；本条**没有写入**。' }
       }
-      return confirmWake(target, rawToken.trim(), h)
+      return confirmWake(target, rawWakeToken.trim(), h)
     }
     const res = await store.mutate(s => post(s, h, a, store.now), aId, agent)
     if (!res || res.ok !== true || !res.data) return res
@@ -383,8 +661,49 @@ export function installTools(ctx: CollabContext, store: StateStore, push: PushAp
     return res
   }
 
+  /**
+   * 广播第一次调用：**受众上限是写入前的门禁**（超限 ⇒ 不推送、不发令牌、**不写留言**，
+   * 不做"静默推一半"）；受众为空则照常落板、只如实说明不推送。
+   * 受众在 `mutate` 的回调里从当轮状态现算，和这条留言落在同一份状态上。
+   */
+  async function broadcastPush(a: CollabArgs, h: HolderInput & { agent?: AgentLike }, aId: string | null, agent?: AgentLike): Promise<ToolResult> {
+    let cap: PushCapture | null = null
+    const res = await store.mutate(s => {
+      const ch = channelOf(a)
+      const aud = pushAudience(s, ch, h.holderId, store.now())
+      const names = new Map<string, string>()
+      const hs = s && Array.isArray(s.holders) ? s.holders : []
+      for (const row of hs) {
+        if (row && typeof row.holderId === 'string' && row.holderId) names.set(row.holderId, typeof row.name === 'string' && row.name ? row.name : row.holderId)
+      }
+      cap = { channel: ch, audience: aud, names }
+      if (aud.holderIds.length > PUSH_MAX) {
+        return {
+          ok: false, changed: false, state: s,
+          data: {
+            error: 'bad-request',
+            message: '广播受众 ' + aud.holderIds.length + ' 人 > 上限 ' + PUSH_MAX + '（DSH_COLLAB_PUSH_MAX 可覆盖）：**未推送、未写留言、不发令牌**，不做"静默推一半"；请改用更窄的 path:<相对路径> 频道或分批广播。',
+            push: {
+              supported: true, mode: 'rejected', reason: 'audience-over-limit',
+              audience: aud.holderIds.map(id => ({ target: id, name: names.get(id) || id })),
+              audienceCount: aud.holderIds.length, maxAudience: PUSH_MAX,
+              delivered: false, pushed: []
+            }
+          }
+        }
+      }
+      return post(s, h, a, store.now)
+    }, aId, agent)
+    if (!res || res.ok !== true || !res.data || !cap) return res
+    const report = await beginPush(cap, String(res.data.msgId || ''), typeof a.body === 'string' ? a.body : '', h)
+    res.data.push = report
+    res.data.delivered = report.delivered === true
+    res.data.deliveryNote = typeof report.note === 'string' ? report.note : BOARD_NO_DELIVERY_HINT
+    return res
+  }
+
   const boardHandler = exec((a, h, aId, agent) => {
-    if (a.op === 'post') return postWithWake(a, h, aId, agent)
+    if (a.op === 'post') return postWithDelivery(a, h, aId, agent)
     if (a.op === 'read') return store.msgs(a, aId, agent)
     return { ok: false, error: 'bad-request', message: '未知操作：' + String(a.op) }
   })
@@ -417,7 +736,7 @@ export function installTools(ctx: CollabContext, store: StateStore, push: PushAp
 
   const boardTool: ToolDefinition = {
     name: 'collab_board',
-    description: '跨会话协作留言板：post 往共享状态文件留痕 / read 增量读取。用于同一仓库上互不相识的会话之间交接进度与协商。**默认不投递、不唤醒任何会话**：对方只在它自己 read 时才看得到。可选**定向唤醒** `wake`（目标会话 id）：投递前先**探活**，且目标 idle 时**必须二次确认** —— 目标正在跑（非 idle）就**直接** steer 投递（下一步边界领走，不需确认）；目标 idle 就**不投递**，返回预览 + 一次性 `confirmToken`，你**必须再调一次 op=post 并回传 `wakeToken`**（确认步只唤醒、不再写留言）才真正唤醒，免得未经同意烧 token；探不到（不在本进程/无此会话）就**不投递**、留言只落板。唤醒消息由本插件经真实的 dsh-llm 构造、来源显式非 user（kind:dsh-collab, form:notice），不冒充用户。read 两种模式：不给 since（或 0）读**最新** limit 条（追平用）；否则从该游标**往后**读 limit 条（增量用，旧→新）——按返回的 nextCursor 继续调、直到 hasMore=false 才算读完（nextCursor 是复合游标 seq@writer；只按数字 nextSince 翻页在 seq 相撞时会把同 seq 的记录再送一遍）。',
+    description: '跨会话协作留言板：post 往共享状态文件留痕 / read 增量读取。用于同一仓库上互不相识的会话之间交接进度与协商。**默认不投递、不唤醒任何会话**：对方只在它自己 read 时才看得到。可选**广播推送** `push:true`：受众由频道现算（general = 本项目全部持有人，path:<相对路径> = 声明与该路径重叠的持有人；都排除你自己），逐个探活后**全部在跑就整批 steer 投递**（在跑不需要确认），**有任一 idle 就一个都不投递**、返回受众预览 + 一个绑定本次广播的一次性 `pushToken`，你**必须再调一次 op=post 并回传 `pushToken`**（确认步只推送、不再写留言）；受众为空就不推送、如实说明；受众数超过上限（默认 12，env DSH_COLLAB_PUSH_MAX）直接拒绝（不推送、不发令牌、不写留言，不做"静默推一半"）。推送给每个人的是一条**短通知**（频道 + 作者 + 正文摘要，长正文留在板上），由本插件经真实的 dsh-llm 构造、来源显式非 user（kind:dsh-collab, form:notice），不冒充用户。另有**定向唤醒** `wake`（单个目标会话 id）：与 push 互斥；目标在跑就直接 steer，idle 就返回 confirmToken 等你再确认（回传 wakeToken），探不到只落板。read 两种模式：不给 since（或 0）读**最新** limit 条（追平用）；否则从该游标**往后**读 limit 条（增量用，旧→新）——按返回的 nextCursor 继续调、直到 hasMore=false 才算读完（nextCursor 是复合游标 seq@writer；只按数字 nextSince 翻页在 seq 相撞时会把同 seq 的记录再送一遍）。',
     parameters: {
       type: 'object',
       properties: {
@@ -425,7 +744,9 @@ export function installTools(ctx: CollabContext, store: StateStore, push: PushAp
         channel: { type: 'string', description: '频道，默认 general；**精确匹配**的自由字符串（写什么就得按什么读，path: 频道与 claim 用同一套相对路径写法），未命中时返回会列出既有频道' },
         body: { type: 'string', maxLength: 8000, description: 'post 用，消息正文。上限 8000 字符（与 collab-core 的 MESSAGE_BODY_MAX_CHARS 同值）；超限由 post() 以 bad-request 挡回且**整条不写入**，不静默截断' },
         replyTo: { type: 'string', description: '回复的 msgId' },
-        wake: { type: 'string', description: 'post 用（可选）：**定向唤醒**的目标会话 id（可带 agent: 前缀）。投递前先探活：目标在跑（非 idle）⇒ 直接 steer 投递、不需确认；目标 idle ⇒ **不投递**、返回预览 + 一次性 confirmToken，需再调一次并回传才唤醒；探不到 ⇒ 不投递、如实说明（留言只落板）。省略则只落板、不投递。' },
+        push: { type: 'boolean', description: 'post 用（可选）：**广播推送**意图（true = 推送；false / 省略 = 只落板）。受众由频道现算：general = 本项目全部持有人、path:<相对路径> = 声明与该路径重叠者，都排除你自己。逐个探活：全部在跑 ⇒ 直接整批 steer（不需确认、不发令牌）；有任一 idle ⇒ 一个都不投递、返回受众预览 + 一次性 pushToken（需再调一次并回传）；受众为空 ⇒ 不推送、如实说明；受众数超上限（默认 12，env DSH_COLLAB_PUSH_MAX）⇒ 拒绝且不写留言。与 wake 互斥。' },
+        pushToken: { type: 'string', description: 'post 用（可选）：首次广播推送返回的 confirmToken，原样回传以**确认整批投递**。带它时**只推送、不再写留言**（留言永远只落一条），且对每个受众各 steer 恰好一次；令牌绑定本次广播的**频道 + 受众集合 + 投递方 + 到期** —— 受众变了（有人新 claim / 有人消失）、换频道、过期、乱造、他人令牌一律拒绝且不 steer；一次性（成功投递才消耗，失败可重试）。' },
+        wake: { type: 'string', description: 'post 用（可选）：**定向唤醒**的目标会话 id（可带 agent: 前缀）。投递前先探活：目标在跑（非 idle）⇒ 直接 steer 投递、不需确认；目标 idle ⇒ **不投递**、返回预览 + 一次性 confirmToken，需再调一次并回传才唤醒；探不到 ⇒ 不投递、如实说明（留言只落板）。省略则只落板、不投递。与 push 互斥。' },
         wakeToken: { type: 'string', description: 'post 用（可选）：首次 idle 探活返回的 confirmToken，原样回传以**二次确认**唤醒。带它时**只唤醒、不再写留言**（留言永远只落一条）；令牌绑定同一目标 + 同一留言、一次性、有有效期。校验不过一律拒绝且不唤醒。' },
         since: { type: ['number', 'string'], description: 'read 用：省略或 0 = 读最新 limit 条（tail）；否则从该游标往后读 limit 条（forward，旧→新）。游标是复合值 (seq, writer)：字符串写法 `<seq>@<writer>`（取返回的 nextCursor），数字写法（向后兼容）解释为 `(seq, "")`。' },
         limit: { type: 'number', description: 'read 用，最多条数，默认 50，上限 200' }

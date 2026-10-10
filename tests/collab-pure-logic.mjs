@@ -9,7 +9,7 @@ import { readFileSync } from 'node:fs'
 import {
   norm, ov, cleanName, init, publish, expire, sweep, HOLDER_TTL_MS, holder, claim, release, heartbeat,
   post, overview, related, filterMessages, blockers, holderView, holderFresh, MODES, reap,
-  MESSAGE_BODY_MAX_CHARS,
+  MESSAGE_BODY_MAX_CHARS, pushAudience,
 } from '../lib/collab-core.js'
 
 const h = createHarness()
@@ -472,6 +472,50 @@ console.log('# reap 级联清 holders')
   st2.holders.push({ holderId: 'agent:zombie2', name: 'Z2', kind: 'agent', sessionId: 'zombie2', lastSeenAt: T() })
   const r = reap(st2, { holderId: 'agent:me' }, { confirm: true, olderThanSec: 600 }, null, T())
   ok(r.changed === false && st2.holders.length === 1, '活体检查不可用：一个也不收，holders 不动', JSON.stringify(st2.holders.length))
+}
+
+// ===== 10. 广播推送的受众（pushAudience，单元 F）=====
+// 受众是**频道到持有人集合**的纯投影：general = 全部持有人、path:<p> = 声明重叠者，都排除自己。
+// 它必须**确定性**（排序输出）—— 受众集合进一次性令牌的载荷，顺序不定会让"受众是否变过"失真。
+console.log('# pushAudience（单元 F 广播受众）')
+{
+  const st = init()
+  st.holders.push({ holderId: 'agent:a', name: 'A', kind: 'agent', sessionId: 'a', lastSeenAt: t0 })
+  st.holders.push({ holderId: 'agent:b', name: 'B', kind: 'agent', sessionId: 'b', lastSeenAt: t0 })
+  st.holders.push({ holderId: 'agent:me', name: 'Me', kind: 'agent', sessionId: 'me', lastSeenAt: t0 })
+  const mk = (holderId, paths, expiresAt = t0 + 600000) => ({ claimId: 'c_' + holderId + paths.join(','), holderId, holderName: holderId, paths, mode: 'exclusive', ttlSec: 1800, expiresAt, createdAt: t0, readable: true, readers: [] })
+  st.claims.push(mk('agent:a', ['src/a/x/']))
+  st.claims.push(mk('agent:b', ['src/a/y/sub/']))  // 后代 ⇒ 与 src/a/ 重叠
+  st.claims.push(mk('agent:b', ['src/b/']))
+
+  const gen = pushAudience(st, 'general', 'agent:me', t0)
+  ok(gen.kind === 'general' && JSON.stringify(gen.holderIds) === '["agent:a","agent:b"]',
+    'general = 全部持有人、排除自己、按 holderId 排序', JSON.stringify(gen))
+
+  const p = pushAudience(st, 'path:src/a/', 'agent:me', t0)
+  ok(p.kind === 'path' && p.path === 'src/a/' && JSON.stringify(p.holderIds) === '["agent:a","agent:b"]',
+    'path:src/a/ = 声明重叠者（含后代 src/a/y/sub/）', JSON.stringify(p))
+
+  const pB = pushAudience(st, 'path:src/b/', 'agent:me', t0)
+  ok(JSON.stringify(pB.holderIds) === '["agent:b"]', 'path:src/b/ 只含 b（a 的声明不重叠）', JSON.stringify(pB))
+
+  const self = pushAudience(st, 'path:src/a/x/', 'agent:a', t0)
+  ok(self.holderIds.length === 0, 'path 受众同样排除投递方自己', JSON.stringify(self))
+
+  const other = pushAudience(st, 'agent:someone', 'agent:me', t0)
+  ok(other.kind === 'unsupported-channel' && other.holderIds.length === 0 && other.reason === 'channel-has-no-audience-rule',
+    '非 general / path: 的频道没有受众规则（返回空 + 原因）', JSON.stringify(other))
+
+  const badPath = pushAudience(st, 'path:', 'agent:me', t0)
+  ok(badPath.kind === 'path' && badPath.reason === 'empty-path' && badPath.holderIds.length === 0,
+    'path: 没给路径 ⇒ 空受众 + empty-path', JSON.stringify(badPath))
+
+  // 过期声明不进受众
+  const stExp = init()
+  stExp.holders.push({ holderId: 'agent:old', name: 'Old', kind: 'agent', sessionId: 'old', lastSeenAt: t0 })
+  stExp.claims.push(mk('agent:old', ['src/a/'], t0 - 1))
+  ok(pushAudience(stExp, 'path:src/a/', 'agent:me', t0).holderIds.length === 0,
+    '过期声明不进受众', JSON.stringify(pushAudience(stExp, 'path:src/a/', 'agent:me', t0)))
 }
 
 h.finish()

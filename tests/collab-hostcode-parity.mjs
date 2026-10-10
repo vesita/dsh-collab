@@ -363,6 +363,26 @@ console.log('# read ops read the same state file writes wrote (agent threaded th
   const msR2 = await boardLocal.execute({ op: 'read', channel: 'anchored' }, AG)
   ok((msR2.data.messages || []).filter((m) => m.body === 'wake 降级').length === 1,
     'hostCode：wake 留言恰好 1 条；确认步不写第二条', JSON.stringify((msR2.data.messages || []).map((m) => m.body)))
+
+  // 单元 F：受限动态宿主的**广播推送**同样必须如实降级（同一理由：没有 dsh-llm / 没有 steer 面）。
+  // 带 push:true 时留言照常只落一条、push 一侧 supported:false；确认步（带 pushToken）
+  // **不写留言** ⇒ 绝不会产生第二条。
+  const pushR = await boardLocal.execute({ op: 'post', channel: 'anchored', body: 'push 降级', push: true }, AG)
+  ok(pushR.ok === true && pushR.data && pushR.data.push && pushR.data.push.supported === false &&
+     pushR.data.push.reason === 'unsupported-host' && pushR.data.push.delivered === false && pushR.data.delivered === false,
+    'hostCode：push 如实降级为 supported:false / unsupported-host', JSON.stringify(pushR && pushR.data && pushR.data.push))
+  ok(/已落板/.test(String(pushR.data.push.note)), 'hostCode：push 降级说明点出"已落板"', String(pushR.data.push.note))
+  const pushConfR = await boardLocal.execute({ op: 'post', pushToken: 'any-token' }, AG)
+  ok(pushConfR.ok === true && pushConfR.data.push.supported === false && pushConfR.data.push.delivered === false,
+    'hostCode：push 确认步也如实降级（不假装投递、不写留言）', JSON.stringify(pushConfR && pushConfR.data && pushConfR.data.push))
+  const pushBad = await boardLocal.execute({ op: 'post', channel: 'anchored', body: 'push 非布尔', push: 'yes' }, AG)
+  ok(pushBad.ok === false && pushBad.error === 'bad-request',
+    'hostCode：push 非布尔值 ⇒ 拒绝（不静默当成 true）', JSON.stringify(pushBad))
+  const msR3 = await boardLocal.execute({ op: 'read', channel: 'anchored' }, AG)
+  ok((msR3.data.messages || []).filter((m) => m.body === 'push 降级').length === 1,
+    'hostCode：push 留言恰好 1 条；确认步不写第二条', JSON.stringify((msR3.data.messages || []).map((m) => m.body)))
+  ok((msR3.data.messages || []).filter((m) => m.body === 'push 非布尔').length === 0,
+    'hostCode：push 非布尔被拒后一个字都没落板', JSON.stringify((msR3.data.messages || []).map((m) => m.body)))
 }
 
 // ---------- 5. 态势摘要渲染：文档化具体文案 + 顺序确定性 ----------

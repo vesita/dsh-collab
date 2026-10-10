@@ -1041,6 +1041,58 @@ export function claimsCovering(claims: Claim[], target: string, now: number): Cl
   }))
 }
 
+// ---- 广播推送（单元 F）：受众 ----
+//
+// 用户实测的硬伤：留言板只有"读者主动 op=read"这一个出口，`src/awareness.ts` 完全不碰 messages
+// （每轮摘要只渲染 active claims），于是广播留言**没有任何人会看到**。单元 F 把广播改成推送制：
+// `op=post` 带推送意图时，按频道算出**受众**再逐个探活投递。
+//
+// 受众**每轮现算、不落状态文件**：它只是 `state.holders` / `state.claims` 的投影，没有任何
+// 需要跨副本 join 的新事实，所以不进 SSOT、不参与 mergeDocs（也就没有新的收敛字段要定义）。
+
+/**
+ * 广播推送的受众。
+ *
+ *   · `general`  ⇒ 本项目**全部持有人**（`state.holders` 的 holderId），排除投递方自己；
+ *   · `path:<p>` ⇒ 声明与该路径**重叠**的持有人（`claimsCovering` 的既有判据），排除自己；
+ *   · 其它频道   ⇒ 没有受众规则（`agent:<x>` 是定向唤醒 `wake` 的用法），返回空 + 原因。
+ *
+ * 结果按 holderId 排序：受众集合要进一次性令牌的载荷，必须**确定性** —— 否则"受众是否变过"
+ * 的逐集合比较会失去意义。过期声明不进受众（`claimsCovering` 已按 `expiresAt > t` 过滤）。
+ */
+export interface PushAudience {
+  holderIds: string[]
+  kind: 'general' | 'path' | 'unsupported-channel'
+  /** 仅 `path`：归一化后的目标路径。 */
+  path?: string
+  /** 受众为空且原因不是"本来就没别人"时（路径为空 / 频道无规则）的如实说明。 */
+  reason?: string
+}
+
+export function pushAudience(state: StateDocument, channel: string, selfHolderId: string, t: number): PushAudience {
+  const ch = typeof channel === 'string' && channel.trim() ? channel.trim() : 'general'
+  const self = typeof selfHolderId === 'string' ? selfHolderId : ''
+  if (ch === 'general') {
+    const ids = new Set<string>()
+    const hs = state && Array.isArray(state.holders) ? state.holders : []
+    for (const h of hs) {
+      const id = h && typeof h.holderId === 'string' ? h.holderId : ''
+      if (id && id !== self) ids.add(id)
+    }
+    return { holderIds: [...ids].sort(), kind: 'general' }
+  }
+  if (ch.slice(0, 5) === 'path:') {
+    const p = norm(ch.slice(5))
+    if (!p) return { holderIds: [], kind: 'path', reason: 'empty-path' }
+    const ids = new Set<string>()
+    for (const c of claimsCovering(state ? state.claims : [], p, t)) {
+      if (c && c.holderId && c.holderId !== self) ids.add(c.holderId)
+    }
+    return { holderIds: [...ids].sort(), kind: 'path', path: p }
+  }
+  return { holderIds: [], kind: 'unsupported-channel', reason: 'channel-has-no-audience-rule' }
+}
+
 /** 可读性归一：缺省（含 0.7.0 之前写下的状态文件）视为**可读**。 */
 export function isReadable(c: Claim): boolean {
   return !(c && (c as { readable?: unknown }).readable === false)

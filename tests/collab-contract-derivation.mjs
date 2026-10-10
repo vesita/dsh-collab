@@ -202,8 +202,11 @@ function parseRealTool(text, toolName) {
   const marker = `name: '${toolName}'`
   const start = text.indexOf(marker)
   if (start < 0) return null
+  // 终点取**下一个 collab_ 工具**；没有下一个（本文件里 collab_board 是最后一个）就取源末尾。
+  // （旧实现兜底是 `start + 2600` 的定长窗口 —— 工具 description 一长就会把 properties / required
+  // 挤出窗口，把"解析不到"误报成契约漂移。这里改为按对象边界取，不再是脆弱常数。）
   const nextTool = text.indexOf("name: 'collab_", start + marker.length)
-  const seg = text.slice(start, nextTool > 0 ? nextTool : start + 2600)
+  const seg = text.slice(start, nextTool > 0 ? nextTool : text.length)
   const pm = /properties:\s*\{([\s\S]*?)\n\s*required:\s*\[([^\]]*)\]/.exec(seg)
   if (!pm) return null
   const names = [...pm[1].matchAll(/^\s+(\w+):\s*\{/gm)].map(x => x[1])

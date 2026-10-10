@@ -174,6 +174,19 @@ export interface CollabBoardParams {
    * 不再写留言**（留言永远只落一条）；令牌绑定同一目标 + 同一留言、一次性、有有效期。
    */
   wakeToken?: string;
+  /**
+   * 广播推送意图（单元 F）：`true` = 推送，`false` / 省略 = 只落板。受众由频道现算
+   * （`general` = 全部持有人，`path:<相对路径>` = 声明重叠者，都排除自己），逐个探活：
+   * 全部在跑 ⇒ 直接整批 steer；有任一 idle ⇒ 一个都不投递 + 一次性 `pushToken`；
+   * 受众为空 ⇒ 不推送、只落板；受众数超上限 ⇒ 拒绝且不写留言。与 `wake` 互斥。
+   */
+  push?: boolean;
+  /**
+   * 广播确认令牌（单元 F）：首次推送返回的 `confirmToken` 原样回传。带它时**只推送、
+   * 不再写留言**，对每个可达受众各 steer 恰好一次；令牌绑定本次广播的**频道 + 受众集合 +
+   * 投递方 + 到期** —— 受众变了 / 换频道 / 过期 / 乱造 / 他人令牌一律拒绝且不 steer。
+   */
+  pushToken?: string;
   since?: number;
   limit?: number;
 }
