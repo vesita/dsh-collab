@@ -41,7 +41,8 @@ const { ok } = h
 const PROJECT_CWD = '/fake/project/cross-session'
 // 通用规范的唯一前缀：用于把"回落为通用规范"与"仍是一份占用摘要"严格区分开。
 // （摘要正文末尾也含 'collab_lock' 字样，只看 includes('collab_lock') 会漏判。）
-const GENERIC = '多会话协作（dsh-collab）：'
+// 与摘要开头区分得开：摘要是 `[dsh-collab] 同项目其他会话当前占用：…`，通用规范是 `同一项目可能有…`。
+const GENERIC = '[dsh-collab] 同一项目可能有其他 DSH 会话并行工作'
 // B 的 id 为空：refreshDigest 里 mine 退化成 'human:console'，谁都不排除。
 const A = { id: 'agent-A', session: { header: { cwd: PROJECT_CWD } } }
 const B = { id: '', session: { header: { cwd: PROJECT_CWD } } }

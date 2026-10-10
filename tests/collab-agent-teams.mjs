@@ -266,7 +266,7 @@ console.log('# 2. 服务在场 + 在跑任务：awareness 加 advisory 行；ove
   ok(text.includes('advisory'), 'awareness 把团队写域标成 advisory', text)
   ok(!text.includes('t-2'), 'awareness 不含 pending 任务（只认 in_progress）', text)
   ok(!text.includes('t-3'), 'awareness 不含 writeScopes 为空的在跑任务（过滤）', text)
-  ok(text.startsWith('多会话协作（dsh-collab）：'), 'awareness 仍在通用规范基础上追加（首行未变）', text.slice(0, 40))
+  ok(text.startsWith('[dsh-collab] 同一项目可能有其他 DSH 会话并行工作'), 'awareness 仍在通用规范基础上追加（首行未变）', text.slice(0, 40))
 
   const ov = await present.lock.execute({ op: 'overview' }, { agent: ME })
   const tt = ov.data && ov.data.teamTasks
@@ -290,7 +290,7 @@ console.log('# 2. 服务在场 + 在跑任务：awareness 加 advisory 行；ove
   const itext = await idle.awarenessText()
   ok(!itext.includes('官方 Agent Teams') && !itext.includes('t-1') && !itext.includes('交叉预警'),
     '服务在场但空闲 -> awareness 不加团队行', itext)
-  ok(itext.startsWith('多会话协作（dsh-collab）：'), '（对照）空闲时 awareness 仍是通用规范', itext.slice(0, 40))
+  ok(itext.startsWith('[dsh-collab] 同一项目可能有其他 DSH 会话并行工作'), '（对照）空闲时 awareness 仍是通用规范', itext.slice(0, 40))
 
   // 服务在场 + 在跑任务写域与**外部**声明重叠 -> awareness 追加反向预警行
   // （官方读不到本插件的声明，awareness 是能同时看到两边的唯一位置）。

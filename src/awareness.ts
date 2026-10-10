@@ -30,7 +30,10 @@ export function installAwareness(ctx: CollabContext, store: StateStore): Awarene
     context(c: { name: string; order: number; text: string | ((context: any) => string) }): () => void
   } | undefined
 
-  const OPEN_HINT = '多会话协作（dsh-collab）：同一项目可能有其他 DSH 会话并行工作。改动文件前用 collab_lock op=claim 声明占用（目录以 / 结尾，如 src/backend/），并先 op=overview 查看他人占用；只读调研用 mode=read；完成后 op=release，长任务 op=heartbeat 续租；跨会话交接与协商走 collab_board（只留痕，不投递、不唤醒；要某个已停下的会话动起来用它自己的消息工具）。'
+  // 只讲**工具 description 讲不了的那件事**：本项目是多会话共享的。怎么用（op / mode / ttlSec /
+  // heartbeat / board 的投递语义）都在工具自身的 description 里，这里再抄一遍就是重复
+  // （agent-experience：「把参数规则放在参数上」「每个事实只说一次」）。
+  const OPEN_HINT = '[dsh-collab] 同一项目可能有其他 DSH 会话并行工作：改动共享路径前先 collab_lock op=claim 声明占用，冲突用 op=wait 或 collab_board 协商，完成后 op=release。'
   // 包形态的关闭开关：DSH_COLLAB_NO_PROMPT_HINT=1 时不注册态势上下文，也不起刷新定时器。
   const PROMPT_HINT_ENABLED = process.env.DSH_COLLAB_NO_PROMPT_HINT !== '1'
   const DIGEST_TTL_MS = Math.max(200, Number(process.env.DSH_COLLAB_DIGEST_TTL_MS) || 15000)
