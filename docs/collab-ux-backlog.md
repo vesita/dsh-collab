@@ -652,8 +652,10 @@
     确认写者戳还是自己）→ 不一致就重读 + 重合并 + 重试。留言截断（条数 / 字节预算）在**合并之后**
     按同一条确定性规则施加，否则两份副本各截一半会来回抖动、永不收敛。
   - `mergeDocs` 是半格 join（逐字段取大/取小/求并 + 规范序），交换/结合/幂等；`release` /
-    自动释放 / `reap` 不再"从数组里删掉"，而是立终态墓碑（`released`：claimId → 原 expiresAt），
-    由 `sweep` 按"原租约到点"确定性回收。
+    自动释放 / `reap` 不再"从数组里删掉"，而是立终态墓碑（`released`）。墓碑值 = `max(现有值,
+    原 expiresAt, 释放时刻 + ttlSec)`（单元 D：盖住释放之后才合并进来的并发续租），由 `sweep`
+    按"墓碑值到点"确定性回收，表按 `(墓碑值, claimId)` 保留最大的 `MAX_RELEASED = 4096` 条。
+    Rust CLI 走同一套合并写路径，靠 `tests/fixtures/merge-golden.json` 与 TS 对拍。
   - 游标改成 `(seq, writer)` 复合值：`read` 返回 `cursor` / `nextCursor`；数字入参向后兼容为 `(n, "")`，
     保证不漏（至多重送 seq 相同的那个批次）。
 - **证据**：`tests/collab-convergence.mjs`（随机文档上的交换/结合/幂等 + 不丢独有记录 + id 唯一 +

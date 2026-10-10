@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -584,6 +584,12 @@ fn save_state(path: &Path, doc: &StateDocument, expected: Option<&[u8]>) -> Resu
 // `released` 求并（同键取大）；claims/messages/holders 按 id **逐字段** join（不是整条二选一，
 // 否则并发续租的 expiresAt、并发登记的 readers 会丢）。输出是规范序，可直接逐字节比较。
 
+/// 墓碑表上限（单元 D，与 TS 的 `MAX_RELEASED` 同值同规则）：按 `(墓碑值, claimId)` 保留最大的
+/// N 条、丢最旧的。N 取 4096 的理由：墓碑最多活到"释放时刻 + ttl"（ttl 上限 24h），一次释放只
+/// 产生一条，4096 条仍在 KB 级，只在异常密集的释放下才生效。规则**只看数据**，两个副本 GC 出
+/// 同样结果 —— 否则不收敛。
+const MAX_RELEASED: usize = 4096;
+
 fn mode_str(m: &Mode) -> &'static str {
     match m {
         Mode::Exclusive => "exclusive",
@@ -794,13 +800,20 @@ fn merge_docs(a: &StateDocument, b: &StateDocument) -> StateDocument {
     })
 }
 
-/// 给若干条声明立墓碑：墓碑值 = `max(现有值, claim.expiresAt)`。
-fn bury(s: &mut StateDocument, claims: &[Claim]) {
+/// 给若干条声明立墓碑：墓碑值 = `max(现有值, claim.expiresAt, 释放时刻 + ttlSec)`。
+///
+/// 第三项堵住一个真实边角：若有一条**并发续租**在释放之后才被合并进来，它的 `expiresAt`
+/// 可以大于原 `expiresAt`；只取原值的话，墓碑按自己的到期被 GC 之后那条声明会**重新具备权威**
+/// （同一个 holder 有两个进程在写 —— 会话被恢复的现场）。取"释放时刻 + ttl"把整段可能的续租
+/// 窗口盖住，墓碑因此活到那之后，而那时的声明必然已过期。
+fn bury(s: &mut StateDocument, claims: &[Claim], t: i64) {
     for c in claims {
         if c.claim_id.is_empty() {
             continue;
         }
-        let exp = c.expires_at;
+        let exp = c
+            .expires_at
+            .max(t.saturating_add(c.ttl_sec.saturating_mul(1000)));
         let cur = s.released.get(&c.claim_id).copied();
         let v = match cur {
             Some(cur) => cur.max(exp),
@@ -810,11 +823,23 @@ fn bury(s: &mut StateDocument, claims: &[Claim]) {
     }
 }
 
-/// 惰性清理（与 TS `sweep` 的确定性规则同源）：过期声明、按值到期的墓碑。
+/// 惰性清理（与 TS `sweep` 的确定性规则同源）：过期声明、按值到期的墓碑、墓碑表上限。
 /// 判据只看数据与传入的 t，不看本地计数/插入顺序 —— 同一份数据在任何副本上得到同一结果。
 fn sweep_state(s: &mut StateDocument, t: i64) {
     s.claims.retain(|c| c.expires_at > t);
     s.released.retain(|_, exp| *exp > t);
+    if s.released.len() > MAX_RELEASED {
+        let mut entries: Vec<(String, i64)> =
+            s.released.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        // 保留 (墓碑值, claimId) 最大的 MAX_RELEASED 条；同值先按 claimId 降序，确定性地丢最旧。
+        entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.cmp(&a.0)));
+        let keep: BTreeSet<String> = entries
+            .into_iter()
+            .take(MAX_RELEASED)
+            .map(|(k, _)| k)
+            .collect();
+        s.released.retain(|k, _| keep.contains(k));
+    }
 }
 
 /// 一次写命令的结果（打印在事务**之外**：重试会多次执行 apply，不能重复打印）。
@@ -1124,7 +1149,7 @@ fn main() -> Result<()> {
                     anyhow::bail!("claim_id or paths required for release");
                 }
                 let released = buried.len();
-                bury(s, &buried);
+                bury(s, &buried, now);
                 Ok(WriteOutcome::Release { released })
             })?;
             if let WriteOutcome::Release { released } = outcome {
@@ -1781,6 +1806,116 @@ mod tests {
         assert_eq!(neg_back.claims.len(), 1, "RED: whole-file overwrite loses the CLI record");
         assert_eq!(neg_back.claims[0].writer, "plugin-1");
         fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- 单元 D：墓碑值取上界 + 墓碑表有界 ----
+
+    /// 墓碑值 = `max(现有值, claim.expiresAt, 释放时刻 + ttlSec)`：把"释放之后才合并进来的
+    /// 并发续租"整段窗口盖住，墓碑 GC 之后那条声明仍不具备权威。负向对照（同测试内）：
+    /// 退回"只取原 expiresAt"⇒ 墓碑先被 GC、续租复活成权威。
+    #[test]
+    fn test_tombstone_upper_bound_covers_concurrent_renewal() {
+        let mut claim = full_claim("c_1@wA", "agent:A", &["src/a/"], "wA", 1, 10000);
+        claim.ttl_sec = 10; // 释放于 t=1000 时墓碑 = max(10000, 1000+10000) = 11000
+        let mut d = StateDocument::default();
+        d.claims.push(claim.clone());
+        d.claims.clear();
+        bury(&mut d, &[claim.clone()], 1000);
+        assert_eq!(
+            d.released.get("c_1@wA"),
+            Some(&11000),
+            "release at t=1000 with ttl=10s => max(10000, 1000+10000)"
+        );
+
+        // 并发续租：另一个进程在 t=500 续租 ⇒ expiresAt = 10500 > 原 10000；它在释放之后才合并进来。
+        let mut renewed = claim.clone();
+        renewed.expires_at = 10500;
+        let mut replica = StateDocument::default();
+        replica.claims.push(renewed);
+
+        // 正题：在"旧墓碑会被 GC、而续租还没到期"的窗口（10200）里，墓碑必须还在。
+        let mut before = d.clone();
+        sweep_state(&mut before, 10200);
+        assert_eq!(before.released.get("c_1@wA"), Some(&11000), "tombstone must survive 10200");
+        assert_eq!(merge_docs(&before, &replica).claims.len(), 0, "renewal must stay buried");
+
+        // 墓碑按自己的值被 GC 之后，那条续租也已过期（10500 <= 11000）⇒ 仍无权威。
+        let mut after_gc = d.clone();
+        sweep_state(&mut after_gc, 11000);
+        assert!(after_gc.released.is_empty(), "tombstone is GC'd at its own value");
+        let merged = normalize_doc(&merge_docs(&after_gc, &replica));
+        assert_eq!(merged.claims.len(), 1);
+        assert_eq!(merged.claims[0].expires_at, 10500, "revived but already expired");
+
+        // 负向对照（RED）：只取原 expiresAt（= 10000）⇒ 10200 就被 GC，续租复活成权威。
+        let mut old = StateDocument::default();
+        old.released.insert("c_1@wA".into(), 10000);
+        let mut old_after = old.clone();
+        sweep_state(&mut old_after, 10200);
+        assert!(old_after.released.is_empty(), "RED: the old tombstone is gone at 10200");
+        assert_eq!(
+            normalize_doc(&merge_docs(&old_after, &replica)).claims.len(),
+            1,
+            "RED: the concurrent renewal becomes authoritative again"
+        );
+    }
+
+    /// 墓碑表有界：超过 `MAX_RELEASED` 时按 (墓碑值, claimId) 保留最大的那些、丢最旧的；
+    /// 规则只看数据 ⇒ 插入顺序不同也 GC 出同样结果。负向对照（同测试内）：保留最小的 N 条
+    /// ⇒ 最新（值最大）的墓碑被丢，被它镇住的声明复活成权威。
+    #[test]
+    fn test_tombstone_table_bounded_and_deterministic() {
+        let total = MAX_RELEASED + 5;
+        let id_of = |i: usize| format!("c_{i}@wA");
+        let build = |ascending: bool| {
+            let mut d = StateDocument::default();
+            let mut order: Vec<usize> = (0..total).collect();
+            if !ascending {
+                order.reverse();
+            }
+            for i in order {
+                d.released.insert(id_of(i), 1000 + i as i64);
+            }
+            d
+        };
+        let mut a = build(true);
+        let mut b = build(false);
+        sweep_state(&mut a, 0);
+        sweep_state(&mut b, 0);
+        assert_eq!(a.released.len(), MAX_RELEASED);
+        assert_eq!(
+            serde_json::to_string(&a).unwrap(),
+            serde_json::to_string(&b).unwrap(),
+            "the cap must be deterministic across insertion orders"
+        );
+        for i in 0..5 {
+            assert!(!a.released.contains_key(&id_of(i)), "oldest tombstone {i} must be dropped");
+        }
+        assert!(
+            a.released.contains_key(&id_of(total - 1)) && a.released.contains_key(&id_of(total - 5)),
+            "the newest tombstones must be kept"
+        );
+
+        // 负向对照（RED）：保留最小的 N 条 ⇒ 最新的墓碑被丢，被它镇住的声明复活。
+        let mut all: Vec<(String, i64)> = build(true).released.into_iter().collect();
+        all.sort_by(|x, y| x.1.cmp(&y.1).then_with(|| x.0.cmp(&y.0)));
+        let wrong: BTreeMap<String, i64> = all.into_iter().take(MAX_RELEASED).collect();
+        let newest = id_of(total - 1);
+        assert!(!wrong.contains_key(&newest), "RED: keep-smallest drops the newest tombstone");
+        let mut wrong_doc = StateDocument::default();
+        wrong_doc.released = wrong;
+        let mut replica = StateDocument::default();
+        replica.claims.push(full_claim(
+            &newest,
+            "agent:A",
+            &["src/a/"],
+            "wA",
+            1,
+            1000 + (total as i64 - 1),
+        ));
+        let merged = normalize_doc(&merge_docs(&wrong_doc, &replica));
+        assert_eq!(merged.claims.len(), 1, "RED: the buried claim revives under keep-smallest");
+        assert_eq!(merged.claims[0].claim_id, newest);
     }
 }
 

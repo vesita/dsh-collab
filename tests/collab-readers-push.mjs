@@ -528,10 +528,10 @@ console.log('# M1 第 1 条：pushed 的诚实口径（pushedNote）—— 只�
 console.log('# M1 第 5 条：inject 失败不记账，同 claimId 的第二次释放真的重试（不再误报 already-pushed）')
 {
   // 第一次用的租约**刻意短**：单元 C 起 release 会把 claimId 记进**终态墓碑**（权威失效，
-  // 不让旧副本翻案），而墓碑的 GC 规则是确定性的"原租约 expiresAt 到点即回收"。要重放同一对
-  // (claimId, reader)，就得等那块墓碑被 sweep 回收 —— 短租约让这里只等一两秒，而**幂等键
-  // 始终是同一个 claimId**（换 id 会把要测的东西绕过去）。
-  const shortLease = () => mkClaim({ claimId: 'c_idem', holderId: 'agent:owner', holderName: 'Owner', paths: ['src/a/'], readers: ['agent:me'], expiresAt: Date.now() + 2000 })
+  // 不让旧副本翻案）；单元 D 起墓碑值 = max(原 expiresAt, 释放时刻 + ttlSec)，所以"短租约"
+  // 必须 **ttlSec 也短**，墓碑才会在一两秒内被 sweep 回收。要重放同一对 (claimId, reader)，
+  // 就得等那块墓碑被回收 —— 而**幂等键始终是同一个 claimId**（换 id 会把要测的东西绕过去）。
+  const shortLease = () => mkClaim({ claimId: 'c_idem', holderId: 'agent:owner', holderName: 'Owner', paths: ['src/a/'], readers: ['agent:me'], ttlSec: 2, expiresAt: Date.now() + 2000 })
   const longLease = () => mkClaim({ claimId: 'c_idem', holderId: 'agent:owner', holderName: 'Owner', paths: ['src/a/'], readers: ['agent:me'], expiresAt: Date.now() + HOUR })
   // opts 在 harness 生命周期内可改：liveAgent 每次 inject 现读 opts.injectThrows。
   const opts = { claims: [shortLease()], liveSessions: ['me'], injectThrows: true }
@@ -593,10 +593,10 @@ console.log('# 旧通道整体删除：即使读者是"子代理路由托管"的
   ok(sourceShapeOk(injectLog[0] && injectLog[0].message), '(a) 该投递的来源形状同样正确', sourceShapeWhy(injectLog[0] && injectLog[0].message))
 
   // 幂等键 (claimId, reader)：投递成功过的一对，重新放回状态文件再释放也不再投。
-  // 单元 C：release 立终态墓碑，同一 claimId 在同一进程里不会复活；墓碑按"原租约到期"
-  // 确定性回收，所以这里用短租约 + 轮询等到墓碑被 sweep 回收，再观测 already-pushed
-  // （换 claimId 会把幂等键换掉，测不到这条）。
-  const shortLock = () => mkClaim({ claimId: 'c_lock', holderId: 'agent:owner', holderName: 'Owner', paths: ['src/a/'], readers: ['agent:me'], expiresAt: Date.now() + 2000 })
+  // 单元 C：release 立终态墓碑，同一 claimId 在同一进程里不会复活；单元 D：墓碑值 =
+  // max(原 expiresAt, 释放时刻 + ttlSec)，所以短租约的 ttlSec 也要短，墓碑才很快被 sweep 回收，
+  // 这里据此轮询等到那一刻，再观测 already-pushed（换 claimId 会把幂等键换掉，测不到这条）。
+  const shortLock = () => mkClaim({ claimId: 'c_lock', holderId: 'agent:owner', holderName: 'Owner', paths: ['src/a/'], readers: ['agent:me'], ttlSec: 2, expiresAt: Date.now() + 2000 })
   const hs = await makeHarness({ claims: [shortLock()], liveSessions: ['me'] })
   const first = await hs.callLock({ op: 'release', claimId: 'c_lock' }, 'owner')
   await settle()
@@ -694,9 +694,10 @@ console.log('# 安全硬约束：冷读者零投递（既不 inject，也不碰�
 
 console.log('# 排除释放者自己 / 同一 (claimId, reader) 只投一次')
 {
-  // 单元 C：release 立终态墓碑，同一 claimId 在同一进程里不会复活；墓碑按"原租约到期"
-  // 确定性回收 ⇒ 这里用短租约，并**轮询**到墓碑被 sweep 回收（换 id 会把幂等键换掉）。
-  const foreign = mkClaim({ claimId: 'c_lock', holderId: 'agent:owner', paths: ['src/a/'], readers: ['agent:owner', 'agent:me'], expiresAt: Date.now() + 2000 })
+  // 单元 C：release 立终态墓碑，同一 claimId 在同一进程里不会复活；单元 D：墓碑值 =
+  // max(原 expiresAt, 释放时刻 + ttlSec) ⇒ 短租约要把 ttlSec 也写短，墓碑才很快被回收，
+  // 这里轮询到那一刻（换 id 会把幂等键换掉）。
+  const foreign = mkClaim({ claimId: 'c_lock', holderId: 'agent:owner', paths: ['src/a/'], readers: ['agent:owner', 'agent:me'], ttlSec: 2, expiresAt: Date.now() + 2000 })
   const h = await makeHarness({ claims: [foreign], liveSessions: ['owner', 'me'] })
   const res0 = await h.callLock({ op: 'release', claimId: 'c_lock' }, 'owner')
   await settle()

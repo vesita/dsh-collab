@@ -221,31 +221,33 @@ console.log('# release 终态化：墓碑让"已释放"不被旧副本翻案，�
   // 新盘（A 释放过它：claims 里没有，released 里有）
   const releasedDoc = init(); releasedDoc.writer = 'wA'; releasedDoc.seq = 1
   const r = release(old, { holderId: 'agent:A', name: 'A' }, { claimId: 'c_9@wA' }, T)
-  ok(r.ok === true && old.claims.length === 0 && old.released['c_9@wA'] === 2600,
-    'release 把声明从 claims 拿掉、同时立墓碑（claimId → 原 expiresAt）',
+  // 单元 D：墓碑值 = max(原 expiresAt, 释放时刻 + ttlSec) = max(2600, 1000 + 600*1000) = 601000。
+  // 第三项把"释放之后才合并进来的并发续租"整段窗口盖住（见 tests/collab-tombstone.mjs）。
+  ok(r.ok === true && old.claims.length === 0 && old.released['c_9@wA'] === 601000,
+    'release 把声明从 claims 拿掉、同时立墓碑（claimId → max(原 expiresAt, 释放时刻 + ttl)）',
     show({ claims: old.claims.map(c => c.claimId), released: old.released }))
 
   const merged = mergeDocs(old, { ...init(), claims: [live()] })
   ok(merged.claims.length === 0, '旧副本合并回来也翻不了案：claims 里没有它', show(merged.claims))
-  ok(merged.released['c_9@wA'] === 2600, '墓碑仍在（权威失效的状态本身被合并保留）', show(merged.released))
+  ok(merged.released['c_9@wA'] === 601000, '墓碑仍在（权威失效的状态本身被合并保留）', show(merged.released))
 
   // GC 确定性：同一份数据 + 同一个 t ⇒ 任何副本上结果相同。
   const before = JSON.parse(JSON.stringify(old))
   const c1 = JSON.parse(JSON.stringify(before)); const c2 = JSON.parse(JSON.stringify(before))
-  sweep(c1, 2599)
-  sweep(c2, 2599)
-  ok(same(c1, c2) && c1.released['c_9@wA'] === 2600, '租约未到期：两个副本 sweep 后逐字节相同且墓碑都在', show(c1.released))
+  sweep(c1, 600999)
+  sweep(c2, 600999)
+  ok(same(c1, c2) && c1.released['c_9@wA'] === 601000, '墓碑未到期：两个副本 sweep 后逐字节相同且墓碑都在', show(c1.released))
   const d1 = JSON.parse(JSON.stringify(before)); const d2 = JSON.parse(JSON.stringify(before))
-  sweep(d1, 2600)
-  sweep(d2, 2600)
+  sweep(d1, 601000)
+  sweep(d2, 601000)
   ok(same(d1, d2) && !('c_9@wA' in d1.released),
-    '租约到期：两个副本 sweep 后逐字节相同且墓碑被确定性回收', show(d1.released))
+    '墓碑到期：两个副本 sweep 后逐字节相同且墓碑被确定性回收', show(d1.released))
   // 墓碑被 GC 之后，旧副本复活的那条记录只能"已过期"（在所有视图里不可见），所以无害。
   const afterGc = mergeDocs(
-    (() => { const d = JSON.parse(JSON.stringify(before)); sweep(d, 2600); return d })(),
+    (() => { const d = JSON.parse(JSON.stringify(before)); sweep(d, 601000); return d })(),
     { ...init(), claims: [live()] }
   )
-  ok(afterGc.claims.length === 1 && afterGc.claims[0].expiresAt <= 2600,
+  ok(afterGc.claims.length === 1 && afterGc.claims[0].expiresAt <= 601000,
     '墓碑 GC 后旧副本可以"复活"它，但复活出来的记录必然已过租约（list/overview/wait 都按 expiresAt 过滤）',
     show(afterGc.claims.map(c => ({ id: c.claimId, expiresAt: c.expiresAt }))))
 }

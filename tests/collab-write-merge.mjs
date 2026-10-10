@@ -177,7 +177,7 @@ console.log('# 3. release 终态化：旧副本合并回来也翻不了案（lis
   ok(rel.ok === true && rel.data.released.length === 1, 'A 释放了 src/x/', show(rel && rel.data && rel.data.released))
   const mid = onDisk(disk)
   ok(!mid.claims.some((c) => c.claimId === 'c_1@wA'), '释放后盘上 claims 里没有它', show(mid.claims.map(c => c.claimId)))
-  ok(mid.released && mid.released['c_1@wA'] > 0, '盘上留了终态墓碑（claimId → 原 expiresAt）', show(mid.released))
+  ok(mid.released && mid.released['c_1@wA'] > 0, '盘上留了终态墓碑（claimId → max(原 expiresAt, 释放时刻 + ttl)）', show(mid.released))
 
   // B 拿**旧副本**（里面 src/x/ 还活着）做一次正常写。
   const rb = await B.mutate((s) => pure.claim(s, holder('B'), { paths: ['src/z/'] }, now), null)

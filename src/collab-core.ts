@@ -308,12 +308,14 @@ export function cleanName(s: string): string {
 //      也不会撞 id（Lamport 时钟只保证"不小于所见最大值"，唯一性靠写者戳）；
 //   3. 游标是 `(seq, writer)` 复合值：只给数字时解释为 `(n, "")`，**不漏**（至多重送同 seq 那批）。
 //
-// 终态（release）不是"从数组里删掉"，而是记进 `released` 墓碑表（claimId → 原 expiresAt）：
+// 终态（release）不是"从数组里删掉"，而是记进 `released` 墓碑表：
 // 删除在 join 下**不单调** —— 另一份旧副本会把记录带回来；墓碑才单调（有墓碑就赢）。
 // `claims` 因此仍然只含**有效**记录，于是门控（gate / host-shell）与全部视图一个字都不用改。
 //
-// 墓碑的 GC 规则必须是**确定性**的（否则两个副本收敛不到同一处）：原租约 `expiresAt <= t`
-// 时丢掉。从那一刻起，任何副本上的那条记录都已过期、在所有视图里不可见 —— 复活它无害。
+// 墓碑的 GC 规则必须是**确定性**的（否则两个副本收敛不到同一处）：墓碑值 `<= t` 时丢掉。
+// 墓碑值本身取 `max(现有值, claim.expiresAt, 释放时刻 + ttlSec)`（单元 D）：只取原 expiresAt
+// 会被一条**并发续租**（释放之后才合并进来、expiresAt 更大）绕过 —— 墓碑先到期被 GC、那条
+// 声明重新具备权威。表本身还有确定性上限 `MAX_RELEASED`（单元 D，见 sweep）。
 
 /** 一个文档的写者戳（写这份文档的进程身份）。缺字段（老状态文件）归一为空串。 */
 export function writerOf(s: StateDocument | null | undefined): string {
@@ -510,15 +512,25 @@ function mergeReleased(a: Record<string, number>, b: Record<string, number>): Re
   return out
 }
 
-/** 给若干条声明立墓碑（claimId → 原 expiresAt）—— **所有**把声明从 `claims` 里拿掉的路径
- *  都必须走这里，否则"删掉"在 join 下不单调，会被旧副本翻案。
- *  只加不减、同键取 max，所以它本身也是单调的。 */
-function bury(s: StateDocument, claims: Claim[]): void {
+/** 墓碑表上限（单元 D）：按 `(墓碑值, claimId)` 保留最大的 N 条，其余（最接近自己到期的）丢掉。
+ *  N 取 4096 的理由：墓碑最多活到"释放时刻 + ttl"（ttl 上限 24h），一次释放只产生一条，4096 条
+ *  仍在 KB 级，只在异常密集的释放下才生效。规则**只看数据**（值 + claimId），不看插入顺序，
+ *  两个副本 GC 出同样结果 —— 否则不收敛。与 Rust 的 `MAX_RELEASED` 同值、同规则。 */
+export const MAX_RELEASED: number = 4096
+
+/** 给若干条声明立墓碑 —— **所有**把声明从 `claims` 里拿掉的路径都必须走这里，否则"删掉"在
+ *  join 下不单调，会被旧副本翻案。只加不减、同键取 max，所以它本身也是单调的。
+ *
+ *  墓碑值（单元 D）= `max(现有值, claim.expiresAt, t + ttlSec*1000)`。第三项堵住一个真实边角：
+ *  若有一条**并发续租**在释放之后才被合并进来，它的 `expiresAt` 可以大于原 `expiresAt`；只取原值
+ *  的话，墓碑按自己的到期被 GC 之后那条声明会**重新具备权威**（同一个 holder 有两个进程在写
+ *  —— 会话被恢复的现场）。取"释放时刻 + ttl"把整段可能的续租窗口盖住，那时的声明必然已过期。 */
+function bury(s: StateDocument, claims: Claim[], t: number): void {
   if (!Array.isArray(claims) || !claims.length) return
   if (!s.released || typeof s.released !== 'object') s.released = {}
   for (const c of claims) {
     if (!c || typeof c.claimId !== 'string' || !c.claimId) continue
-    const exp = Number(c.expiresAt) || 0
+    const exp = Math.max(Number(c.expiresAt) || 0, t + (Number(c.ttlSec) || 0) * 1000)
     const cur = s.released[c.claimId]
     s.released[c.claimId] = cur === undefined || exp > cur ? exp : cur
   }
@@ -662,13 +674,21 @@ export function sweep(s: StateDocument, t: number, opts: SweepOptions = {}): Swe
   const beforeClaims = s.claims.length
   s.claims = s.claims.filter(c => c.expiresAt > t)
   const expiredClaims = beforeClaims - s.claims.length
-  // 终态墓碑的**确定性** GC（见收敛层注释）：原租约 `expiresAt <= t` ⇒ 丢掉墓碑。
-  // 判据只看"数据里的 expiresAt"与传入的 t，不看本地计数/插入顺序/随机 —— 同一份数据
+  // 终态墓碑的**确定性** GC（见收敛层注释）：墓碑值 `<= t` ⇒ 丢掉墓碑。
+  // 判据只看"数据里的墓碑值"与传入的 t，不看本地计数/插入顺序/随机 —— 同一份数据
   // 在任何副本上得到同一结果。丢掉的那一刻起，任何副本上的那条记录都已过期、在所有视图里
   // 不可见（gate 与 list/overview/wait 都按 expiresAt 过滤），复活它无害。
   const rel = s.released
   if (rel && typeof rel === 'object') {
     for (const id of Object.keys(rel)) if (!(Number(rel[id]) > t)) delete rel[id]
+    // 墓碑表**有界**（单元 D）：超过 MAX_RELEASED 条时，按 (墓碑值, claimId) 保留最大的那些、
+    // 丢最旧的。规则只看数据，不看插入顺序 ⇒ 两个副本 GC 出同样结果（收敛的前提）。
+    // 被丢的是"最接近自己到期"的那些（值最小），丢它们只会让本就要到期的墓碑早一点消失。
+    const ids = Object.keys(rel)
+    if (ids.length > MAX_RELEASED) {
+      ids.sort((a, b) => ((Number(rel[b]) || 0) - (Number(rel[a]) || 0)) || (a < b ? 1 : a > b ? -1 : 0))
+      for (const id of ids.slice(MAX_RELEASED)) delete rel[id]
+    }
   }
 
   let droppedMessages = 0
@@ -1068,7 +1088,7 @@ export function dropHolder(state: StateDocument, holderId: string, t: number): O
   const expired = (c: Claim): boolean => c.holderId === holderId && c.expiresAt <= t
   const rel = state.claims.filter(expired)
   let changed = rel.length > 0
-  if (rel.length) { state.claims = state.claims.filter(c => !expired(c)); bury(state, rel) }
+  if (rel.length) { state.claims = state.claims.filter(c => !expired(c)); bury(state, rel, t) }
   for (const c of state.claims) {
     const list = readersOf(c)
     if (!list.includes(holderId)) continue
@@ -1130,7 +1150,7 @@ export function releaseOnLoopEnd(state: StateDocument, holderId: string, holderN
   const mine = state.claims.filter(c => c.holderId === holderId && c.expiresAt > t)
   if (!mine.length) return { ok: true, changed: false, data: { released: [] } }
   state.claims = state.claims.filter(c => !mine.includes(c))
-  bury(state, mine)
+  bury(state, mine, t)
   const released = mine.map(publish)
   // 路径去重保序后折叠：与通知文案同一口径（最多列 3 条，其余计数）。
   const uniq: string[] = []
@@ -1308,7 +1328,7 @@ export function claim(state: StateDocument, h: HolderInput, a: ClaimInput, tNow:
 // 释放。a = {claimId?} 或 {paths?}。返回 {ok,changed,state,data}。
 //
 // **终态化**（单元 C）：释放不再"从数组里删掉"，而是把命中的声明从 `claims` 移到
-// `released` 墓碑表（claimId → 原 expiresAt）。理由见收敛层注释：删除在 join 下不单调 ——
+// `released` 墓碑表（claimId → 墓碑值 = max(原 expiresAt, 释放时刻 + ttlSec)）。理由见收敛层注释：删除在 join 下不单调 ——
 // 另一份还握着旧副本的写者会把那条声明并回盘上；墓碑才单调（有墓碑就赢）。
 // 对外形状一字不变：`claims` 里不再有它，`data.released` 仍是那几条的公开视图。
 export function release(state: StateDocument, h: HolderInput, a: ReleaseInput, tNow: Clock): OpResult {
@@ -1325,7 +1345,7 @@ export function release(state: StateDocument, h: HolderInput, a: ReleaseInput, t
     if (!rel.length) return { ok: true, changed: false, state, tNow, data: { released: [], serverTime: t } }
   }
   state.claims = state.claims.filter(c => !rel.includes(c))
-  bury(state, rel)
+  bury(state, rel, t)
   return { ok: true, changed: true, state, tNow, data: { released: rel.map(publish), serverTime: t } }
 }
 
@@ -1411,7 +1431,7 @@ export function reap(s: StateDocument, h: HolderInput, a: ReapInput, liveHolderI
   }
   s.claims = s.claims.filter(c => !hits.includes(c))
   // reap（显式回收僵尸）也是"把声明拿掉"，同样立墓碑：否则被回收的声明会被另一份旧副本并回来。
-  bury(s, hits)
+  bury(s, hits, t)
   const reapedHolders: string[] = []
   if (!unknown) {
     s.holders = s.holders.filter(hh => {

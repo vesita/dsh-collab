@@ -128,7 +128,11 @@ DSH 自带一套实验性的 `Agent Teams`（`dsh-experimental-agent-team*`）�
     ├── _harness.mjs                 # 共用断言脚手架（ok / skip / 汇总 / 退出码）
     ├── collab-pure-logic.mjs        # 纯逻辑回归 + hostCode 内联副本漂移守护
     ├── collab-convergence.mjs       # 单元 C：merge 的代数律（交换/结合/幂等）+ id 唯一 + 游标无损 + 终态化
-    ├── collab-write-merge.mjs       # 单元 C：两个写者并发写盘不丢更新（含"后写覆盖"负向对照）+ release 终态化
+    ├── collab-tombstone.mjs         # 单元 D：墓碑值取上界（并发续租翻不了案）+ 墓碑表有界（各配负向对照）
+    ├── gen-merge-golden.mjs         # 单元 D：黄金语料生成器（从 lib/collab-core.js 的 mergeDocs 现算）
+    ├── fixtures/merge-golden.json   # 单元 D：TS/Rust 两侧共用的期望输出（勿手改，重跑生成器）
+    ├── collab-merge-golden.mjs      # 单元 D：TS 侧断言自己的 mergeDocs 与黄金语料逐字节相同
+    ├── collab-write-merge.mjs       # 单元 C/D：写者并发写盘不丢更新 + CLI/插件两个方向（含负向对照）
     ├── collab-integration.mjs       # Cordis 插件端到端（fake ctx）
     ├── collab-hostcode-parity.mjs   # 动态宿主形态**行为**对拍（路径 + 三态语义 + holder 回收）
     ├── collab-inline-parity.mjs     # 两形态**源码同源**守护（核心 + 状态层两段内联区逐字节一致，外壳不复刻）
@@ -782,6 +786,7 @@ cargo test --manifest-path crates/collab-cli/Cargo.toml
 | 行为 | 阈值 | 说明 |
 | --- | --- | --- |
 | 过期声明回收 | 租约到期 | 过期声明随每次读取失效，不再阻塞他人 |
+| 终态墓碑（`released`）回收 | 墓碑值到点，**且**表上限 `MAX_RELEASED = 4096` 条 | 墓碑值 = `max(现有值, 原 expiresAt, 释放时刻 + ttlSec)`（单元 D：盖住"释放之后才合并进来的并发续租"）；两个规则都**只看数据**（值 + claimId），任何副本 GC 出同一结果；超限丢最旧的（值最小） |
 | **僵尸声明显式回收** | **仅 `op=reap` + `confirm:true`** | **绝不自动**：dry-run 默认、判据见「僵尸声明的显式回收」一节；被强杀的会话留下的未到期声明由调用方显式确认后回收 |
 | 留言保留 | 最近 `MAX_MESSAGES = 2000` 条 **且** 总量 ≤ `MAX_MESSAGES_BYTES = 256 KiB` | 两个上限**取先到者**，超出都从最旧的开始丢弃；写入时回报 `swept.droppedMessages`（`swept` 是**条件字段**：仅当本次 `droppedMessages > 0` 或 `prunedHolders > 0` 时才出现在返回里，且不含 readers 相关字段）。字节口径 = 每条留言 JSON 序列化的 UTF-8 字节之和（不含数组分隔符与外层键名） |
 | 单条留言正文上限 | `MESSAGE_BODY_MAX_CHARS = 8000` 字符 | 只封条数会让状态"任意大"（一条 5MB 实测原样落盘）；超限由 `post()` 以 `bad-request` **显式挡回**，不静默截断 |
@@ -806,7 +811,9 @@ cargo test --manifest-path crates/collab-cli/Cargo.toml
 - **加载期合并**：主文件 + 旁挂合并成一个逻辑文档；`seq` 取两边的较大值（Lamport 逻辑时钟，`claimId` 与 `msgId` 都从它分配）。
 - **写盘**：`claim` / `release` / `heartbeat` 只写主文件；旁挂**只在留言真的变了**时才写（判据是"条数 + 首条 msgId + 末条 msgId"指纹，留言只有尾部追加与头部截断两种变化）。迁移那一次**先写旁挂再写主文件**，保证任何一步失败时留言都还在磁盘上。
 - **迁移**：主文件里仍有 `messages`（旧布局）时与旁挂按 `msgId` 求**并集**（同 `msgId` 取 `(seq, writer)` 较大者，按 `(seq, writer)` 升序），**首次写盘**把并集搬进旁挂并从主文件里去掉这个键；**只搬不删**，`collab_board op=read` 迁移前后返回一致。求并集而不是"以主文件为准"的理由：滚动升级期间同一份状态会被新旧两个版本交替写（旧版写主文件、新版写旁挂），任何"以某一边为准"都会在下次写盘时把另一边整批覆盖掉。
-- **跨进程收敛（单元 C）**：状态文件用 `replaceIfVersion` 写，而它是 probe → rename —— 两个进程可以同时 probe 到同一个 version、各自 rename 都成功，后写者静默覆盖先写者。所以写入不靠"版本守卫一定拦住"，靠状态本身**可合并**：每个写者有稳定唯一的写者戳（记录 id 是 `c_<seq>@<writer>` / `m_<seq>@<writer>`），写路径是 读 → `mergeDocs(盘上, 我的副本)` → 应用本次 op → 写 → **写后验证**（重读主文件、确认写者戳还是自己；不是就重读重合并重试）。`mergeDocs` 是半格 join（交换/结合/幂等）；`release` 不删记录而是留终态墓碑（`released`：claimId → 原 expiresAt），由 `sweep` 按"原租约到点"确定性回收。
+- **跨进程收敛（单元 C）**：状态文件用 `replaceIfVersion` 写，而它是 probe → rename —— 两个进程可以同时 probe 到同一个 version、各自 rename 都成功，后写者静默覆盖先写者。所以写入不靠"版本守卫一定拦住"，靠状态本身**可合并**：每个写者有稳定唯一的写者戳（记录 id 是 `c_<seq>@<writer>` / `m_<seq>@<writer>`），写路径是 读 → `mergeDocs(盘上, 我的副本)` → 应用本次 op → 写 → **写后验证**（重读主文件、确认写者戳还是自己；不是就重读重合并重试）。`mergeDocs` 是半格 join（交换/结合/幂等）；`release` 不删记录而是留终态墓碑（`released`）：墓碑值 = `max(现有值, 原 expiresAt, 释放时刻 + ttlSec)`，由 `sweep` 按"墓碑值到点"确定性回收，表本身按 `(墓碑值, claimId)` 保留最大的 `MAX_RELEASED = 4096` 条（丢最旧，规则只看数据）。
+- **CLI 也走同一条收敛路径（单元 D）**：`crates/collab-cli` 的写命令同样是 读盘 → `merge_docs(盘上, 本实例副本)` → 应用命令 → 写 → 写后验证（重试 5 轮）；它自己的 `<name>.lock` 保留（对 CLI 之间仍是便宜的串行化）。Rust 与 TS 是同一算法的两份实现，靠黄金语料 `tests/fixtures/merge-golden.json` 防漂移：语料由 `tests/gen-merge-golden.mjs` 从 TS 的 `mergeDocs` 现算，`tests/collab-merge-golden.mjs`（TS）与 Rust 的 `test_merge_golden_corpus_matches_ts` 都断言自己的输出与语料**逐字节相同** —— 改了一侧不改另一侧，必有一侧红。
+- **读路径不合并任何"本地未落盘的改动"**（单元 D 澄清，不是缺陷）：`list` / `status` / `overview` / `collab_board op=read` / `wait` / 写保护门控都直接以**盘上内容**为准，因为它们根本没有可合并的东西——写是 **write-through**（每个 op 都在自己的事务里落盘，成功才返回）。唯一的 in-memory 副本是写事务内部的"合并基"，它在每次写盘成功后都等于盘上内容，且只服务于下一次写。所以"读到的比写过的旧"只可能来自读盘时的**跨进程时序**，不可能来自本进程未落盘的改动。
 - `overview` 的 `otherProjects` 扫状态目录时排除 `*.messages.json`，不会把旁挂当成一个项目。
 
 ---
