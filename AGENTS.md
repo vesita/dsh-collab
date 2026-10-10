@@ -136,7 +136,7 @@
   环境面）才碰 `src/host-shell.js`，改完必须重新 build。
 - **契约只有一份**：`src/schema/collab.schema.json` 是 SSOT，TS / Python / Rust 三份派生物由
   `tests/collab-contract-derivation.mjs` 逐字段核对。
-- **状态必须可收敛（0.17.0 单元 C + 单元 D）**：跨进程并发**不靠锁** —— 状态文件的 `replaceIfVersion` 是
+- **状态必须可收敛（0.17.0 单元 C / 0.18.0 单元 D）**：跨进程并发**不靠锁** —— 状态文件的 `replaceIfVersion` 是
   probe → rename，两个进程可同时 probe 成功、各自 rename 都成功（`dsh-fs-local` 的串行化锁是
   实例字段，只在本进程排队）。硬规则：写路径必须是 读 → `mergeDocs(盘上, 本实例副本)` →
   应用 op → 写 → **写后验证**（重读主文件确认写者戳是自己）；`mergeDocs` 必须是半格 join

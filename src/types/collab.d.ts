@@ -101,11 +101,13 @@ export interface StateDocument {
    */
   writer?: string;
   /**
-   * 终态墓碑表（单元 C）：`claimId → 原租约 expiresAt`。release / 自动释放 / reap 不再把
+   * 终态墓碑表（单元 C）：`claimId → 墓碑时刻`（epoch ms）。release / 自动释放 / reap 不再把
    * 声明"从数组里删掉"，而是记进这里 —— 删除在 join 下不单调（另一份旧副本会把记录带回来），
    * 墓碑才单调。`claims` 仍然只含有效记录，所以门控与全部视图不受影响。
-   * GC 规则**确定性**：原租约 `expiresAt <= t` 时由 sweep 丢掉（那一刻起该记录在所有副本上
-   * 都已过期、不可见，复活无害）。**可选**：老状态文件缺省为空表。
+   * 墓碑值取**上界** `max(现有值, 声明 expiresAt, 释放时刻 + ttlSec)`（单元 D）：否则一条并发的
+   * 续租能把租约推到墓碑之后，等墓碑被回收，那条声明就会重新具备权威。
+   * GC 规则**确定性**：墓碑值 `<= t` 时由 sweep 丢掉，再按「墓碑值降序、claimId 降序」保留
+   * MAX_RELEASED（4096）条 —— 只看数据，故任何副本 GC 出同样结果。**可选**：老文件缺省为空表。
    */
   released?: Record<string, number>;
 }
