@@ -144,6 +144,8 @@
         "channel": { "type": "string" },
         "body": { "type": "string", "maxLength": 8000, "description": "post 用，消息正文。上限 8000 字符（与 collab-core 的 MESSAGE_BODY_MAX_CHARS 同值）；超限由 post() 以 bad-request 挡回且整条不写入，不静默截断。" },
         "replyTo": { "type": "string" },
+        "wake": { "type": "string", "description": "post 用（可选，单元 E）：定向唤醒的目标会话 id（可带 agent: 前缀）。投递前先探活（agent.status：running / idle / 探不到）：目标在跑 ⇒ 直接 steer 投递、不需确认；目标 idle ⇒ 不投递、返回预览 + 一次性 confirmToken，需再调一次并回传才唤醒；探不到 ⇒ 不投递、如实说明（留言只落板）。省略则只落板、不投递。" },
+        "wakeToken": { "type": "string", "description": "post 用（可选，单元 E）：首次 idle 探活返回的 confirmToken，原样回传以二次确认唤醒。带它时只唤醒、不再写留言（留言永远只落一条）；令牌绑定同一目标 + 同一留言、一次性、有有效期（默认 120 秒）。校验不过一律拒绝且不唤醒。" },
         "since": { "type": ["integer", "string"], "minimum": 0, "description": "read 用：省略或 0 = 读最新 limit 条（tail）；否则从该游标往后读 limit 条（forward，旧→新）。游标是**复合值** (seq, writer)：字符串写法 `<seq>@<writer>`（取返回的 nextCursor），数字写法（向后兼容）解释为 `(seq, \"\")`。返回的 nextCursor 是下一次的精确游标。" },
         "limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 }
       }

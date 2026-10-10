@@ -7,7 +7,7 @@
 | 工具 | 作用 |
 | --- | --- |
 | `collab_lock` | **中央注册锁**：开工前声明"我占用哪些文件夹/文件"，并查询/等待/协商 |
-| `collab_board` | **跨会话留痕本**：发消息 / 增量读消息。**不投递、不唤醒任何会话**（@ 谁 ≠ 通知谁） |
+| `collab_board` | **跨会话留痕本**：发消息 / 增量读消息。**默认不投递、不唤醒任何会话**（@ 谁 ≠ 通知谁）；可选 `wake: <会话id>` 定向唤醒 —— 投递前先探活，目标在跑就直接 steer，目标 idle 必须先二次确认（防未经同意烧 token） |
 
 ## 多会话协同靠三个机制
 
@@ -144,7 +144,7 @@ DSH 自带一套实验性的 `Agent Teams`（`dsh-experimental-agent-team*`）�
     ├── collab-awareness-cross-session.mjs # 跨会话家人/陌生人视角回归
     ├── collab-agent-teams.mjs       # 官方 Agent Teams 交叉预警（服务缺席 ⇒ 输出一字不变）
     ├── collab-access-gate.mjs       # 访问通知（agent.inject 的 notice 载体）与原生写保护（pre-execute）回归
-    ├── collab-readers-push.mjs      # 读者反向注册 + 释放推送 + 子代理回退 + 通知载体回归
+    ├── collab-readers-push.mjs      # 读者反向注册 + 释放推送 + 通知载体 + 定向唤醒（探活三分支 / idle 门控 / 令牌校验）回归
     ├── collab-e2e.mjs               # 真实 fs + 临时 DSH_HOME 的端到端回归
     ├── collab-skill.mjs             # 随包 skill + 委托纪律 + 偏好设置回归
     ├── collab-client-route.mjs      # Host 端技能索引路由（GET /dsh-collab/skill-index）回归

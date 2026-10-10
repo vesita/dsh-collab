@@ -28,12 +28,43 @@ import type {
   LoadResult, SessionsService, SessionTitleService, ToolExecContext, ToolResult
 } from './contract.js'
 
+/**
+ * 定向唤醒探活的返回（单元 E）。五种取值**不许合并**，各自对应一种真实的现场：
+ *   - `running` = agent 在场且 `status === 'running'` ⇒ 调用方可直接 steer（下一步边界领走）；
+ *   - `idle`    = agent 在场且 `status === 'idle'` ⇒ 唤醒会**立刻起一轮**，调用方必须走二次确认；
+ *   - `unknown` = agent 在场、但 `status` 不是可读字符串（形态给不出状态）⇒ 按保守侧处理（门控），
+ *                 绝不静默当成"在跑"直接唤醒；
+ *   - `absent`  = 本进程解析不到这个会话（不在本进程 / 无此会话）⇒ 不投递，如实说明；
+ *   - `failed`  = 探活判据**本身**抛错（agents.get 崩了）⇒ 基础设施故障，与 absent 是两件事。
+ */
+export interface ProbeResult {
+  state: 'running' | 'idle' | 'unknown' | 'absent' | 'failed'
+  /** 解析到的活 Agent（`running` / `idle` / `unknown` 三种取值才有）。 */
+  agent?: AgentLike
+  /** 仅 `failed`：真实错误文本，绝不抹平成 undefined。 */
+  error?: string
+}
+
 /** 状态存取面：installStore() 对外暴露的东西，也是其他 installer 的唯一状态入口。 */
 export interface StateStore {
   fs: CollabFs
   now(): number
   /** 功能 D 的存活判据：三态（live / not-live / failed）—— 基础设施故障不得折叠成"读者没在线"。 */
   livenessOf(sessionId: string): { state: 'live' | 'not-live' | 'failed'; error?: string }
+  /**
+   * 定向唤醒的**探活**（单元 E）：把 `agents.get(sessionId)` 的现场翻译成五态（见 ProbeResult）。
+   *
+   * 依据的真 API（不是猜的）：
+   *   - `agents.get(id: SessionId): Agent | undefined` —— 与上面 `livenessOf` 同一访问器；
+   *   - Agent 上的活体字段 `status: 'idle' | 'running'`
+   *     （`@deepseek-ai/dsh-agent/lib/types/runtime-types.d.ts:90`，字段声明在同文件 `:147`；
+   *      注释原文："idle means no driver is active; running begins when waking input starts
+   *      cancellable pre-step processing"）。受限动态宿主读同一个字段的先例：
+   *     `src/host-shell.js` 的 `agentStatusOf`（`a.status` 字符串直读）。
+   * 没有去猜任何别的判据：`agents.list()` 只含**本进程**加载着的 agent，用它就区分不出
+   * "idle" 与"不在本进程"，所以只作旁证、不参与本判定。
+   */
+  probeAgent(sessionId: string): ProbeResult
   /**
    * 会话家族（血缘）的 holderId 集合：自己 + 祖先链 + 后代。**只用于冲突判定，不落盘。**
    * 拿不到 agents 服务时退化为 `[self]`（= 0.9.10 的语义）。
@@ -313,6 +344,24 @@ export function installStore(ctx: CollabContext): StateStore {
     }
   }
 
+  // 定向唤醒的探活（单元 E）：与 livenessOf 同一访问器，只是把 `agent.status` 一起读出来。
+  // `status` 是 Agent 上的活体字段（dsh-agent/lib/types/runtime-types.d.ts:90,147）；
+  // 拿不到它时返回 'unknown'（**在**场但状态不可读），由调用方按保守侧门控 —— 绝不退回
+  // "当成 running 直接唤醒"或"当成 absent 不投递"这两种更省事的谎。
+  const probeAgent = (sessionId: string): ProbeResult => {
+    try {
+      const svc = ctx.get('agents') as AgentsLookupService | undefined
+      if (!svc || typeof svc.get !== 'function') return { state: 'absent' }
+      const a = svc.get(sessionId)
+      if (!a) return { state: 'absent' }
+      if (a.status === 'running') return { state: 'running', agent: a }
+      if (a.status === 'idle') return { state: 'idle', agent: a }
+      return { state: 'unknown', agent: a }
+    } catch (e) {
+      return { state: 'failed', error: describeError(e) }
+    }
+  }
+
   // ---- 环境面 3/3：身份与显示名 ----
   const holderOf = (exec: ToolExecContext): HolderInput & { agent?: AgentLike } => {
     const agent = exec && exec.agent
@@ -363,7 +412,7 @@ export function installStore(ctx: CollabContext): StateStore {
   })
 
   return {
-    fs, now, livenessOf, familyIds, descendantIds, teamTasks, cwdOf, holderOf, hname,
+    fs, now, livenessOf, probeAgent, familyIds, descendantIds, teamTasks, cwdOf, holderOf, hname,
     load: (agentId, agent) => state.load(agentId, agent),
     mutate: (fn, agentId, agent) => state.mutate(fn, agentId, agent),
     list: (agentId, agent) => state.list(agentId, agent),

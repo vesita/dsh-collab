@@ -348,6 +348,21 @@ console.log('# read ops read the same state file writes wrote (agent threaded th
   const msR = await boardLocal.execute({ op: 'read', channel: 'anchored' }, AG)
   ok(msR.ok === true && (msR.data.messages || []).some((m) => m.body === 'hello'),
     'board read 也读同一份状态文件的留言', JSON.stringify(msR.data))
+
+  // 单元 E：受限动态宿主的**定向唤醒**必须如实降级（没有 dsh-llm ⇒ 构造不出显式来源的
+  // UserMessage；也没有可依赖的 agent.steer 面）。留言照常只落一条；确认步（带 wakeToken）
+  // 只做"唤醒"这件事，本形态不投递 ⇒ **绝不写第二条留言**。
+  const wakeR = await boardLocal.execute({ op: 'post', channel: 'anchored', body: 'wake 降级', wake: 'any-target' }, AG)
+  ok(wakeR.ok === true && wakeR.data && wakeR.data.wake && wakeR.data.wake.supported === false &&
+     wakeR.data.wake.reason === 'unsupported-host' && wakeR.data.wake.delivered === false,
+    'hostCode：wake 如实降级为 supported:false / unsupported-host', JSON.stringify(wakeR && wakeR.data && wakeR.data.wake))
+  ok(/已落板/.test(String(wakeR.data.wake.note)), 'hostCode：降级说明点出"已落板"', String(wakeR.data.wake.note))
+  const confR = await boardLocal.execute({ op: 'post', wake: 'any-target', wakeToken: 'any-token' }, AG)
+  ok(confR.ok === true && confR.data.wake.supported === false && confR.data.wake.delivered === false,
+    'hostCode：确认步也如实降级（不假装投递）', JSON.stringify(confR && confR.data && confR.data.wake))
+  const msR2 = await boardLocal.execute({ op: 'read', channel: 'anchored' }, AG)
+  ok((msR2.data.messages || []).filter((m) => m.body === 'wake 降级').length === 1,
+    'hostCode：wake 留言恰好 1 条；确认步不写第二条', JSON.stringify((msR2.data.messages || []).map((m) => m.body)))
 }
 
 // ---------- 5. 态势摘要渲染：文档化具体文案 + 顺序确定性 ----------

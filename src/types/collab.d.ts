@@ -163,6 +163,17 @@ export interface CollabBoardParams {
   channel?: string;
   body?: string;
   replyTo?: string;
+  /**
+   * 定向唤醒（单元 E）的目标会话 id（可带 `agent:` 前缀）。投递前先探活：目标在跑（非 idle）
+   * ⇒ 直接 steer 投递、不需确认；目标 idle ⇒ **不投递**、返回预览 + 一次性 `wakeToken`；
+   * 探不到 ⇒ 不投递、留言只落板。省略则只落板、不投递。
+   */
+  wake?: string;
+  /**
+   * 二次确认令牌（单元 E）：首次 idle 探活返回的 `confirmToken` 原样回传。带它时**只唤醒、
+   * 不再写留言**（留言永远只落一条）；令牌绑定同一目标 + 同一留言、一次性、有有效期。
+   */
+  wakeToken?: string;
   since?: number;
   limit?: number;
 }

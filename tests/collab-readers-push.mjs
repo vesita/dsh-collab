@@ -1027,6 +1027,135 @@ console.log('# 通知载体：手抄的消息副本已删除，通知经 agent.i
 }
 
 // ════════════════════════════════════════════════════════════════════════
+// 3b. 单元 E：定向唤醒（wake）—— 探活三分支 + idle 门控 + 令牌校验
+// ════════════════════════════════════════════════════════════════════════
+// 用户定的规则：投递前**探活**，且**接收方 idle ⇒ 投递方必须二次确认**，否则不需要。
+// 这一节用**假 agents**（带 `status` 与 `steer` 记录器）把三条分支各钉一条断言，并钉死
+// "未确认前 steer 次数为 0 / 确认后恰好 1 次"与四条令牌拒绝路径。
+console.log('# 定向唤醒：探活三分支 + idle 二次确认 + 令牌校验（不重复留言 / 未确认不 steer）')
+{
+  const steers = []
+  /** 带 steer 记录器的假 agent：steer 会**唤醒**，所以单独记账（inject 与本功能无关）。 */
+  const mkTarget = (id, status) => ({
+    id,
+    session: { header: { cwd: CWD } },
+    status,
+    steer: (message) => steers.push({ id, message }),
+    inject: (message) => steers.push({ id, inject: message })
+  })
+  const RUN = mkTarget('run-target', 'running')
+  const IDLE = mkTarget('idle-target', 'idle')
+  const IDLE2 = mkTarget('idle-target-2', 'idle')
+  const AGENTS = {}
+  AGENTS[RUN.id] = RUN; AGENTS[IDLE.id] = IDLE; AGENTS[IDLE2.id] = IDLE2
+  const exec = (id) => ({ agent: { id, session: { header: { cwd: CWD } } } })
+  const boardOf = (h) => h.tools.find((t) => t.name === 'collab_board')
+  const countSteers = (id) => steers.filter((s) => !s.inject && s.id === id).length
+  const steerShapeOk = (id) => steers.filter((s) => !s.inject && s.id === id).every((s) => sourceShapeOk(s.message))
+
+  // ① 目标在跑（非 idle）⇒ 直接 steer，不需要确认、不发令牌
+  {
+    const h = await makeHarness({ liveSessions: [RUN.id], agentObjects: AGENTS })
+    const res = await boardOf(h).execute({ op: 'post', body: '给在跑的目标', wake: RUN.id }, exec('me'))
+    ok(res.ok === true && res.data.wake && res.data.wake.delivered === true,
+      '① 在跑 ⇒ 直接投递（delivered:true）', JSON.stringify(res.data && res.data.wake))
+    ok(res.data.wake.mode === 'running' && res.data.wake.confirmToken === undefined,
+      '① 在跑：mode=running 且**不发**令牌', JSON.stringify(res.data.wake))
+    ok(countSteers(RUN.id) === 1, '① 在跑：steer 恰好 1 次', 'steers=' + countSteers(RUN.id))
+    ok(h.readState().messages.length === 1, '① 在跑：留言恰好 1 条', 'messages=' + h.readState().messages.length)
+    ok(steerShapeOk(RUN.id), '① 唤醒消息的 source 显式非 user（同 (a) 判据）',
+      JSON.stringify(steers.filter((s) => !s.inject).map((s) => s.message && s.message.source)))
+  }
+
+  // ② idle ⇒ **不投递** + 预览 + 令牌；③ 确认后才恰好 steer 一次
+  {
+    const h = await makeHarness({ liveSessions: [IDLE.id], agentObjects: AGENTS })
+    const r1 = await boardOf(h).execute({ op: 'post', body: '给 idle 的留言', channel: 'general', wake: IDLE.id }, exec('me'))
+    const w1 = r1.data && r1.data.wake
+    ok(r1.ok === true && w1 && w1.delivered === false && w1.pending === true,
+      '② idle ⇒ **不投递**且 pending:true', JSON.stringify(w1))
+    ok(typeof w1.confirmToken === 'string' && w1.confirmToken.length > 20,
+      '② idle ⇒ 返回一次性 confirmToken', JSON.stringify(w1 && w1.confirmToken))
+    ok(!!w1.preview && w1.preview.target === IDLE.id && typeof w1.preview.bodySummary === 'string' &&
+       /起一轮/.test(String(w1.preview.wakeEffect)),
+      '② idle ⇒ 返回预览（目标 + 正文摘要 + "它会立刻起一轮"）', JSON.stringify(w1 && w1.preview))
+    ok(countSteers(IDLE.id) === 0, '【门控】② idle 未确认之前 steer 调用次数恰好 0', 'steers=' + countSteers(IDLE.id))
+    ok(h.readState().messages.length === 1, '② idle 首次调用：留言恰好 1 条', 'messages=' + h.readState().messages.length)
+
+    const r2 = await boardOf(h).execute({ op: 'post', wake: IDLE.id, wakeToken: w1.confirmToken }, exec('me'))
+    ok(r2.ok === true && r2.data.wake && r2.data.wake.delivered === true,
+      '③ 确认后 ⇒ 真正唤醒（delivered:true）', JSON.stringify(r2.data && r2.data.wake))
+    ok(countSteers(IDLE.id) === 1, '【门控】③ 确认后才恰好 steer 1 次', 'steers=' + countSteers(IDLE.id))
+    ok(h.readState().messages.length === 1, '③ 确认步**不再写留言**：板上恰好 1 条', 'messages=' + h.readState().messages.length)
+    ok(steerShapeOk(IDLE.id), '③ 唤醒消息 source 显式非 user',
+      JSON.stringify(steers.filter((s) => !s.inject && s.id === IDLE.id).map((s) => s.message && s.message.source)))
+
+    const r3 = await boardOf(h).execute({ op: 'post', wake: IDLE.id, wakeToken: w1.confirmToken }, exec('me'))
+    ok(r3.ok === false && r3.error === 'bad-request', '③ 令牌一次性：用过再传被拒', JSON.stringify(r3))
+    ok(countSteers(IDLE.id) === 1, '③ 一次性：被拒时不 steer（仍是 1 次）', 'steers=' + countSteers(IDLE.id))
+  }
+
+  // ④ 探不到 ⇒ 不投递 + 如实说明（留言照样落板）
+  {
+    const h = await makeHarness({ liveSessions: [], agentObjects: AGENTS })
+    const res = await boardOf(h).execute({ op: 'post', body: '给不存在的会话', wake: 'ghost-target' }, exec('me'))
+    const w = res.data && res.data.wake
+    ok(res.ok === true && w && w.delivered === false && w.pending === false && w.reason === 'not-found',
+      '④ 探不到 ⇒ 不投递、reason=not-found', JSON.stringify(w))
+    ok(/探不到|只落板/.test(String(w.note)), '④ 探不到 ⇒ 如实说明（不谎报已投递）', String(w && w.note))
+    ok(h.readState().messages.length === 1, '④ 探不到：留言照样落板且恰好 1 条', 'messages=' + h.readState().messages.length)
+    ok(countSteers('ghost-target') === 0, '④ 探不到：steer 一次都没有', 'steers=' + countSteers('ghost-target'))
+  }
+
+  // ⑤ 令牌校验：换目标 / 换留言 / 乱造 / 过期 ⇒ 一律拒绝且不 steer
+  {
+    const h = await makeHarness({ liveSessions: [IDLE.id, IDLE2.id], agentObjects: AGENTS })
+    const mint = async (target, body) => {
+      const r = await boardOf(h).execute({ op: 'post', body: body, wake: target }, exec('me'))
+      return r.data.wake.confirmToken
+    }
+    const before = () => countSteers(IDLE.id) + countSteers(IDLE2.id)
+    const start = before()
+
+    const tTarget = await mint(IDLE.id, '换目标用')
+    const rTarget = await boardOf(h).execute({ op: 'post', wake: IDLE2.id, wakeToken: tTarget }, exec('me'))
+    ok(rTarget.ok === false && rTarget.error === 'bad-request' && /target-mismatch/.test(String(rTarget.message)),
+      '⑤ 换目标 ⇒ 拒绝（target-mismatch）', JSON.stringify(rTarget))
+    ok(before() === start, '⑤ 换目标被拒时不 steer', 'steers=' + before())
+
+    const tMsg = await mint(IDLE.id, '换留言用')
+    const dot = tMsg.indexOf('.')
+    const payload = JSON.parse(Buffer.from(tMsg.slice(0, dot), 'base64url').toString('utf8'))
+    payload.m = 'm_forged@nowhere'
+    const tampered = Buffer.from(JSON.stringify(payload)).toString('base64url') + tMsg.slice(dot)
+    const rMsg = await boardOf(h).execute({ op: 'post', wake: IDLE.id, wakeToken: tampered }, exec('me'))
+    ok(rMsg.ok === false && rMsg.error === 'bad-request' && /bad-signature/.test(String(rMsg.message)),
+      '⑤ 换留言（篡改 msgId）⇒ 签名不符被拒', JSON.stringify(rMsg))
+    ok(before() === start, '⑤ 换留言被拒时不 steer', 'steers=' + before())
+
+    const rFake = await boardOf(h).execute({ op: 'post', wake: IDLE.id, wakeToken: 'not.a.real.token' }, exec('me'))
+    ok(rFake.ok === false && rFake.error === 'bad-request', '⑤ 乱造令牌 ⇒ 拒绝', JSON.stringify(rFake))
+    ok(before() === start, '⑤ 乱造被拒时不 steer', 'steers=' + before())
+
+    // 过期：把令牌有效期调到 20ms，装一个新实例，等 80ms 再确认。
+    const prevTtl = process.env.DSH_COLLAB_WAKE_TTL_SEC
+    process.env.DSH_COLLAB_WAKE_TTL_SEC = '0.02'
+    const hExp = await makeHarness({ liveSessions: [IDLE.id], agentObjects: AGENTS })
+    if (prevTtl === undefined) delete process.env.DSH_COLLAB_WAKE_TTL_SEC
+    else process.env.DSH_COLLAB_WAKE_TTL_SEC = prevTtl
+    const rMintExp = await boardOf(hExp).execute({ op: 'post', body: '过期用', wake: IDLE.id }, exec('me'))
+    const tExp = rMintExp.data.wake.confirmToken
+    await new Promise((r) => setTimeout(r, 80))
+    const beforeExp = countSteers(IDLE.id)
+    const rExp = await boardOf(hExp).execute({ op: 'post', wake: IDLE.id, wakeToken: tExp }, exec('me'))
+    ok(rExp.ok === false && rExp.error === 'bad-request' && /expired/.test(String(rExp.message)),
+      '⑤ 过期令牌 ⇒ 拒绝（expired）', JSON.stringify(rExp))
+    ok(countSteers(IDLE.id) === beforeExp, '⑤ 过期被拒时不 steer', 'steers=' + countSteers(IDLE.id))
+    ok(hExp.readState().messages.length === 1, '⑤ 过期确认步不写留言（仍 1 条）', 'messages=' + hExp.readState().messages.length)
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════
 // 4. 全局断言：(a) 每条投递的来源形状 + 旧通道/旧 reason 的彻底消失
 // ════════════════════════════════════════════════════════════════════════
 console.log('# (a) 投递出去的**每一条**消息来源都显式非 user')
