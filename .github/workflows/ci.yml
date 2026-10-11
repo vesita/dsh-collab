@@ -32,8 +32,9 @@ jobs:
 
       - name: 安装 pnpm
         uses: pnpm/action-setup@v4
-        with:
-          version: 11
+        # 版本**只有一个家**：package.json 的 `packageManager`。action 会自己读它。
+        # 这里再写 `version: 11` 会被判为版本冲突并**直接失败**（实测 GitHub 注解）：
+        #   Error: Multiple versions of pnpm specified … ERR_PNPM_BAD_PM_VERSION
 
       - name: 安装 Node
         uses: actions/setup-node@v4
