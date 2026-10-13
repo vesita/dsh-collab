@@ -1,0 +1,55 @@
+name: CI
+
+# ⑩ 本仓库实际怎么装依赖（判定依据，不是猜的）：
+#   - pnpm-lock.yaml 存在（lockfileVersion 9.0），node_modules 走 .pnpm 虚拟 store，
+#     pnpm-workspace.yaml 里只有 pnpm 配置项（minimumReleaseAgeExclude），**没有** packages:，
+#     所以它是"pnpm 配置 + 单包"，不是 monorepo 工作区。
+#   - 没有 package-lock.json / yarn.lock ⇒ 用 `npm install` 会无视这份锁文件，不可复现。
+#   ⇒ 安装用 pnpm（--frozen-lockfile），再交给 npm 跑 package.json 里的 scripts
+#     （`npm run build` / `npm test` 与包管理器无关）。
+#   本机已验证：`pnpm install --frozen-lockfile --ignore-scripts --store-dir <空 store>`
+#   从 npmjs 冷拉 23 个包成功（pnpm 11.26.0），锁文件与 package.json 一致。
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  node:
+    name: node (build + tests)
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: 安装 pnpm
+        uses: pnpm/action-setup@v4
+        # 版本**只有一个家**：package.json 的 `packageManager`。action 会自己读它。
+        # 这里再写 `version: 11` 会被判为版本冲突并**直接失败**（实测 GitHub 注解）：
+        #   Error: Multiple versions of pnpm specified … ERR_PNPM_BAD_PM_VERSION
+
+      - name: 安装 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: 安装依赖（严格按 pnpm-lock.yaml）
+        run: pnpm install --frozen-lockfile
+
+      - name: 构建（tsc -> lib/）
+        run: npm run build
+
+      # 10 个 harness；静默跳过已经被改成"默认失败"（只有 COLLAB_ALLOW_SKIP=1 才放行），
+      # 所以这里**不要**给它设 COLLAB_ALLOW_SKIP。
+      - name: 测试
+        run: npm test
+

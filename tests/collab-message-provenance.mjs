@@ -1,0 +1,214 @@
+// tests/collab-message-provenance.mjs
+// **项目规范的可执行版本**（见 AGENTS.md §1）：**严禁冒充用户**。
+//
+// 规范的内核不是"禁止一切消息构造"，而是三条：
+//   ① 不许造出 `source.kind === 'user'` 的消息（那是冒充真人输入）；
+//   ② 不许在没有显式来源（`source` + 本插件自己的 `kind` + `form`）的情况下投递消息；
+//   ③ 不许在仓库里手抄构造函数副本 —— 必须用真实的 `@deepseek-ai/dsh-llm`；
+//   ④ 不许用「收 content、来源由宿主盖章」的通道投递（`sessionController.prompt` /
+//      `subagents.sendMessage`）—— 实测宿主把来源写死成 `kind: 'user'`，GUI 里就是**用户气泡**。
+//      0.9.6 已把这两条通道从 `src/push.ts` 整体删除，此处把它钉成一次命令可判定的规则。
+// 允许的是：经真实构造链、且**来源显式非 user** 的 notice 消息（例如访问通知），
+// 由 `agent.inject` 逐事件投递 —— 客户端按 `source.kind !== 'user'` 把它渲染成 notice 行。
+//
+// 历史教训（别再把这条读成"禁止构造"）：曾经的口径是"一律禁止构造"，逼得访问通知去挤
+// `systemPrompt.context`，代价是每次重提**整份运行时快照**、依赖 `systemPrompt` 可用、
+// 且通知没有自己的一行。收窄到"禁止冒充"之后既保住了内核，又回到了生态的通行写法。
+//
+// 运行：node tests/collab-message-provenance.mjs
+// 退出码非 0 表示失败。
+
+import { readFileSync, existsSync, readdirSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+import { dirname, join } from 'node:path'
+
+const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
+
+let passed = 0
+let failed = 0
+const failures = []
+
+function check(name, cond, detail) {
+  if (cond) {
+    passed++
+    console.log('  ok  ' + name)
+  } else {
+    failed++
+    failures.push(detail ? `${name} — ${detail}` : name)
+    console.log('  FAIL ' + name + (detail ? '  <-- ' + detail : ''))
+  }
+}
+
+/**
+ * 剥掉注释后再匹配：**注释里要能解释"为什么不用它"**，规范管的是代码。
+ * 用状态机而不是正则 —— 正则会被字符串里的 `//`（如 `'https://…'`）截断整行，
+ * 从而漏掉同一行后面的违规。
+ */
+function stripComments(src) {
+  let out = ''
+  let i = 0
+  let quote = null
+  while (i < src.length) {
+    const c = src[i]
+    const n = src[i + 1]
+    if (quote) {
+      out += c
+      if (c === '\\') { out += n === undefined ? '' : n; i += 2; continue }
+      if (c === quote) quote = null
+      i++
+      continue
+    }
+    if (c === '/' && n === '/') { while (i < src.length && src[i] !== '\n') i++; continue }
+    if (c === '/' && n === '*') { i += 2; while (i < src.length && !(src[i] === '*' && src[i + 1] === '/')) i++; i += 2; continue }
+    if (c === '"' || c === "'" || c === '`') quote = c
+    out += c
+    i++
+  }
+  return out
+}
+
+/**
+ * 生成物 `lib/collab-plugin.host.js` 的整份源码装在一个 JSON 字符串里：
+ *     export const hostCode = "<JSON>";
+ * 它的**注释也在字符串里**，直接扫原文会把注释当代码（例如 collab-core 里解释
+ * "为什么不用 sessionController.prompt" 的注释），同时也会漏掉字符串里真正的违规。
+ * 所以先取出字符串本体再扫；其它文件原样返回（解码失败也原样返回，不静默放行）。
+ */
+function decodeHostCode(raw) {
+  const m = /^export const hostCode = (".*");\s*$/m.exec(raw)
+  if (!m) return raw
+  try {
+    const s = JSON.parse(m[1])
+    return typeof s === 'string' ? s : raw
+  } catch (e) { return raw }
+}
+
+/** ① 冒充用户：这两样一出现就违规。 */
+const FORBIDDEN = [
+  { re: /role\s*:\s*['"]user['"]/, why: '手写了 role=user —— 那是冒充真人输入' },
+  { re: /kind\s*:\s*['"]user['"]/, why: "source.kind='user' 会让消息渲染成用户气泡（冒充）" }
+]
+
+/**
+ * ④ 宿主代造消息的通道（0.9.6 整体删除）：这两个 API **收 content、不收 message**，
+ *    消息由宿主构造并写死 `source: { kind: 'user', rpcId: 'dsh-collab-…' }` —— 实测转录里就是
+ *    `user/message` + `kind:'user'`，客户端按 `source.kind` 分流后渲染成**用户气泡**（冒充真人输入，
+ *    落进 next-step 收件箱还会升级成 steering 气泡）。它们的失败还曾在 `notify` 里留下
+ *    `prompt-failed` / `not-adjacent` / `subagent-failed` 三个取值，随通道一起删除。
+ *    现在跨会话通知只有一条路：自造显式来源消息 + `agent.inject`。
+ *    这两个名字**只允许出现在注释里** —— `stripComments` 之后一命中即违规。
+ */
+const HOST_STAMPED_CHANNELS = [
+  { re: /\.sendMessage\s*\(/, why: "subagents.sendMessage 由宿主盖章 kind:'user' ⇒ 用户气泡（冒充）" },
+  { re: /\bsessionController\b/, why: "sessionController.prompt 由宿主盖章 kind:'user' ⇒ 用户气泡（冒充）" }
+]
+
+/** ③ 手抄副本：只禁**定义**，不禁调用。 */
+const REPLICA_DEFS = [
+  { re: /(?:function|const|let|var)\s+createUserMessage\b/, name: 'createUserMessage' },
+  { re: /(?:function|const|let|var)\s+createMessage\b/, name: 'createMessage' },
+  { re: /(?:function|const|let|var)\s+freezeMessage\b/, name: 'freezeMessage' },
+  { re: /(?:function|const|let|var)\s+boundContextSummary\b/, name: 'boundContextSummary' }
+]
+
+const SCAN_DIRS = ['src', 'lib']
+
+function scanDir(rel) {
+  const abs = join(ROOT, rel)
+  if (!existsSync(abs)) return { present: false, files: [] }
+  // .d.ts 是类型声明（不是构造），排除。
+  const files = readdirSync(abs)
+    .filter((f) => f.endsWith('.js') || (f.endsWith('.ts') && !f.endsWith('.d.ts')))
+    .sort()
+  return { present: true, files }
+}
+
+console.log('# 规范：严禁冒充用户（AGENTS.md §1）')
+
+let totalFiles = 0
+const constructors = []
+for (const dir of SCAN_DIRS) {
+  const { present, files } = scanDir(dir)
+  if (dir === 'src') {
+    check('src/ 存在且含源码文件', present && files.length > 0, present ? 'no .ts files' : 'missing dir')
+  } else if (!present || files.length === 0) {
+    // 构建产物缺失时**不静默通过** —— 提示先构建，并判失败。
+    check('lib/ 存在且含构建产物（先 npm run build）', false, 'missing lib/ —— 不静默跳过')
+    continue
+  }
+  totalFiles += files.length
+
+  for (const f of files) {
+    const raw = readFileSync(join(ROOT, dir, f), 'utf8')
+    const text = stripComments(decodeHostCode(raw))
+    for (const { re, why } of FORBIDDEN) {
+      const m = re.exec(text)
+      if (!m) continue
+      const line = text.slice(0, m.index).split('\n').length
+      check(`${dir}/${f} 不得冒充用户`, false, `${why}（剥注释后第 ${line} 行）`)
+    }
+    // ④ 宿主代造消息的通道：剥注释后一命中即违规（注释里允许解释为什么不用它）。
+    for (const { re, why } of HOST_STAMPED_CHANNELS) {
+      const m = re.exec(text)
+      if (!m) continue
+      const line = text.slice(0, m.index).split('\n').length
+      check(`${dir}/${f} 不得经宿主代造消息的通道投递`, false, `${why}（剥注释后第 ${line} 行）`)
+    }
+    // ③ 只在源码里禁副本定义；lib/ 是产物，副本定义会以同样形态出现，故一并扫。
+    for (const { re, name } of REPLICA_DEFS) {
+      if (re.test(text)) check(`${dir}/${f} 不得自定义 ${name}（手抄副本）`, false, '必须用真实的 @deepseek-ai/dsh-llm')
+    }
+    if (/\bcreateUserMessage\s*\(/.test(text)) constructors.push({ dir, f, text })
+  }
+}
+
+check('扫描覆盖了源码与构建产物', totalFiles > 0, 'no files scanned')
+
+// ② 有构造，就必须有显式来源：source + kind + form。
+//    没有 source 的消息无法被追溯；没有 form 的消息在客户端会退化成 opaque 行。
+//    0.1.7 起 `MessageSourceMap` 没有通用的 `plugin` 兜底种类，每个生产者声明自己的
+//    `kind`（本仓库在 `src/contract.ts` 里声明 `'dsh-collab'`），所以规则查的是 `kind`。
+for (const { dir, f, text } of constructors) {
+  const who = `${dir}/${f}`
+  check(`${who} 构造消息时带 source`, /\bsource\s*:/.test(text), '缺 source —— 无来源的消息无法追溯')
+  check(`${who} source 带 kind 标签`, /\bkind\s*:\s*['"]/.test(text), '缺 kind 标签 —— 来源不可读')
+  check(`${who} source 带 form`, /\bform\s*:\s*['"]/.test(text), "缺 form —— 客户端会退化成 opaque 行")
+  // notice 必须带 summary，否则 `contextBody` 的 case "notice" 会返回 opaque。
+  if (/\bform\s*:\s*['"]notice['"]/.test(text)) {
+    check(`${who} form:'notice' 带 summary`, /\bsummary\s*:/.test(text), '缺 summary ⇒ notice 行退化成 opaque')
+  }
+  // ③ 必须来自真身，而不是某个本地模块。
+  const importedFromReal = /from\s+['"]@deepseek-ai\/dsh-llm['"]/.test(text)
+  check(`${who} 的构造函数来自 @deepseek-ai/dsh-llm`, importedFromReal, '没有从真身 import —— 可能是本地副本')
+}
+
+// 访问通知是当前唯一的构造点：它必须是逐事件投递，而不是又挤回上下文段。
+const access = readFileSync(join(ROOT, 'src/access.ts'), 'utf8')
+check('访问通知经 agent.inject 逐事件投递', /\.inject\s*\(/.test(access), 'src/access.ts 里找不到 agent.inject')
+check('访问通知不再注册 systemPrompt 上下文段', !/systemPrompt/.test(access), 'src/access.ts 里仍有 systemPrompt —— 载体又变了')
+check('访问通知的 source 标注为 dsh-collab', /\bkind\s*:\s*'dsh-collab'/.test(access), "source.kind 不是 'dsh-collab'")
+// 0.1.7 的 `MessageSourceMap` 是 merge-extensible 的，本仓库必须自己声明这个 kind，
+// 否则 `createUserMessage({ source: { kind: 'dsh-collab', … } })` 连编译都过不去。
+const contract = readFileSync(join(ROOT, 'src/contract.ts'), 'utf8')
+check('契约里为 source 声明了 dsh-collab 种类',
+  /interface\s+MessageSourceMap\s*\{[\s\S]{0,400}?'dsh-collab'/.test(contract),
+  'src/contract.ts 里没有 augment MessageSourceMap —— 0.1.7 起没有通用 plugin 兜底')
+
+// 跨会话通知（释放推送）与访问通知同载体：0.9.6 起 src/push.ts 是唯一的投递面，
+// 必须是「自造显式来源消息 + agent.inject」，且代码里不再出现任何宿主代造通道。
+const pushCode = stripComments(readFileSync(join(ROOT, 'src/push.ts'), 'utf8'))
+check('释放通知经 agent.inject 逐事件投递', /\.inject\s*\(/.test(pushCode), 'src/push.ts 里找不到 agent.inject')
+check('释放通知自造显式来源消息', /createUserMessage\s*\(/.test(pushCode)
+  && /from\s+['"]@deepseek-ai\/dsh-llm['"]/.test(pushCode), 'src/push.ts 没有用真身构造消息')
+check('释放通知没有回退通道（代码里不出现被删的两条通道）',
+  !HOST_STAMPED_CHANNELS.some(({ re }) => re.test(pushCode)), 'src/push.ts 里仍有宿主代造通道')
+
+check('手抄的消息副本 src/plugin-message.ts 已删除',
+  !existsSync(join(ROOT, 'src/plugin-message.ts')), 'src/plugin-message.ts 仍然存在')
+
+console.log(`\n${failed === 0 ? 'ALL PASS' : 'FAILURES'}: ${passed} passed, ${failed} failed`)
+if (failed) {
+  console.log('\n失败明细：')
+  for (const f of failures) console.log('  - ' + f)
+}
+process.exit(failed === 0 ? 0 : 1)

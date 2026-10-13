@@ -1,0 +1,9 @@
+node_modules/
+lib/
+dist/
+target/
+.dsh-collab.json
+.test-collab.json
+*.pyc
+__pycache__/
+*.tgz

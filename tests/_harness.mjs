@@ -1,0 +1,207 @@
+// tests/_harness.mjs
+// dsh-collab 测试共享脚手架（⑨ 去重）。
+//
+// 这 9 个 collab-*.mjs 过去各自复制同一段脚手架：
+//     let pass = 0, fail = 0[, skipped = 0]
+//     const ok = (cond, label, extra) => { ... }
+//     const skip = (label) => { ... }
+//     console.log(`\n${fail === 0 ? 'ALL PASS' : 'FAILURES'}: ${pass} passed, ${fail} failed[, N skipped]`)
+//     process.exit(fail === 0 ? 0 : 1)
+// 现在统一从这里取。**输出格式逐字节保持不变**（见 tests/README 或 commit message 里
+// 的 before/after 日志 diff），否则就是在悄悄改断言口径。
+//
+// ⑷ 静默跳过政策：跳过默认是**失败**。
+//   历史缺陷：`skip()` 只把 skipped++，退出码只看 fail ⇒ 真身对拍根本没跑，却报 ALL PASS。
+//   现在只有操作者显式设置 COLLAB_ALLOW_SKIP=1 才允许跳过，且必须打印"未验证"横幅。
+//
+// 用法：
+//   import { createHarness } from './_harness.mjs'
+//   const h = createHarness()                 // 无 skipped 变体
+//   const h = createHarness({ skipped: true })// 汇总行带 ", N skipped" 的变体
+//   const { ok } = h
+//   ...
+//   h.finish()                                // 打印汇总 + process.exit
+
+/** 只有显式 COLLAB_ALLOW_SKIP=1 才允许跳过；其余一律按失败计。 */
+export const ALLOW_SKIP = process.env.COLLAB_ALLOW_SKIP === '1'
+
+// ── 插件 Config 在测试里的正确构造方式（0.11.0 起）────────────────────────────
+// 本插件在**默认导出**上声明了 `Config`（插件页的配置表单与 `fiber.runtime.Config` 都靠它，
+// 见 docs/collab-ux-backlog.md §2.22）。于是 `ctx.plugin(plugin, config)` 会**自己**走完 Loader
+// 的两段式：先按 schema 校验**普通值**，再把 `.volatile()` 字段换成稳定引用（只有 `get()`）。
+//
+// 所以交给 `ctx.plugin` 的必须是**普通值**（就是 profile patch 里写的那种），
+// **不要**再手工造 `{ get, set }` 引用：那等于把"校验后的产物"又喂回校验，会直接
+// `ValidationError: expected boolean but got [object Object]`。校验后 `fiber.config` 上就是真引用。
+//
+// 改一个 volatile 字段：用 cosmokit 的 `updateVolatile(ref, { get })` —— 与
+// cordis-plugin-loader 的 `_commitVolatile` 调的是同一个函数（不是手抄"改引用内容"的替身）。
+// cosmokit 与本仓库的 cordis 一样不是直接依赖，从 pnpm 虚拟 store 的回退路径解析。
+
+/**
+ * 解析 cosmokit（Loader 用的那个 volatile 实现），解析不到的失败**不许**吞成跳过。
+ * @returns {Promise<{ updateVolatile: Function, isVolatile: Function }>}
+ */
+export async function loadCosmokit () {
+  const mod = await import('@deepseek-ai/cosmokit')
+    .catch(() => import('../node_modules/.pnpm/node_modules/@deepseek-ai/cosmokit/lib/index.js'))
+  if (typeof mod.updateVolatile !== 'function') throw new Error('cosmokit 没有导出 updateVolatile')
+  return mod
+}
+
+const BAR = '='.repeat(72)
+
+// ── 状态文件：主文件 + 留言旁挂（0.15.0，R2）────────────────────────────────
+// 磁盘布局拆成两半：<name>.json 只有 {schemaVersion, seq, claims, holders}，
+// 留言在 <name>.messages.json 里（见 src/store.ts 的 writeState / src/host-shell.js 的同名件）。
+// 测试要看的永远是**内存里的逻辑状态**，所以直读主文件必须合并旁挂 —— 直接
+// `JSON.parse(store.get(statePath))` 会看到一个没有 messages 的文档（99% 的字节都在那半边）。
+// 这两个辅助函数就是"测试侧的 load / 落盘"，口径与实现同源；不要在各测试里手抄。
+
+/** 旁挂留言文件的路径（`<name>.json` → `<name>.messages.json`）。 */
+export const sidecarPathOf = (statePath) => statePath.replace(/\.json$/, '.messages.json')
+
+/**
+ * 读取**逻辑状态**：主文件 + 旁挂留言（缺失的字段补成空数组）。
+ * @param {(path: string) => string | undefined} read 按绝对路径取原始文本（测试自己的 Map）
+ * @param {string} statePath 主文件绝对路径
+ */
+export function readStateMerged (read, statePath) {
+  const mainRaw = read(statePath)
+  const main = mainRaw ? JSON.parse(mainRaw) : {}
+  if (!main || typeof main !== 'object') throw new Error('state main file is not an object')
+  const sideRaw = read(sidecarPathOf(statePath))
+  if (sideRaw) {
+    const side = JSON.parse(sideRaw)
+    if (side && Array.isArray(side.messages)) main.messages = side.messages
+    if (side && Number(side.seq) > (Number(main.seq) || 0)) main.seq = Number(side.seq)
+  }
+  if (!Array.isArray(main.messages)) main.messages = []
+  if (!Array.isArray(main.claims)) main.claims = []
+  if (!Array.isArray(main.holders)) main.holders = []
+  return main
+}
+
+/**
+ * 写回**逻辑状态**：主文件不含 messages，留言进旁挂（与实现的落盘布局同源）。
+ * @param {(path: string, text: string) => void} write
+ */
+export function writeStateSplit (write, statePath, doc) {
+  const messages = Array.isArray(doc.messages) ? doc.messages : []
+  const rest = {}
+  for (const k of Object.keys(doc)) if (k !== 'messages') rest[k] = doc[k]
+  write(statePath, JSON.stringify(rest))
+  write(sidecarPathOf(statePath), JSON.stringify({ schemaVersion: doc.schemaVersion, seq: doc.seq, messages }))
+}
+
+/**
+ * 共享 harness 的**活体注入**。
+ *
+ * 一条 claim 有效与否只由 harness 的活体 oracle 决定（不再看 TTL / lastSeenAt）。
+ * 测试里预置的"外部会话"声明默认代表**活着的会话**，所以缺省 `get(id) → { id }`。
+ * 不注入活体时 oracle 会把每个 fixture holder 判成"未加载" ⇒ 声明立刻失效 ⇒ 门控全部放行。
+ *
+ * 要造"确证死亡"的负向对照：传 `live: [sessionId, ...]`（白名单）或 `byId: {...}`（逐 id 指定，
+ * 未命中即 not-live）；两者都不传 = 全都活着。
+ */
+export function fakeAgentsService ({ initiator = null, live = null, byId = null, list = null } = {}) {
+  const get = (id) => {
+    if (byId) return Object.prototype.hasOwnProperty.call(byId, id) ? byId[id] : undefined
+    if (live) return live.includes(id) ? { id } : undefined
+    return { id }
+  }
+  return {
+    currentInitiator: () => initiator,
+    list: () => (typeof list === 'function' ? list() : (initiator ? [initiator] : [])),
+    get
+  }
+}
+
+/**
+ * 打印"这次运行有东西没被验证"的醒目横幅。含"未验证"字样，必须出现。
+ * @param {string} what 被跳过的内容描述
+ */
+export function printSkipBanner (what) {
+  console.log('')
+  console.log(BAR)
+  console.log('!!  未验证：本次运行跳过了断言（COLLAB_ALLOW_SKIP=1 显式放行）')
+  console.log('!!  跳过项：' + what)
+  console.log('!!  跳过的内容**不代表通过**；默认模式与 CI 一律把跳过当作失败。')
+  console.log(BAR)
+  console.log('')
+}
+
+/**
+ * 统一的"跳过或失败"决策，供自带 harness 的测试（collab-e2e.mjs）复用。
+ * @param {string} what 被跳过的内容描述
+ * @returns {boolean} true = 已被操作者显式放行（调用方按"跳过"处理）；false = 调用方必须按失败处理
+ */
+export function skippedOrRejected (what) {
+  if (ALLOW_SKIP) {
+    printSkipBanner(what)
+    console.log('SKIPPED: ' + what)
+    return true
+  }
+  console.log('')
+  console.log(BAR)
+  console.log('!!  拒绝静默跳过：' + what)
+  console.log('!!  跳过的断言等于未验证，默认按**失败**计。')
+  console.log('!!  确需在本机放行，请设置 COLLAB_ALLOW_SKIP=1（会打印未验证横幅）。')
+  console.log(BAR)
+  console.log('')
+  return false
+}
+
+/**
+ * 创建一套计数器 + ok/skip/summary/finish。
+ * @param {{ skipped?: boolean, name?: string }} [options]
+ *        skipped: true 时汇总行追加 ", N skipped"（保持 readers-push 的历史格式）
+ */
+export function createHarness (options = {}) {
+  const trackSkipped = options.skipped === true
+  let pass = 0
+  let fail = 0
+  let skipped = 0
+  let bannerShown = false
+
+  const ok = (cond, label, extra) => {
+    if (cond) { pass++; console.log('  ok  ' + label) }
+    else { fail++; console.log('  FAIL ' + label + (extra ? '  <-- ' + extra : '')) }
+  }
+
+  const skip = (label) => {
+    if (ALLOW_SKIP) {
+      skipped++
+      if (!bannerShown) { bannerShown = true; printSkipBanner(label) }
+      console.log('  SKIP ' + label)
+      return true
+    }
+    fail++
+    console.log('  FAIL ' + label)
+    console.log('        <-- 拒绝静默跳过：该断言未执行 = 未验证。设 COLLAB_ALLOW_SKIP=1 才允许跳过。')
+    return false
+  }
+
+  const summary = () => {
+    const head = fail === 0
+      ? (skipped > 0 ? 'ALL PASS (含未验证项)' : 'ALL PASS')
+      : 'FAILURES'
+    const tail = trackSkipped ? `, ${skipped} skipped` : ''
+    return `\n${head}: ${pass} passed, ${fail} failed${tail}`
+  }
+
+  const finish = () => {
+    console.log(summary())
+    process.exit(fail === 0 ? 0 : 1)
+  }
+
+  return {
+    ok,
+    skip,
+    summary,
+    finish,
+    get pass () { return pass },
+    get fail () { return fail },
+    get skipped () { return skipped }
+  }
+}

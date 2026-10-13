@@ -1,0 +1,65 @@
+{
+  "name": "dsh-collab",
+  "version": "0.1.0",
+  "description": "DSH 插件：多会话协作与路径占用管理 —— 会话之间实时同步占用状态，动手前声明、冲突时协商、完成后释放",
+  "type": "module",
+  "packageManager": "pnpm@11.28.5",
+  "main": "lib/index.js",
+  "types": "lib/types/collab.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/types/collab.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": []
+    }
+  },
+  "files": [
+    "lib/**/*.js",
+    "lib/**/*.d.ts",
+    "skills",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "rm -rf lib && tsc -p tsconfig.json && tsc -p tsconfig.client.json && node scripts/build-host.mjs && cp -R src/types lib/",
+    "build:types": "tsc --declaration --emitDeclarationOnly",
+    "prepack": "pnpm run build",
+    "test": "pnpm run build && node tests/collab-proc-id.mjs && node tests/collab-pure-logic.mjs && node tests/collab-convergence.mjs && node tests/collab-write-merge.mjs && node tests/collab-merge-golden.mjs && node tests/collab-integration.mjs && node tests/collab-state-split.mjs && node tests/collab-hostcode-parity.mjs && node tests/collab-inline-parity.mjs && node tests/collab-contract-derivation.mjs && node tests/collab-message-provenance.mjs && node tests/collab-digest-stability.mjs && node tests/collab-awareness.mjs && node tests/collab-awareness-cross-session.mjs && node tests/collab-agent-teams.mjs && node tests/collab-access-gate.mjs && node tests/collab-reap.mjs && node tests/collab-e2e.mjs && node tests/collab-skill.mjs && node tests/collab-client-route.mjs && node tests/collab-client-config-page.mjs && node tests/collab-invariants-i1-i4.mjs",
+    "test:real": "pnpm run build && node tests/collab-skill-real.mjs",
+    "test:types": "tsc --noEmit",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "~3.18.4"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-llm": "0.2.1-alpha.2",
+    "@deepseek-ai/dsh-tools": "0.2.1-alpha.2"
+  },
+  "devDependencies": {
+    "@deepseek-ai/dsh-llm": "0.2.1-alpha.2",
+    "@types/node": "^22.20.1",
+    "typescript": "^5.9.3"
+  },
+  "keywords": [
+    "dsh",
+    "cordis",
+    "multi-agent",
+    "collaboration",
+    "advisory-lock"
+  ],
+  "author": "",
+  "license": "MIT"
+}

@@ -1,0 +1,408 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dsh.local/schema/collab.schema.json",
+  "title": "collab (多智能体协作) 数据与工具契约",
+  "description": "多智能体协作插件的单一事实源契约：注册表状态文档 + 两个模型工具参数。JSON Schema v1。TS 类型 / Python dataclass 均由本文件派生。",
+  "$defs": {
+    "Path": {
+      "type": "string",
+      "description": "项目相对路径。目录以 / 结尾（如 src/backend/），文件不带斜杠。"
+    },
+    "Mode": {
+      "type": "string",
+      "enum": [
+        "exclusive",
+        "shared",
+        "read"
+      ],
+      "description": "exclusive 独占（默认）：请求它会与**已在场的 exclusive 和 shared 都冲突**（返回冲突清单供协商/等待/换路径 —— 0.14.0 起不再静默抢占共享方）；shared 声明共用：与已在场的 shared 不冲突、被他人的 exclusive 挡住；read 只读观测，不排他也不被挡。"
+    },
+    "Claim": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "claimId",
+        "holderId",
+        "paths",
+        "mode",
+        "createdAt"
+      ],
+      "properties": {
+        "claimId": {
+          "type": "string",
+          "description": "声明 id，如 c_1。release 用它定位。"
+        },
+        "holderId": {
+          "type": "string",
+          "description": "持有者，格式 agent:<sessionId> 或 human:console。"
+        },
+        "holderName": {
+          "type": "string",
+          "description": "持有者显示名（会话标题截断 24 字）。"
+        },
+        "paths": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Path"
+          }
+        },
+        "mode": {
+          "$ref": "#/$defs/Mode"
+        },
+        "note": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "createdAt": {
+          "type": "integer",
+          "description": "创建时刻（Unix 毫秒）。"
+        },
+        "readable": {
+          "type": "boolean",
+          "default": true,
+          "description": "可读性（0.8.0 功能 C）：true = 他人可读（默认），false = 他人读取也要先协商；写入对非持有者始终要协商。可选字段，兼容 0.7.0 之前的状态文件（缺省即可读）。"
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Lamport 逻辑时钟序号（单元 C）：写时 bump 过所见最大值。可选（0.16.0 之前的状态文件缺省 0）。记录 id 与全序都由 (seq, writer) 决定。"
+        },
+        "writer": {
+          "type": "string",
+          "description": "写者戳（单元 C）：产生这条记录的进程身份。claimId 形如 c_<seq>@<writer>，两个写者撞同一个 seq 也不会撞 id。可选（老状态文件缺省空串）。"
+        }
+      }
+    },
+    "Message": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "msgId",
+        "seq",
+        "channel",
+        "author",
+        "ts",
+        "body"
+      ],
+      "properties": {
+        "msgId": {
+          "type": "string",
+          "description": "消息 id，如 m_1。"
+        },
+        "seq": {
+          "type": "integer",
+          "description": "单调递增序号，用于增量读取（read since）。"
+        },
+        "channel": {
+          "type": "string",
+          "default": "general",
+          "description": "频道：general / path:<相对路径> / agent:<holderId>（holderId 本身已含 agent: 前缀，直接写它，不要再加一层）。写什么就得按什么读：精确匹配。"
+        },
+        "author": {
+          "type": "string",
+          "description": "作者 holderId。"
+        },
+        "ts": {
+          "type": "integer",
+          "description": "发送时刻（Unix 毫秒）。"
+        },
+        "body": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 8000,
+          "description": "消息正文。上限 8000 字符（与 collab-core 的 MESSAGE_BODY_MAX_CHARS 同值）：只封条数的 MAX_MESSAGES=2000 × 单条上限 ⇒ 最坏约 16MB，而不是「任意大」。超限由 post() 以 bad-request 显式挡回，**不静默截断**。"
+        },
+        "replyTo": {
+          "type": "string",
+          "description": "回复的 msgId，可做成线程。"
+        },
+        "writer": {
+          "type": "string",
+          "description": "写者戳（单元 C）：产生这条留言的进程身份。msgId 形如 m_<seq>@<writer>，两个写者撞同一个 seq 也不会撞 id。可选（老状态文件缺省空串，游标按 (seq, \"\") 处理）。"
+        }
+      }
+    },
+    "Holder": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "holderId",
+        "name",
+        "kind"
+      ],
+      "properties": {
+        "holderId": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "agent",
+            "human"
+          ]
+        },
+        "sessionId": {
+          "type": "string"
+        },
+        "lastSeenAt": {
+          "type": "integer",
+          "description": "最近一次活跃（Unix 毫秒）。注意：只有 claim / post 会刷新它（release 不刷），所以它是「最近一次登记」而不是「最近一次活动」。"
+        },
+        "proc": {
+          "type": "string",
+          "description": "写这一行的进程身份令牌 `<pid>:<开机节拍>`（0.14.0）。名册行的生死按它判：写它的那个进程不在了（被杀的进程没有 agent/disposed 可等）⇒ 下一次 sweep 就删掉这一行。缺省 = 升级前留下的旧行，或该形态拿不到进程身份（受限动态宿主里 process 是 undefined），此时不删（fail-closed）。只影响名册行，不改变任何声明（claim）的语义。"
+        }
+      }
+    },
+    "StateDocument": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "seq",
+        "claims",
+        "messages",
+        "holders"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "type": "integer",
+          "const": 1
+        },
+        "seq": {
+          "type": "integer",
+          "description": "全局单调序号，用于分配 claimId/msgId。"
+        },
+        "claims": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Claim"
+          }
+        },
+        "messages": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Message"
+          }
+        },
+        "holders": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Holder"
+          }
+        },
+        "writer": {
+          "type": "string",
+          "description": "写者戳（单元 C）：最后一次落盘这份文档的写者身份。写路径每次写入前盖上自己的戳；写后验证据此判断「我的写入是否被别人覆盖了」（覆盖 ⇒ 重读 + 重合并 + 重试）。可选（老状态文件缺省空串 = 观测不到）。"
+        },
+        "released": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "description": "终态墓碑表（单元 C）：claimId → 墓碑值（该声明的 Lamport seq）。release / 句柄结束释放 / reap 不再把声明从数组里删掉，而是记进这里 —— 删除在 join 下不单调（另一份旧副本会把记录带回来），墓碑才单调。claims 仍然只含有效记录，门控与全部视图不受影响。GC 只按条数上限（MAX_RELEASED 4096）确定性淘汰：只看数据，故任何副本 GC 出同样结果。可选（老状态文件缺省为空表）。"
+        }
+      }
+    },
+    "ConflictInfo": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "claimId",
+        "holderId",
+        "path",
+        "overlapsWith",
+        "mode"
+      ],
+      "properties": {
+        "claimId": {
+          "type": "string"
+        },
+        "holderId": {
+          "type": "string"
+        },
+        "holderName": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "overlapsWith": {
+          "type": "string"
+        },
+        "mode": {
+          "$ref": "#/$defs/Mode"
+        },
+        "suggestedAction": {
+          "type": "string",
+          "enum": [
+            "wait",
+            "negotiate",
+            "switch_path"
+          ],
+          "description": "为 AI 提供的下一步协作决策建议"
+        }
+      }
+    },
+    "TeamScopeTask": {
+      "type": "object",
+      "description": "官方 Agent Teams 任务的只读视图（在跑任务的 advisory 写域；数据由 dsh-experimental-agent-team 拥有，非本插件状态）",
+      "required": [
+        "id",
+        "status",
+        "writeScopes"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "subject": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "pending",
+            "in_progress",
+            "completed",
+            "deleted"
+          ]
+        },
+        "ownerName": {
+          "type": "string"
+        },
+        "writeScopes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "TeamScopeOverlap": {
+      "type": "object",
+      "description": "团队任务写域与 collab_lock 声明的重叠（advisory 交叉预警，不改变任何门控）",
+      "required": [
+        "taskId",
+        "scope",
+        "path"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "taskId": {
+          "type": "string"
+        },
+        "subject": {
+          "type": "string"
+        },
+        "scope": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        }
+      }
+    },
+    "colabLockParams": {
+      "title": "collab_lock 工具参数",
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "op"
+      ],
+      "properties": {
+        "op": {
+          "type": "string",
+          "enum": [
+            "claim",
+            "release",
+            "list",
+            "overview",
+            "status",
+            "wait",
+            "reap"
+          ]
+        },
+        "paths": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Path"
+          }
+        },
+        "claimId": {
+          "type": "string"
+        },
+        "mode": {
+          "$ref": "#/$defs/Mode"
+        },
+        "readable": {
+          "type": "boolean",
+          "default": true,
+          "description": "claim 用：他人是否可读这些路径（默认 true，只认显式 false）。"
+        },
+        "timeoutMs": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 120000,
+          "default": 30000,
+          "description": "wait 用，最多等待毫秒。"
+        },
+        "confirm": {
+          "type": "boolean",
+          "default": false,
+          "description": "reap 用（0.9.8）：默认 false = dry-run，只返回候选清单、绝不改状态；只有显式 true 才真正删除确证死亡的声明。"
+        },
+        "note": {
+          "type": "string",
+          "maxLength": 500
+        }
+      }
+    },
+    "colabBoardParams": {
+      "title": "collab_board 工具参数",
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "op"
+      ],
+      "properties": {
+        "op": {
+          "type": "string",
+          "enum": [
+            "post",
+            "read"
+          ]
+        },
+        "channel": {
+          "type": "string"
+        },
+        "body": {
+          "type": "string",
+          "maxLength": 8000,
+          "description": "post 用，消息正文。上限 8000 字符（与 collab-core 的 MESSAGE_BODY_MAX_CHARS 同值）；超限由 post() 以 bad-request 挡回且整条不写入，不静默截断。"
+        },
+        "replyTo": {
+          "type": "string"
+        },
+        "since": {
+          "type": [
+            "integer",
+            "string"
+          ],
+          "minimum": 0,
+          "description": "read 用：**省略或 0** = 读最新 limit 条（tail）；**给了游标** = 从该位置往后读 limit 条（forward，旧→新）。游标是**复合值** (seq, writer)：字符串写法 `<seq>@<writer>`（取返回的 nextCursor），裸 seq（数字或无 @ 的字符串）按 seq 严格大于匹配。**`since: \"0@\"` = 从头读**（全历史可达）；省略/0 仍是 tail。**一页不会切开同一个 seq 组**，故 limit 是软上限：一页可能短于它，单组更大时整组返回。返回的 nextCursor 是下一次的精确游标。"
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 200,
+          "default": 50
+        }
+      }
+    }
+  }
+}
