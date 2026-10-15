@@ -6,7 +6,7 @@
 //    - live 会话的 claim 依然有效阻塞（负向对照）。
 //    - failed（基础设施故障）fail-closed 保持现状（不误放行、不误收）。
 // 2. 只读不写状态：切掉"只读触发写盘"。
-//    - 在他人独占路径下做 read，notice 依然 inject，但状态文件 readers/mtime 绝对不发生变化（写盘次数为 0）。
+//    - 在他人独占路径下做 read，notice 依然 inject，但状态文件逐字节不变（写盘次数为 0）。
 //
 // 运行：node tests/collab-oracle-liveness.mjs
 
@@ -390,16 +390,17 @@ console.log('\n=== 检查：切掉只读触发写盘 ===')
     'S1.2: read 绝不触发写盘（writes === 0，无写放大）',
     'writes=' + env.stats.writes)
 
-  // 3. 验证状态文件逐字节不变，readers 字段依然为空（不被反向污染）
+  // 3. 验证状态文件逐字节不变，且声明上没有任何"读者"痕迹（只读不写状态 ⇒ 不反向登记读者）
   const rawAfter = env.stateRaw()
   ok(rawAfter === rawBefore,
     'S1.3: 状态文件逐字节不变（mtime/version 不变）',
     'changed=' + (rawAfter !== rawBefore))
 
   const docAfter = env.readState()
-  ok(Array.isArray(docAfter.claims[0].readers) && docAfter.claims[0].readers.length === 0,
-    'S1.4: claims[0].readers 保持为空（不再被写入 reader-me）',
-    JSON.stringify(docAfter.claims[0].readers))
+  const withReaders = docAfter.claims.filter(c => c && Object.prototype.hasOwnProperty.call(c, 'readers'))
+  ok(withReaders.length === 0,
+    'S1.4: read 不在声明上留痕迹（claims 里没有 readers 字段）',
+    '带 readers 的声明数=' + withReaders.length)
 }
 
 console.log(`\n结果：${passed} passed, ${failed} failed`)

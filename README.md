@@ -123,6 +123,7 @@ DSH 自带一套实验性的 `Agent Teams`（`dsh-experimental-agent-team*`）�
 │       └── SKILL.md              # 随包发布的委托与验收纪律技能
 └── tests/
     ├── _harness.mjs                 # 共用断言脚手架（ok / skip / 汇总 / 退出码）
+    ├── collab-proc-id.mjs           # 进程身份（<pid>:<开机节拍>）唯一事实源的行为守护
     ├── collab-pure-logic.mjs        # 纯逻辑回归 + hostCode 内联副本漂移守护
     ├── collab-convergence.mjs       # 单元 C：merge 的代数律（交换/结合/幂等）+ id 唯一 + 游标无损 + 终态化
     ├── gen-merge-golden.mjs         # 单元 D：黄金语料生成器（从 lib/collab-core.js 的 mergeDocs 现算）
@@ -140,9 +141,14 @@ DSH 自带一套实验性的 `Agent Teams`（`dsh-experimental-agent-team*`）�
     ├── collab-awareness-cross-session.mjs # 跨会话家人/陌生人视角回归
     ├── collab-agent-teams.mjs       # 官方 Agent Teams 交叉预警（服务缺席 ⇒ 输出一字不变）
     ├── collab-access-gate.mjs       # 访问通知（agent.inject 的 notice 载体）与原生写保护（pre-execute）回归
+    ├── collab-reap.mjs              # op=reap：确证死亡的显式回收（dry-run / confirm / 无自动触发路径）
     ├── collab-e2e.mjs               # 真实 fs + 临时 DSH_HOME 的端到端回归
     ├── collab-skill.mjs             # 随包 skill + 委托纪律 + 偏好设置回归
     ├── collab-client-route.mjs      # Host 端技能索引路由（GET /dsh-collab/skill-index）回归
+    ├── collab-client-config-page.mjs # 浏览器半边配置页注册面机械检查
+    ├── collab-invariants-i1-i4.mjs  # 不变量 I1–I4：唯一存活判据 / 归属 / 有界 / 不误收
+    ├── collab-oracle-liveness.mjs   # 存活 oracle 三态 + 只读不写状态（只读不留痕）
+    ├── collab-test-inventory.mjs    # 测试清单守卫：无孤儿测试 + README 清单与 npm test 一致
     └── collab-skill-real.mjs        # 真实 DSH 部署上的委托纪律端到端（`npm run test:real`，不在 npm test 内）
 ```
 
@@ -466,23 +472,32 @@ claim 增加可读性维度（`readable`，默认 `true`；缺字段的老状态
 
 ```bash
 pnpm run build          # 测试与发布均针对 lib/ 产物
-npm test                # 依次运行下列全部测试
+npm test                # 依次运行下列全部测试（清单与 `test` 脚本的一致性由 tests/collab-test-inventory.mjs 守卫）
 
+node tests/collab-proc-id.mjs          # 进程身份（<pid>:<开机节拍>）：活进程不误判成死
 node tests/collab-pure-logic.mjs       # 纯逻辑 + hostCode 漂移守护
 node tests/collab-convergence.mjs      # merge 的代数律（交换/结合/幂等）+ id 唯一 + 游标无损 + 终态化
 node tests/collab-write-merge.mjs      # 两个写者并发写盘不丢更新（含负向对照）+ release 终态化
+node tests/collab-merge-golden.mjs     # 合并语义黄金语料逐字节对拍（改了语义没重跑语料即红）
 node tests/collab-integration.mjs      # Cordis 插件端到端（fake ctx）
+node tests/collab-state-split.mjs      # 主文件 + 留言旁挂的磁盘布局、两形态等价
 node tests/collab-hostcode-parity.mjs  # 动态宿主形态**行为**对拍
 node tests/collab-inline-parity.mjs    # 两形态**同名函数**逐输出对拍（30 个 + 集合回归守护）
 node tests/collab-contract-derivation.mjs # 契约派生守卫（schema ⇄ d.ts ⇄ Python ⇄ 真实工具 schema）
 node tests/collab-message-provenance.mjs # 规范守卫：严禁冒充用户（AGENTS.md §1）
 node tests/collab-digest-stability.mjs # 态势摘要文本时间稳定性
 node tests/collab-awareness.mjs        # 多会话态势注入
+node tests/collab-awareness-cross-session.mjs # 跨会话家人/陌生人视角
+node tests/collab-agent-teams.mjs      # 官方 Agent Teams 交叉预警（服务缺席 ⇒ 输出一字不变）
 node tests/collab-access-gate.mjs      # 访问通知（agent.inject 的 notice 载体）+ 原生写保护（真实 cordis waterfall）
 node tests/collab-reap.mjs             # op=reap 确证死亡的显式回收（dry-run / confirm / 无自动触发路径）
 node tests/collab-e2e.mjs              # 真实 fs 路径/语义端到端（临时 DSH_HOME）
 node tests/collab-skill.mjs            # 随包 skill + 委托纪律 + 偏好设置
 node tests/collab-client-route.mjs     # Host 端技能索引路由（GET /dsh-collab/skill-index）
+node tests/collab-client-config-page.mjs # 浏览器半边配置页注册面机械检查
+node tests/collab-invariants-i1-i4.mjs # 不变量 I1–I4：唯一存活判据 / 归属 / 有界 / 不误收
+node tests/collab-oracle-liveness.mjs  # 存活 oracle 三态（dead 立刻失效 / live 阻塞 / failed fail-closed）+ 只读不写状态
+node tests/collab-test-inventory.mjs   # 本清单守卫：无孤儿测试 + 清单与 `npm test` 逐条一致（含负向对照）
 
 pnpm run test:types                    # TypeScript 契约静态检查
 pnpm run test:real                     # 真实 DSH 部署上的委托纪律端到端（不在 npm test 内）

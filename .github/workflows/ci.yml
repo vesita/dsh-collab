@@ -48,7 +48,7 @@ jobs:
       - name: 构建（tsc -> lib/）
         run: npm run build
 
-      # 10 个 harness；静默跳过已经被改成"默认失败"（只有 COLLAB_ALLOW_SKIP=1 才放行），
+      # 全部测试 harness；静默跳过已经被改成"默认失败"（只有 COLLAB_ALLOW_SKIP=1 才放行），
       # 所以这里**不要**给它设 COLLAB_ALLOW_SKIP。
       - name: 测试
         run: npm test
