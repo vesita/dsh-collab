@@ -56,7 +56,7 @@ export function installGate(ctx: CollabContext, store: StateStore, prefs: GatePr
     const id = agent && agent.id ? String(agent.id) : null
     const cwd = await store.cwdOf(id, agent)
     // holderOf 顺带把**会话家族（血缘）**现算出来（自己 + 祖先 + 后代）。父会话 claim 了 src/ 再派
-    // 子代理改 src/ 时，子代理的写不该被自己家的锁拦下 —— 这正是"子代理用不了"的现场。
+    // 子智能体改 src/ 时，子智能体的写不该被自己家的锁拦下 —— 这正是"子智能体用不了"的现场。
     // 判据与 claim() 的冲突扫描同源（collab-core 的 inFamily），血缘缺省时退化为旧语义。
     const me = store.holderOf(execCtx)
     const { state } = await store.load(id, agent)

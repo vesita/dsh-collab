@@ -40,7 +40,7 @@ export function modeLabel(mode: Mode | string): string {
 }
 
 // 稳定短句柄：从 holderId 取一段**不随会话标题变化**的短标识（会话 id 前 8 字符）。
-// 为什么需要它：holderName 来自会话标题，而子代理会话的标题就是父 AI 那条 prompt 的开头。
+// 为什么需要它：holderName 来自会话标题，而子智能体会话的标题就是父 AI 那条 prompt 的开头。
 // 实测（2026-10-06 复算，本机 my 项目文件）：35 个 holder 只有 14 种名字，其中一个名字占 10 份
 // —— 名单认不出人（docs/collab-ux-backlog.md §2.3）。句柄来自 holderId，不随标题变。
 // 8 字符是**短标识、不是身份保证**：它把该语料的重名全部分开（0 碰撞），
@@ -314,7 +314,7 @@ export function dropHolder(state: StateDocument, holderId: string): OpResult {
 
 // ---- 会话句柄结束时的释放（agent/disposed，op=release 之外的第二条回收路径）----
 //
-// 为什么需要它（一手场景）：会话 claim 了一个目录，把写入交给子代理后**自己退场**了
+// 为什么需要它（一手场景）：会话 claim 了一个目录，把写入交给子智能体后**自己退场**了
 // （agent/disposed，句柄结束）。会话恢复后它的对话历史里仍然"记得"自己持有这些路径，
 // 而另一边看到路径空闲 ⇒ 两边同时以为可以写（W7 实测过的锁安全缺陷）。
 // 所以句柄结束的那一刻就把它的声明释放掉，并在留言板留下一条可审计的留言。
@@ -452,7 +452,7 @@ export function claim(state: StateDocument, h: HolderInput, a: ClaimInput, tNow:
       // 持有者已不在 harness 的活体名单里 ⇒ 这条声明立即失效，不参与冲突判定（不看 TTL）。
       // failed（判据自己坏了）经 holderAlive 视为"仍然有效"，与 I4 的 fail-closed 一致。
       if (!holderAlive(c.holderId, liveness)) continue
-      // inFamily 取代了裸的 `c.holderId === h.holderId`：自家子代理（或父会话）的声明
+      // inFamily 取代了裸的 `c.holderId === h.holderId`：自家子智能体（或父会话）的声明
       // 属于同一个写域，不该互相拦。血缘缺省时 inFamily 的语义与旧写法**完全一致**。
       if (inFamily(h, c.holderId)) continue
       // read 是纯观测：不阻塞他人，也不被他人阻塞（与上面 `mode !== 'read'` 的外层判断同源）。
@@ -774,7 +774,7 @@ export function channelRosterNote(state: StateDocument): string {
 }
 
 // 计算在当前时刻 blocking 的独占声明（供 wait）。
-// 家族成员不算 blocker：wait 自己的子代理/父会话没有意义（它们与我是同一个写域）。
+// 家族成员不算 blocker：wait 自己的子智能体/父会话没有意义（它们与我是同一个写域）。
 export function blockers(state: StateDocument, h: HolderInput, paths: string[], liveness?: LivenessFn): Claim[] {
   return state.claims.filter(c => holderAlive(c.holderId, liveness) && c.mode === 'exclusive' && !inFamily(h, c.holderId) && c.paths.some(cp => paths.some(p => ov(p, cp))))
 }

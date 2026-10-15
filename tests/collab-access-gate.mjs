@@ -359,7 +359,7 @@ let injectLog = []
 const resetInject = () => { injectLog = [] }
 /** 从 inject 记录里取正文（防御性：拿不到就返回空串，让断言失败而不是抛）。 */
 const noticeText = (entry) => (entry && entry.message && entry.message.content && entry.message.content[0] && entry.message.content[0].text) || ''
-/** 带记录器的假 agent：inject 把每次调用记进 injectLog。parentSession 给出时即"某个会话的子代理"。 */
+/** 带记录器的假 agent：inject 把每次调用记进 injectLog。parentSession 给出时即"某个会话的子智能体"。 */
 const withInject = (id, parentSession) => ({ id, session: { header: parentSession ? { cwd: CWD, parentSession } : { cwd: CWD } }, inject: (m) => injectLog.push({ agent: id, message: m }) })
 const ME = withInject('agent-me')
 /** 故意**没有** inject 的 agent：受限宿主上的 agent 形状（契约要求此时不投递、不抛）。 */
@@ -991,8 +991,8 @@ console.log('# C: 一致性 —— writeGate 阻塞集合 ≡ claim() 冲突集�
     JSON.stringify(conflicts.map(c => c.claimId)))
 }
 
-// ── 功能 C × 会话家族（血缘，0.9.11）：父会话占着的路径，自家子代理写得过 ──
-console.log('# C · 会话家族：父会话的独占锁不拦自家子代理，仍然拦外人')
+// ── 功能 C × 会话家族（血缘，0.9.11）：父会话占着的路径，自家子智能体写得过 ──
+console.log('# C · 会话家族：父会话的独占锁不拦自家子智能体，仍然拦外人')
 {
   const parentClaim = mkClaim({
     claimId: 'c_parent', holderId: 'agent:agent-parent', holderName: 'Parent Session',
@@ -1004,11 +1004,11 @@ console.log('# C · 会话家族：父会话的独占锁不拦自家子代理，
   const blocked = await h.pre(execOf('write', { file_path: 'src/a/1', content: 'x' }))
   ok(blocked.decision.kind === 'ask', '无血缘：仍然被拦（没放开外人）', JSON.stringify(blocked.decision))
 
-  // 正向：ME 是 agent-parent 的子代理（session.header.parentSession）⇒ 放行。
+  // 正向：ME 是 agent-parent 的子智能体（session.header.parentSession）⇒ 放行。
   const child = withInject('agent-me', 'agent-parent')
   const allowed = await h.pre(execOf('write', { file_path: 'src/a/1', content: 'x' }, child))
   ok(allowed.decision.kind === 'allow' && allowed.nextCalls === 1,
-    '自家子代理写父会话独占的路径：放行（ask 不再产生）', JSON.stringify(allowed))
+    '自家子智能体写父会话独占的路径：放行（ask 不再产生）', JSON.stringify(allowed))
 
   // 负向 2：血缘指向别人（不是这条声明的持有者）⇒ 照旧被拦。
   const unrelated = withInject('agent-me', 'agent-someone-else')

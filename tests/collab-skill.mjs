@@ -2,10 +2,10 @@ import { createHarness } from './_harness.mjs'
 import { loadCosmokit } from './_harness.mjs'
 
 // collab-skill.mjs
-// 随包发布的 subagent-delegation skill + 委托纪律常驻上下文 + 偏好设置的回归测试。
+// 随包发布的 agent-delegation skill + 委托纪律常驻上下文 + 偏好设置的回归测试。
 //
 // 机制：
-//   - 包形态在 apply 里按 import.meta.url 定位 ../skills/subagent-delegation/SKILL.md 读一次（结果缓存）；
+//   - 包形态在 apply 里按 import.meta.url 定位 ../skills/agent-delegation/SKILL.md 读一次（结果缓存）；
 //   - skill 与常驻 PromptContext 都**只**在偏好 exposeDelegationDiscipline（默认 true）为真时注册；
 //   - 0.1.7 起偏好就是插件**自己的 Config**：`.volatile()` 字段是稳定引用，Loader 就地更新引用
 //     内容并发 `loader/volatile-update`（插件不重载），所以设置里一改就重新结算；
@@ -32,7 +32,7 @@ const cordis = await import('@deepseek-ai/cordis').catch(() => import('../node_m
 const { Context } = cordis
 
 const ROOT = path.dirname(new URL(import.meta.url).pathname)
-const SKILL_PATH = path.join(ROOT, '../skills/subagent-delegation/SKILL.md')
+const SKILL_PATH = path.join(ROOT, '../skills/agent-delegation/SKILL.md')
 const SKILL_DIR = path.dirname(SKILL_PATH)
 const collabPlugin = (await import(path.join(ROOT, '../lib/index.js'))).default
 const { Config, DELEGATION_SETTINGS_ENTRY } = await import(path.join(ROOT, '../lib/index.js'))
@@ -118,7 +118,7 @@ function makeCtx(opts = {}) {
 }
 
 console.log('# (a) the shipped skill file exists and its frontmatter parses')
-ok(fs.existsSync(SKILL_PATH), 'skills/subagent-delegation/SKILL.md exists', SKILL_PATH)
+ok(fs.existsSync(SKILL_PATH), 'skills/agent-delegation/SKILL.md exists', SKILL_PATH)
 const raw = fs.readFileSync(SKILL_PATH, 'utf8')
 // 测试自己独立解析一遍（刻意不复用 lib 里的解析器），避免"用被测代码验证被测代码"。
 const fm = /^\uFEFF?---[ \t]*\r?\n([\s\S]*?)\r?\n---[ \t]*(?:\r?\n|$)/.exec(raw)
@@ -132,7 +132,7 @@ const diskName = field('name')
 const diskDescription = field('description')
 const diskWhenToUse = field('whenToUse')
 const diskBody = fm ? raw.slice(fm[0].length) : ''
-ok(diskName === 'subagent-delegation', "frontmatter name === 'subagent-delegation'", diskName)
+ok(diskName === 'agent-delegation', "frontmatter name === 'agent-delegation'", diskName)
 ok(diskDescription.length > 0, 'frontmatter description is non-empty', diskDescription)
 ok(diskWhenToUse.length > 0, 'frontmatter whenToUse is non-empty', diskWhenToUse)
 ok(diskBody.length > 1000, 'body after frontmatter is non-trivial', String(diskBody.length))
@@ -176,7 +176,7 @@ console.log('# (b)(c)(g) preference ON (explicit true): skill + constant discipl
     ok(t1 === t2, 'discipline text is CONSTANT across calls (byte-identical)', JSON.stringify([t1, t2]))
     ok(!/[0-9]/.test(t1), 'discipline text contains no digits that could drift', t1)
     ok(t1.includes('[dsh-collab]'), 'discipline text carries the [dsh-collab] marker', t1)
-    ok(/子代理/.test(t1) && /验收/.test(t1) && /原始输出/.test(t1), 'discipline text states the delegation + acceptance + raw-evidence rules', t1)
+    ok(/子智能体/.test(t1) && /验收/.test(t1) && /原始输出/.test(t1), 'discipline text states the delegation + acceptance + raw-evidence rules', t1)
     // 指名换模型是**被明确要求**的行为：它必须留在常驻文本里，且必须点名真实存在的接口
     // （`provider` / `model` 参数与 `list_subagent_models` 工具），否则模型只会看到一句空话。
     ok(t1.includes('provider / model') && t1.includes('list_subagent_models'),

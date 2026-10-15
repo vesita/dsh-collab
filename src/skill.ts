@@ -1,5 +1,5 @@
 // src/skill.ts
-// **随包 skill 的读盘与只读载荷**：正文与目录来自 <pkg>/skills/subagent-delegation/。
+// **随包 skill 的读盘与只读载荷**：正文与目录来自 <pkg>/skills/agent-delegation/。
 // 两个消费者共用本模块：delegation.ts（注册给 skills 服务）与 client-route.ts（只交出路径）。
 // 读盘结果（含失败）只算一次；任何失败都返回 null，绝不抛。
 
@@ -8,8 +8,8 @@ import { fileURLToPath } from 'node:url'
 import { DELEGATION_SETTINGS_NAMESPACE } from './spec.js'
 import type { BundledSkill, CollabSkillIndex } from './contract.js'
 
-/** 随包发布的 skill：正文与目录都来自 <pkg>/skills/subagent-delegation/。 */
-const BUNDLED_SKILL_FILE = '../skills/subagent-delegation/SKILL.md'
+/** 随包发布的 skill：正文与目录都来自 <pkg>/skills/agent-delegation/。 */
+const BUNDLED_SKILL_FILE = '../skills/agent-delegation/SKILL.md'
 
 /**
  * 极简 frontmatter 解析：只认文件开头的 `---` 块，只取 name/description/whenToUse 三个标量，

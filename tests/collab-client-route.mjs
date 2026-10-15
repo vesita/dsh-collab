@@ -29,7 +29,7 @@ const cordis = await import('@deepseek-ai/cordis').catch(() => import('../node_m
 const { Context } = cordis
 
 const ROOT = path.dirname(new URL(import.meta.url).pathname)
-const SKILL_PATH = path.join(ROOT, '../skills/subagent-delegation/SKILL.md')
+const SKILL_PATH = path.join(ROOT, '../skills/agent-delegation/SKILL.md')
 const mod = await import(path.join(ROOT, '../lib/index.js'))
 const collabPlugin = mod.default
 const { buildSkillIndex, CLIENT_SKILL_ROUTE, DELEGATION_SETTINGS_NAMESPACE } = mod

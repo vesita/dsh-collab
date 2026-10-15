@@ -61,7 +61,7 @@ export function installAccess(ctx: CollabContext, store: StateStore): void {
     const agent = execCtx && execCtx.agent
     const id = agent && agent.id ? String(agent.id) : null
     const cwd = await store.cwdOf(id, agent)
-    // 会话家族（自己 + 祖先 + 后代）不算"别人的占用"：自家子代理与我共享写域，
+    // 会话家族（自己 + 祖先 + 后代）不算"别人的占用"：自家子智能体与我共享写域，
     // 为它发访问通知只会制造噪声（判据与 claim()/gate 同源）。
     const fam = new Set(store.familyIds(id, agent))
     const { state } = await store.load(id, agent)

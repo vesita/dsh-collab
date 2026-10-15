@@ -44,8 +44,8 @@ export interface HolderInput {
 /**
  * 家族判据（纯逻辑，两形态同源）：`holderId` 是否属于本 holder 的会话家族。
  *
- * 为什么需要它：子代理运行在**自己的会话**里，`holderId` 是 `agent:<子会话 id>`，
- * 与父会话不等 —— 于是"父会话 claim src/ 再派子代理改 src/"时，子代理被自己的锁
+ * 为什么需要它：子智能体运行在**自己的会话**里，`holderId` 是 `agent:<子会话 id>`，
+ * 与父会话不等 —— 于是"父会话 claim src/ 再派子智能体改 src/"时，子智能体被自己的锁
  * 硬拒绝（本部署 ask = deny），而且它无权释放（只有持有者本人能 release）。
  * 父子是同一个写域，锁不该拦自家人。血缘从 `session.header.parentSession` 现算。
  */

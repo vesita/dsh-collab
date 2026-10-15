@@ -23,7 +23,7 @@ export function installDelegation(
   config?: Record<string, unknown> | null
 ): DelegationPrefs {
   // ---- 委托纪律：偏好是 Config 的 volatile 字段，默认开 ----
-  // 技能正文随包走（<pkg>/skills/subagent-delegation/SKILL.md），所以按构建产物的位置解析，
+  // 技能正文随包走（<pkg>/skills/agent-delegation/SKILL.md），所以按构建产物的位置解析，
   // 而不是猜用户 ~/.dsh/skills/ 的落点。锁与留言板是产品本体，纪律只是附加项：
   // 字段缺失、文件缺失、解析失败一律**静默跳过**，绝不抛、也绝不阻断上面的工具注册。
   //
@@ -104,7 +104,7 @@ export function installDelegation(
               // 官方 Agent Teams 是否在场**都不追加任何文本** —— teammate 工具语义由官方
               // `team:policy` 段自己给出（`dsh-experimental-tool-agent-team/lib/index.js:21-27`），
               // 本插件重讲一遍就是重复建设。纪律块里只留官方不覆盖的：委托判据、验收、
-              // 并发约束，以及"被唤醒的子代理不知道自己已经丢锁"这条 collab 事实。
+              // 并发约束，以及"被唤醒的子智能体不知道自己已经丢锁"这条 collab 事实。
               text: () => DELEGATION_DISCIPLINE_TEXT
             })
             let live = true

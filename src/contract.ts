@@ -52,14 +52,14 @@ export interface CollabFs {
 /**
  * 会话头。`cwd` 是项目隔离键；`parentSession` 是**血缘**（谁派生了我）。
  *
- * 血缘的来源与实测：子代理创建时把 `parentSession: parentHeader.id`、
+ * 血缘的来源与实测：子智能体创建时把 `parentSession: parentHeader.id`、
  * `origin: 'subagent'`、`delegationDepth` 写进会话头
  * （`dsh-subagent/lib/types/child-agent.js:117-123`），类型定义见部署内
  * `dsh-agent/lib/types/index.d.ts:66`（`SessionHeader.parentSession?: SessionId`）。
  * 祖先链可上溯的先例：`dsh-subagent/lib/types/continuation-activation.js:381-388`。
  *
  * 它**只用于冲突判定**（见 collab-core.ts 的 inFamily）：父子会话共享写域，
- * 所以父的独占锁不该拒绝自家子代理。血缘不落盘，每次从运行时现算。
+ * 所以父的独占锁不该拒绝自家子智能体。血缘不落盘，每次从运行时现算。
  */
 export interface SessionLike { header?: { cwd?: string; parentSession?: string } }
 export interface AgentLike {

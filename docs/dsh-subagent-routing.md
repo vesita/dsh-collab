@@ -1,21 +1,21 @@
-# DSH 子代理路由：继承、点名与验证（实测）
+# DSH 子智能体路由：继承、点名与验证（实测）
 
-> 本文是**文档**，不是提示词：不进 `skills/`、不进 `src/spec.ts` 常驻文本。记的是"子代理跑哪条路由"的机制、可用做法、验证与排障。
+> 本文是**文档**，不是提示词：不进 `skills/`、不进 `src/spec.ts` 常驻文本。记的是"子智能体跑哪条路由"的机制、可用做法、验证与排障。
 > 证据标注：**实测** = 本机跑出/读文件读出；**推断** = 由源码或单次观察推出、未单独复现。
 
 ## 1. 机制
 
-### 1.1 子代理用的是「父会话当前所用的 preset」（最重要）
+### 1.1 子智能体用的是「父会话当前所用的 preset」（最重要）
 
 - 子会话 preset = **父会话实时作用链上的 preset**，不是**部署配置里的默认 preset**（0.1.7 起是 profile 里 `agent-preset-registry` 条目的 `default` / `selectedDefault`），也不是父会话头部那个创建时字段。
-- **实测**：父 `session-93594468-aa20-461d-8f76-295a60d873ef` 头部是 `agentPreset: "standard"`（创建时快照），其裸派子会话 `6502d243-ae82-479b-b3e4-07c024e651ef` 头部是 `agentPreset: "cordis"`、`origin: "subagent"`，路由 `deepseek-official/deepseek-flash`（descriptor 与 `request/header` 一致）—— 父会话界面切到创造模式，子代理就跟 cordis。同现象见 `24655d15-…`、`d5030032-…`。
+- **实测**：父 `session-93594468-aa20-461d-8f76-295a60d873ef` 头部是 `agentPreset: "standard"`（创建时快照），其裸派子会话 `6502d243-ae82-479b-b3e4-07c024e651ef` 头部是 `agentPreset: "cordis"`、`origin: "subagent"`，路由 `deepseek-official/deepseek-flash`（descriptor 与 `request/header` 一致）—— 父会话界面切到创造模式，子智能体就跟 cordis。同现象见 `24655d15-…`、`d5030032-…`。
 - **推断**：默认 preset 只影响**新**会话，管不到已在跑的会话。
-- **结论**：子代理默认继承父会话路由；要换路由就得每次调用显式点名（见 2.1），实际跑哪条可读子会话文件核对（见 3.1）。
+- **结论**：子智能体默认继承父会话路由；要换路由就得每次调用显式点名（见 2.1），实际跑哪条可读子会话文件核对（见 3.1）。
 
 ### 1.2 默认继承：调用层无法区分"点名"与"继承"
 
 - `dsh-subagent` 的 `resolveChildAgentOptions(parent, requested, childDepth)`（`lib/index.js:468-484`）**以父路由为底、用 `requested` 覆盖**；裸委派 `requested` 为空 ⇒ 拿到父路由。父路由口径 `parentAgentOptionsForDelegation`（`:446-456`）= `parent.session.requestHeader()?.config`，退回 `parent.options`。
-- ⇒ 子代理 `agent.options` **永远是一条完整路由**，两种意图同形，任何反推判据都得额外引入信息。
+- ⇒ 子智能体 `agent.options` **永远是一条完整路由**，两种意图同形，任何反推判据都得额外引入信息。
 
 ### 1.3 allowlist 只筛点名，且是会话快照
 
@@ -90,14 +90,14 @@ for line in sys.stdin:
 
 | 事项 | 证据 |
 |---|---|
-| 子代理用父会话当前 preset | 父 `session-93594468-…` 头部 `standard`；子 `6502d243-…` 头部 `cordis` + `origin: subagent` |
+| 子智能体用父会话当前 preset | 父 `session-93594468-…` 头部 `standard`；子 `6502d243-…` 头部 `cordis` + `origin: subagent` |
 | default 管不到已运行会话 | 当时配置的默认 preset 已是另一个值，`6502d243-…` 仍按父 cordis 路由跑 |
 | 同现象重复 | `24655d15-05a6-47b4-afdf-a9ff412553e1`、`d5030032-7fea-4bee-8790-9e82ed412e9c` 头部均 `cordis` |
 | 裸委派继承父路由 | `6502d243-…` descriptor 与 `request/header` = `deepseek-official/deepseek-flash@low`；另 `4ad0dc10` = `command-code/deepseek/deepseek-v4.1-flash` |
 | 指定路由可用 | `aef90834`：`google-antigravity/gemini-3.8-flash@high`，用量库落 `stop`、无错、ttft 4873ms |
 | 调用方点名跑通 | `d8d00aec-1629-4e35-b6b0-83ce51995db9`：descriptor/`request/header` = `google-antigravity/gemini-3.8-flash`，`RESULT=391` |
 | allowlist 是会话快照 | 放开后旧会话仍报 `child LLM route … is not allowed for this Session`；`6502d243-…` 内有 `subagent/model-selection-policy` 快照 |
-| 插件改写致记录/调用分裂 | `781077c5`（fork 子代理）descriptor 与 `request/header` 不同步 |
+| 插件改写致记录/调用分裂 | `781077c5`（fork 子智能体）descriptor 与 `request/header` 不同步 |
 | 白名单判据的洞 | 角色 `mechanical` 与父路由重合 ⇒ 裸委派被放行 |
 
 ## 4. 本文不做什么

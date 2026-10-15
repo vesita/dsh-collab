@@ -11,13 +11,13 @@
 
 ## 多会话协同靠三个机制
 
-1. **共享状态**：所有会话（含子代理、跨进程）读写同一份状态文件，路径由项目工作区绝对路径确定性派生。
+1. **共享状态**：所有会话（含子智能体、跨进程）读写同一份状态文件，路径由项目工作区绝对路径确定性派生。
 2. **自动态势注入**：每次模型步，插件把"同项目其他会话当前占着什么"写进运行时上下文。会话无需记得去查，也无需知道对方存在。
 3. **声明占用**：改动前 `claim` 目标路径；冲突时 `wait` 等待或用 `collab_board` 协商。
 
 > 面向使用者的完整规范见 [`docs/collab-usage.md`](docs/collab-usage.md)。
 >
-> 子代理路由（默认继承父会话 vs 调用时显式点名）的机制与实测证据见
+> 子智能体路由（默认继承父会话 vs 调用时显式点名）的机制与实测证据见
 > [`docs/dsh-subagent-routing.md`](docs/dsh-subagent-routing.md) —— **那是文档，不是提示词**，
 > 不进 `skills/`、不进运行时纪律文本。
 
@@ -31,7 +31,7 @@ DSH 自带一套实验性的 `Agent Teams`（`dsh-experimental-agent-team*`）�
 | | 官方 Agent Teams | 本插件（Collab） |
 | --- | --- | --- |
 | 解决的问题 | **一个会话干不完**：隐式 Lead 派生具名 teammate | **互不相识的会话看不见彼此**：同一 checkout 上的路径占用 |
-| 拓扑 | 树内：Lead → 直属 teammate（`TeamId` = Lead 的 `SessionId`，`dsh-experimental-agent-team/lib/types/types.d.ts:5`） | 树间：平级会话 / 子代理 / 不同 dsh 进程 |
+| 拓扑 | 树内：Lead → 直属 teammate（`TeamId` = Lead 的 `SessionId`，`dsh-experimental-agent-team/lib/types/types.d.ts:5`） | 树间：平级会话 / 子智能体 / 不同 dsh 进程 |
 | 伙伴怎么来 | `spawn_teammate` 现造，`fresh` 或 `fork` | 本来就在那儿：先声明路径，再动手 |
 | 共享什么 | 持久信箱 + 共享任务 DAG（`team_task_*`，revision CAS） | 路径声明（`collab_lock`）+ 留言板（`collab_board`） |
 | 文件冲突 | `write_scopes` 明确是 advisory：*"advisory, not a lock"*（`dsh-experimental-tool-agent-team/lib/index.js:23`） | 路径占用 + 原生写门控，唯一带"这块归谁"语义的一层 |
@@ -89,7 +89,7 @@ DSH 自带一套实验性的 `Agent Teams`（`dsh-experimental-agent-team*`）�
 ├── crates/
 ├── docs/
 │   ├── collab-usage.md           # 面向任意会话的使用指南
-│   ├── dsh-subagent-routing.md   # DSH 子代理路由：继承、点名与验证（机制 + 实测索引；非提示词）
+│   ├── dsh-subagent-routing.md   # DSH 子智能体路由：继承、点名与验证（机制 + 实测索引；非提示词）
 │   ├── agent-teams-interop-evidence.md  # 与官方 Agent Teams 的接缝：一次性取证记录
 │   └── collab-ux-backlog.md      # 仍未解决的使用摩擦（每条都能一次检查判定）
 ├── scripts/
@@ -119,7 +119,7 @@ DSH 自带一套实验性的 `Agent Teams`（`dsh-experimental-agent-team*`）�
 │       └── collab.d.ts           # TypeScript 类型定义（构建时复制到 lib/types/）
 ├── lib/                          # tsc 构建产物（git 忽略，随 npm 包发布）
 ├── skills/
-│   └── subagent-delegation/
+│   └── agent-delegation/
 │       └── SKILL.md              # 随包发布的委托与验收纪律技能
 └── tests/
     ├── _harness.mjs                 # 共用断言脚手架（ok / skip / 汇总 / 退出码）
@@ -191,7 +191,7 @@ legacyCollabDirs(env?)       // 历史落点，用于一次性迁移（env 仅�
 
 ## 多会话态势注入
 
-插件通过 `systemPrompt.context()` 注册一条 `order=130`（紧随 sandbox / approval / subagent-delegation）的运行时上下文。它的 provider 在装配时执行：
+插件通过 `systemPrompt.context()` 注册一条 `order=130`（紧随 sandbox / approval / agent-delegation）的运行时上下文。它的 provider 在装配时执行：
 
 ```
 agents.currentInitiator()            → 正在装配的那个会话
@@ -205,7 +205,7 @@ agents.currentInitiator()            → 正在装配的那个会话
 [dsh-collab] 同项目其他会话当前占用：Other Session#a1b2c3d4（独占）占用 src/backend/。改动这些路径前请先执行 collab_lock op=wait 或用 collab_board 协商。
 ```
 
-名字后的 `#a1b2c3d4` 是 `holderId` 的稳定短句柄（会话 id 去掉 `session-` 前缀后的前 8 字符）：显示名来自会话标题，子代理会话的标题就是父 AI 那条 prompt 的开头，实测会重名（一个名字占 10 份），句柄不会。
+名字后的 `#a1b2c3d4` 是 `holderId` 的稳定短句柄（会话 id 去掉 `session-` 前缀后的前 8 字符）：显示名来自会话标题，子智能体会话的标题就是父 AI 那条 prompt 的开头，实测会重名（一个名字占 10 份），句柄不会。
 
 这段摘要**完全时间无关**：DSH 只在运行时上下文的文本逐字节变化时才提交新快照，不含时刻的摘要因此不会因为过了几分钟就被重复注入。
 
@@ -221,7 +221,7 @@ agents.currentInitiator()            → 正在装配的那个会话
 
 ## 委托纪律偏好与配置卡
 
-运行时上下文除态势摘要外，还带一段常驻的**委托与验收纪律**；它同时决定随包的 `subagent-delegation` 技能是否注册。两者由包形态的一项设置控制，默认开启：
+运行时上下文除态势摘要外，还带一段常驻的**委托与验收纪律**；它同时决定随包的 `agent-delegation` 技能是否注册。两者由包形态的一项设置控制，默认开启：
 
 | 项 | 值 |
 | --- | --- |
@@ -237,7 +237,7 @@ agents.currentInitiator()            → 正在装配的那个会话
 
 开启（默认）时，插件多做两件事：
 
-1. 把随包发布的 `subagent-delegation` 技能注册进宿主技能注册表；
+1. 把随包发布的 `agent-delegation` 技能注册进宿主技能注册表；
 2. 通过 `systemPrompt.context()` 注入段名 `dsh-collab/delegation`、`order=131` 的纪律文本。
 
 关闭时这两项都不注册。**中央注册锁与协作留言板不受影响**——它们是插件本体，始终在场。
@@ -258,11 +258,11 @@ agents.currentInitiator()            → 正在装配的那个会话
 
 ### 随包发布的委托技能
 
-`skills/subagent-delegation/SKILL.md` 随包发布。偏好开启时，插件把它注册进宿主技能注册表（`ctx.skills.register`），标注 `source: 'bundled'`、`provider: 'dsh-collab'`，技能目录里因此能看到它、来源也可辨。注册随 effect disposer 撤回，**可逆**：插件卸载或偏好关闭，该技能随之消失。
+`skills/agent-delegation/SKILL.md` 随包发布。偏好开启时，插件把它注册进宿主技能注册表（`ctx.skills.register`），标注 `source: 'bundled'`、`provider: 'dsh-collab'`，技能目录里因此能看到它、来源也可辨。注册随 effect disposer 撤回，**可逆**：插件卸载或偏好关闭，该技能随之消失。
 
-技能正文的 §10.4 与常驻纪律文本（`DELEGATION_DISCIPLINE_TEXT`）同时写明一条恢复路径：**子代理意外终止（回合以 `error` / 空收尾结束）时先看它还在不在，别急着重派** —— 唤醒走那个能给已停下的它发消息的工具，而 `collab_board` 那条通道**唤不醒任何人**（`agent.inject` 的契约是 `send(msg, 'next-step', wakeup=false)`，只挂进收件箱、不起 driver）。派生 / 转向 / 等待的语义以**你当时的工具目录**为准：启用官方 Agent Teams 时由官方 `team:policy` 段给出（`dsh-experimental-tool-agent-team/lib/index.js:21-27`），本插件不再复述。两处都提醒：被唤醒的子代理**不知道自己已经丢锁**（会话句柄结束即释放），要让它先 `collab_lock op=claim` 再动手；同一处最多试一两次，之后自己写。
+技能正文的 §10.4 与常驻纪律文本（`DELEGATION_DISCIPLINE_TEXT`）同时写明一条恢复路径：**子智能体意外终止（回合以 `error` / 空收尾结束）时先看它还在不在，别急着重派** —— 唤醒走那个能给已停下的它发消息的工具，而 `collab_board` 那条通道**唤不醒任何人**（`agent.inject` 的契约是 `send(msg, 'next-step', wakeup=false)`，只挂进收件箱、不起 driver）。派生 / 转向 / 等待的语义以**你当时的工具目录**为准：启用官方 Agent Teams 时由官方 `team:policy` 段给出（`dsh-experimental-tool-agent-team/lib/index.js:21-27`），本插件不再复述。两处都提醒：被唤醒的子智能体**不知道自己已经丢锁**（会话句柄结束即释放），要让它先 `collab_lock op=claim` 再动手；同一处最多试一两次，之后自己写。
 
-插件的**动态宿主形态**（`hostCode` 字符串）刻意不注册该技能：受限动态环境没有包目录、也没有 `import`，无法定位 `<pkg>/skills/subagent-delegation/SKILL.md`。这是环境限制，不是遗漏。
+插件的**动态宿主形态**（`hostCode` 字符串）刻意不注册该技能：受限动态环境没有包目录、也没有 `import`，无法定位 `<pkg>/skills/agent-delegation/SKILL.md`。这是环境限制，不是遗漏。
 
 包形态的 `DSH_COLLAB_NO_PROMPT_HINT=1` 关掉**所有**运行时注入 —— 态势上下文、委托纪律文本、以及功能 A 的访问通知（后者也是运行时派生再注入进会话的内容）。它不影响技能注册。
 
@@ -270,12 +270,12 @@ agents.currentInitiator()            → 正在装配的那个会话
 
 ## 会话家族（血缘）
 
-**问题**（backlog §2.1，Top 5 第 3 条）：holder 身份是 `agent:<会话 id>`，而**子代理跑在自己的
-会话里** ⇒ 主会话 `claim src/`（exclusive）之后派子代理去改 `src/` 下的文件，子代理会被这把锁
+**问题**（backlog §2.1，Top 5 第 3 条）：holder 身份是 `agent:<会话 id>`，而**子智能体跑在自己的
+会话里** ⇒ 主会话 `claim src/`（exclusive）之后派子智能体去改 `src/` 下的文件，子智能体会被这把锁
 **硬拒绝**（本部署审批关闭，`ask` 即 `deny`），而且它无权释放（`release` 只允许持有者本人）——
-只能到留言板求父会话放锁，而父会话的循环可能已经停了。核心工作流（派子代理写代码）就此卡死。
+只能到留言板求父会话放锁，而父会话的循环可能已经停了。核心工作流（派子智能体写代码）就此卡死。
 
-**血缘从哪来**：子代理创建时会把 `parentSession: parentHeader.id`、`origin: 'subagent'`、
+**血缘从哪来**：子智能体创建时会把 `parentSession: parentHeader.id`、`origin: 'subagent'`、
 `delegationDepth` 写进会话头（`dsh-subagent/lib/types/child-agent.js:117-123`；类型见部署内
 `dsh-agent/lib/types/index.d.ts:66`）。祖先链可上溯，`store.familyIds()` 因此能现算出
 **自己 + 祖先链 + 后代**这一组 holderId（后代会话从 `agents.list()` 里按祖先链反查）。
@@ -285,14 +285,14 @@ agents.currentInitiator()            → 正在装配的那个会话
 
 | 位置 | 作用 |
 | --- | --- |
-| `collab-core.claim()` | 冲突扫描（子代理 claim 父占的路径） |
+| `collab-core.claim()` | 冲突扫描（子智能体 claim 父占的路径） |
 | `collab-core.blockers()` | `op=wait` 的阻塞判据（不 wait 自家人） |
-| `gate.ts` | 原生写门控（子代理写父占的路径） |
-| `awareness.ts` | 常驻态势摘要（不把自家子代理报成"其他会话占用"，backlog §2.2） |
+| `gate.ts` | 原生写门控（子智能体写父占的路径） |
+| `awareness.ts` | 常驻态势摘要（不把自家子智能体报成"其他会话占用"，backlog §2.2） |
 | `access.ts` | 访问通知（不为自家人发通知） |
 | `src/host-shell.js` + `scripts/build-host.mjs` | 动态形态：外壳模板 + 构建期把 `lib/collab-core.js` 与 `lib/state-core.js` 原样内联 ⇒ 两形态的纯逻辑与状态层**逐字节同源**（由 parity 测试断言） |
 
-**边界**：这条豁免的前提是"同一棵树里的子代理与我共享同一写域"。当树里跑的是官方 `Agent Teams`
+**边界**：这条豁免的前提是"同一棵树里的子智能体与我共享同一写域"。当树里跑的是官方 `Agent Teams`
 的 teammate（长期并行、各有独立任务）时，树内占用归团队任务 DAG 的 `write_scopes` —— 见
 「与官方 Agent Teams 的分工（定位）」。
 
@@ -326,7 +326,7 @@ agents.currentInitiator()            → 正在装配的那个会话
 
 ## 确证死亡的显式回收（`op=reap`）
 
-**要解决的问题（实测，不是推演）**：2026-09-13 深夜，一个子代理会话被强杀（dsh 重启），
+**要解决的问题（实测，不是推演）**：2026-09-13 深夜，一个子智能体会话被强杀（dsh 重启），
 它持有的 `src/` + `tests/` exclusive 声明留在了状态文件里。声明只有持有者本人能 `release`
 （对其他会话返回 `forbidden`），当时主 AI 只能手工改状态文件才解开。
 
@@ -347,22 +347,22 @@ agents.currentInitiator()            → 正在装配的那个会话
 
 **回归守卫**：`tests/collab-reap.mjs`。两形态行为一致（`tests/collab-hostcode-parity.mjs` 的对应段）。
 
-## 子代理禁止 client 平台检视 + 探索阶段默认先派
+## 子智能体禁止 client 平台检视 + 探索阶段默认先派
 
 **修的是真故障（实测定位）**：
-- **症状**：子代理执行 `cordis_inspect_query` 查询 `platform: 'client'`（如 `Slots` / `Theme`）会**永久挂起**。故障实测中子代理会话 `769c2e33` 调 `listSubTree` 空挂 344.8 秒直到被主 AI 中断；主会话做相同调用则瞬时返回。
-- **根因**：`@deepseek-ai/dsh-cordis-host-runner/lib/types/inspect-registry.js` 的 `queryClient` 只被拥有该 `agentId` 的浏览器页面应答 settle，子代理没有浏览器页面，因此永不 settle。
+- **症状**：子智能体执行 `cordis_inspect_query` 查询 `platform: 'client'`（如 `Slots` / `Theme`）会**永久挂起**。故障实测中子智能体会话 `769c2e33` 调 `listSubTree` 空挂 344.8 秒直到被主 AI 中断；主会话做相同调用则瞬时返回。
+- **根因**：`@deepseek-ai/dsh-cordis-host-runner/lib/types/inspect-registry.js` 的 `queryClient` 只被拥有该 `agentId` 的浏览器页面应答 settle，子智能体没有浏览器页面，因此永不 settle。
 - **现在的分工与硬化**：
-  1. **纪律文本注入**：`src/spec.ts` 的 `DELEGATION_DISCIPLINE_TEXT` 追加纪律，明文禁止子代理调用客户端检视；界面信息必须由主 AI 在主会话预查并写入委派背景。
-  2. **随包技能硬禁令**：`skills/subagent-delegation/SKILL.md` 新增 §10 硬禁令（含机制解释、反例、正例、以及 Slots/Theme/listSubTree 等危险信号清单），并在 §7 工具表格和 §9 踩坑速查中关联该禁令。
-  3. **探索阶段默认先派**：强化探索期先派子代理拿取事实的纪律，防止主会话上下文浪费。
+  1. **纪律文本注入**：`src/spec.ts` 的 `DELEGATION_DISCIPLINE_TEXT` 追加纪律，明文禁止子智能体调用客户端检视；界面信息必须由主 AI 在主会话预查并写入委派背景。
+  2. **随包技能硬禁令**：`skills/agent-delegation/SKILL.md` 新增 §10 硬禁令（含机制解释、反例、正例、以及 Slots/Theme/listSubTree 等危险信号清单），并在 §7 工具表格和 §9 踩坑速查中关联该禁令。
+  3. **探索阶段默认先派**：强化探索期先派子智能体拿取事实的纪律，防止主会话上下文浪费。
 
 ---
 
 ## 态势摘要按 cwd 缓存原始占用
 
 **修的是真 bug（已实测复现）**：`dsh-collab/awareness` 的运行时候选摘要原先**只按 cwd 缓存「某个人视角
-渲染好的文本」**，而「排除自己」的过滤做在**刷新侧**。同 cwd 的多个会话（父会话与其子代理）各自刷新，
+渲染好的文本」**，而「排除自己」的过滤做在**刷新侧**。同 cwd 的多个会话（父会话与其子智能体）各自刷新，
 后写覆盖先写；只要有一次刷新发生在 `id` 为空的 agent 上（`mine` 退化成 `human:console`，谁都不排除），
 之后同 cwd 的所有会话都会读到这份「含自己锁」的缓存——**持有者会在自己的态势里看到自己的占用**，
 误以为自己被挡着（正是这种误导会让人去 `wait`／`board` 协商一个不存在的竞争者）。
@@ -378,8 +378,8 @@ claim 删除并强制刷新后双方都回落通用规范。修复前实测 `6 p
 被桩成 no-op，「同 cwd 两个会话互相覆盖缓存」这条路径从未被执行。
 
 **顺带（提示词）**：常驻委托纪律文本（`src/spec.ts` 的 `DELEGATION_DISCIPLINE_TEXT`）新增一条
-「探索阶段默认先派」，随包技能 `skills/subagent-delegation/SKILL.md` 新增 §1.1（探索期该派哪五类单元、
-哪三种探索才允许自己做）——目标是让「先摸清情况」默认发生在子代理里，而不是主会话里。
+「探索阶段默认先派」，随包技能 `skills/agent-delegation/SKILL.md` 新增 §1.1（探索期该派哪五类单元、
+哪三种探索才允许自己做）——目标是让「先摸清情况」默认发生在子智能体里，而不是主会话里。
 
 ---
 

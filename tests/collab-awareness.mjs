@@ -71,7 +71,7 @@ const capturedPromptContext = promptContexts.get('dsh-collab/awareness') || null
 console.log('# awareness prompt context is registered')
 ok(!!capturedPromptContext, 'plugin registers the awareness PromptContext')
 ok(!!capturedPromptContext && capturedPromptContext.name === 'dsh-collab/awareness', 'context name is dsh-collab/awareness')
-ok(!!capturedPromptContext && capturedPromptContext.order === 130, 'context order is 130 (after sandbox/approval/subagent-delegation)')
+ok(!!capturedPromptContext && capturedPromptContext.order === 130, 'context order is 130 (after sandbox/approval/agent-delegation)')
 ok(!!capturedPromptContext && typeof capturedPromptContext.text === 'function', 'context text is a live provider function')
 if (!capturedPromptContext) { console.log(`\nFAILURES: ${h.pass}, ${h.fail}`); process.exit(1) }
 

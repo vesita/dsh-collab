@@ -4,7 +4,7 @@
 //
 // 分段与模块（每个 installer 的返回值就是它对外暴露的东西）：
 //   store.ts       状态文件存取 + 只读查询 op
-//   push.ts        功能 D：释放推送、子代理回退通道、agent/disposed 生命周期
+//   push.ts        功能 D：释放推送、子智能体回退通道、agent/disposed 生命周期
 //   access.ts      功能 A：访问旁路通知 + 读者反向注册
 //   awareness.ts   态势上下文（order 130）；暴露 systemPrompt 面与总开关
 //   delegation.ts  委托纪律：settings 偏好 + 随包 skill + 常驻纪律块（order 131）

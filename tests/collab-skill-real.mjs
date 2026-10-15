@@ -71,7 +71,7 @@ const { default: SkillRegistry } = await import(path.join(DEPLOY, '@deepseek-ai/
 const { updateVolatile } = await loadCosmokit()
 const plugin = (await import(PLUGIN_ENTRY)).default
 
-const SKILL_PATH = path.join(ROOT, '../skills/subagent-delegation/SKILL.md')
+const SKILL_PATH = path.join(ROOT, '../skills/agent-delegation/SKILL.md')
 
 // 本测试自己建、自己删的临时目录（不放任何外部路径）。
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'collab-skill-real-'))
@@ -120,7 +120,7 @@ try {
   }
 
   const names = async () => (await root.get('skills').list()).map((s) => s.name)
-  ok((await names()).includes('subagent-delegation'), 'default (ON) -> skill is in the real skill catalog', JSON.stringify(await names()))
+  ok((await names()).includes('agent-delegation'), 'default (ON) -> skill is in the real skill catalog', JSON.stringify(await names()))
   ok(contexts.has('dsh-collab/delegation'), 'default (ON) -> discipline PromptContext registered')
   ok(!!fiber.config && !!fiber.config.exposeDelegationDiscipline && typeof fiber.config.exposeDelegationDiscipline.get === 'function',
     '真实 cordis 按 Config schema 把普通值换成了 volatile 引用（插件页配置卡片的前置条件）',
@@ -130,16 +130,16 @@ try {
   // —— 用户在插件页里关掉它：走 Loader 的 volatile 通道（与线上同一条）——
   setPref(false)
   await settle(250)
-  ok(!(await names()).includes('subagent-delegation'), 'update(false) -> skill withdrawn from the real catalog (live read)', JSON.stringify(await names()))
+  ok(!(await names()).includes('agent-delegation'), 'update(false) -> skill withdrawn from the real catalog (live read)', JSON.stringify(await names()))
   ok(!contexts.has('dsh-collab/delegation'), 'update(false) -> discipline PromptContext withdrawn')
   ok(contextDisposals.includes('dsh-collab/delegation'), 'update(false) went through the real onChange hook', contextDisposals.join(','))
 
   setPref(true)
   await settle(250)
-  ok((await names()).includes('subagent-delegation'), 'update(true) -> skill back in the catalog', JSON.stringify(await names()))
+  ok((await names()).includes('agent-delegation'), 'update(true) -> skill back in the catalog', JSON.stringify(await names()))
   ok(contexts.has('dsh-collab/delegation'), 'update(true) -> discipline PromptContext back')
 
-  const def = await root.get('skills').get('subagent-delegation')
+  const def = await root.get('skills').get('agent-delegation')
   const diskBody = fs.readFileSync(SKILL_PATH, 'utf8')
   const m = /^\uFEFF?---[ \t]*\r?\n([\s\S]*?)\r?\n---[ \t]*(?:\r?\n|$)/.exec(diskBody)
   ok(!!def && def.content === diskBody.slice(m[0].length), 'real catalog body matches the shipped file byte-for-byte')
@@ -148,12 +148,12 @@ try {
 
   await fiber.dispose()
   await settle(250)
-  ok(!(await names()).includes('subagent-delegation'), 'plugin unload -> skill removed from the real catalog')
+  ok(!(await names()).includes('agent-delegation'), 'plugin unload -> skill removed from the real catalog')
   ok(!contexts.has('dsh-collab/delegation'), 'plugin unload -> discipline PromptContext removed')
   // 重新装载能再装一次（skill 名与上下文名都必须已释放，否则第二次会撞名/报重复注册）
   const again = await root.plugin(plugin, Object.assign({}, CONFIG))
   await settle(250)
-  ok((await names()).includes('subagent-delegation'), 're-mount re-registers the skill cleanly')
+  ok((await names()).includes('agent-delegation'), 're-mount re-registers the skill cleanly')
   ok(contexts.has('dsh-collab/delegation'), 're-mount re-registers the discipline PromptContext')
   await again.dispose()
 } finally {

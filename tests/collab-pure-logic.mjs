@@ -427,13 +427,13 @@ console.log('# 会话家族（血缘）豁免')
     claim(st, { holderId: 'agent:parent', name: '父会话' }, { paths: ['src/deploy/'] }, T)
     return st
   }
-  const child = { holderId: 'agent:child', name: '子代理', family: ['agent:child', 'agent:parent'] }
+  const child = { holderId: 'agent:child', name: '子智能体', family: ['agent:child', 'agent:parent'] }
   const stranger = { holderId: 'agent:stranger', name: '陌生会话', family: ['agent:stranger'] }
 
-  // 正：子代理带着血缘 claim 父会话已独占的路径 → 放行
+  // 正：子智能体带着血缘 claim 父会话已独占的路径 → 放行
   const st1 = mkParent()
   const r1 = claim(st1, child, { paths: ['src/deploy/installer/'] }, T)
-  ok(r1.ok === true, '子代理 claim 父会话已独占的路径：放行', JSON.stringify(r1.data && r1.data.error))
+  ok(r1.ok === true, '子智能体 claim 父会话已独占的路径：放行', JSON.stringify(r1.data && r1.data.error))
   ok(st1.claims.length === 2, '两条声明并存（各自持有，不是合并）', JSON.stringify(st1.claims.map(c => c.holderId)))
 
   // 负 1：无血缘的第三方 → 仍然 conflict
@@ -448,11 +448,11 @@ console.log('# 会话家族（血缘）豁免')
   try { claim(st3, { holderId: 'agent:child' }, { paths: ['src/deploy/installer/'] }, T) } catch (e) { threw3 = e }
   ok(!!threw3 && threw3.collabConflict === true, '血缘缺省：仍是 conflict（缺省 = 旧语义）')
 
-  // 反向：父会话去占自家子代理已占的路径
+  // 反向：父会话去占自家子智能体已占的路径
   const st4 = init()
-  claim(st4, { holderId: 'agent:child', name: '子代理' }, { paths: ['src/child/'] }, T)
+  claim(st4, { holderId: 'agent:child', name: '子智能体' }, { paths: ['src/child/'] }, T)
   const r4 = claim(st4, { holderId: 'agent:parent', name: '父会话', family: ['agent:parent', 'agent:child'] }, { paths: ['src/child/'] }, T)
-  ok(r4.ok === true, '父会话 claim 自家子代理已占的路径：放行')
+  ok(r4.ok === true, '父会话 claim 自家子智能体已占的路径：放行')
 
   // wait/blockers 同源：家族成员不算阻塞，外人照旧算
   const st5 = mkParent()

@@ -24,8 +24,8 @@ return {
     const fs = ctx.fs
     const sessions = ctx.get('sessions')
     const sessionTitle = ctx.get('sessionTitle')
-    // 注意：这里**故意不**注册随包 skill（skills.register / subagent-delegation）。
-    // 受限动态宿主里没有包目录、也没有 import，无法定位 <pkg>/skills/subagent-delegation/SKILL.md，
+    // 注意：这里**故意不**注册随包 skill（skills.register / agent-delegation）。
+    // 受限动态宿主里没有包目录、也没有 import，无法定位 <pkg>/skills/agent-delegation/SKILL.md，
     // 所以这是环境限制，不是遗漏。包形态见 src/index.ts：它按 import.meta.url 解析 ../skills/ 后注册。
     const LEGACY_FILE = '.dsh-collab.json'
     const now = () => Date.now()
@@ -176,8 +176,8 @@ return {
       const agent = execCtx && execCtx.agent
       const id = agent && agent.id ? String(agent.id) : null
       const cwd = await cwdOf(id, agent)
-      // holderOf 顺带把会话家族（血缘）现算出来：父会话 claim 了 src/ 再派子代理改 src/ 时，
-      // 子代理的写不该被自己家的锁拦下（判据与 claim() 的冲突扫描同源，见 collab-core.inFamily）。
+      // holderOf 顺带把会话家族（血缘）现算出来：父会话 claim 了 src/ 再派子智能体改 src/ 时，
+      // 子智能体的写不该被自己家的锁拦下（判据与 claim() 的冲突扫描同源，见 collab-core.inFamily）。
       const me = holderOf(execCtx)
       const { state } = await store.load(id, agent)
       const t = now()
@@ -225,7 +225,7 @@ return {
     })
     /*__COLLAB_GATE_END__*/
     // ---- 会话家族（血缘）：只用于冲突判定，**不进状态文件**（与包形态 store.familyIds 同源）----
-    // 血缘来自子代理创建时写入的 session.header.parentSession
+    // 血缘来自子智能体创建时写入的 session.header.parentSession
     // （dsh-subagent/lib/types/child-agent.js:117-123）；拿不到就退化为"只看 holderId 相等"，
     // 也就是 0.9.10 的语义。
     const LINEAGE_MAX_DEPTH = 16

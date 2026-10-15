@@ -50,16 +50,16 @@ export const DELEGATION_SETTINGS_ENTRY: DelegationSettings = {
  */
 // **常驻**（每轮注入、每个会话都付这份 token），所以只留两件东西：
 //   1) 官方面板与随包 skill 都**不覆盖**的那条：委派时尽量换一个模型（用户明确要求它醒目）；
-//   2) collab 自己的生命周期约束（句柄结束即释放、子代理猝死）。
-// 其余（判据、动作序列、规格模板、报告体积、并发切分）全在随包 skill `subagent-delegation`
+//   2) collab 自己的生命周期约束（句柄结束即释放、子智能体猝死）。
+// 其余（判据、动作序列、规格模板、报告体积、并发切分）全在随包 skill `agent-delegation`
 // 里（14k 字符，catalog 靠 description 发现）—— 这里再讲一遍就是重复建设（agent-experience：
 // 「从最小上下文开始」「每个事实只说一次」）。
 export const DELEGATION_DISCIPLINE_TEXT = [
-  '[dsh-collab] 委托与验收（默认工作方式；细则见随包 skill `subagent-delegation`）：',
-  '**委派子代理时尽量换一个模型**：用 provider / model 指名挑一个与自己不同的 —— 机械活给便宜模型、独立复核换另一个家族（同模型复核只会复制你的盲点）；先用 list_subagent_models 查允许的路由，别编；不给就继承你自己的模型。',
+  '[dsh-collab] 委托与验收（默认工作方式；**首选官方智能体团队**，细则见随包 skill `agent-delegation`）：',
+  '**委派子智能体时尽量换一个模型**：用 provider / model 指名挑一个与自己不同的 —— 机械活给便宜模型、独立复核换另一个家族（同模型复核只会复制你的盲点）；先用 list_subagent_models 查允许的路由，别编；不给就继承你自己的模型。',
   '主会话只留结论、决策与验收证据：能用一段话写清规格、且能用一次检查判定对错就委托；验收不外包，要原始输出，别只看摘要。',
-  '同一仓库只许一个跑构建；子代理没有浏览器页面，别派 client 检视。',
-  '锁的存活只看会话注册表：会话句柄结束时（agent/disposed）它持有的声明会被自动释放并留审计留言，恢复工作前先 collab_lock op=claim 重新声明。子代理意外终止（error 或空收尾）后，同一处最多唤醒一两次，唤醒它时提醒它重新 claim。'
+  '同一仓库只许一个跑构建；子智能体没有浏览器页面，别派 client 检视。',
+  '锁的存活只看会话注册表：会话句柄结束时（agent/disposed）它持有的声明会被自动释放并留审计留言，恢复工作前先 collab_lock op=claim 重新声明。子智能体意外终止（error 或空收尾）后，同一处最多唤醒一两次，唤醒它时提醒它重新 claim。'
 ].join('\n')
 
 // ---- 功能 C：写/读调用的路径事实源 ----

@@ -104,10 +104,10 @@ export function installStore(ctx: CollabContext): StateStore {
 
   // ---- 会话家族（血缘）：只用于冲突判定，**不进状态文件** ----
   //
-  // 为什么要它：子代理跑在自己的会话里，holderId 是 `agent:<子会话 id>`，与父会话不等。
-  // 于是"父会话 claim src/ 再派子代理改 src/"会被自己的锁硬拒绝（本部署 ask = deny），
-  // 而子代理无权 release（只有持有者本人能）。父子是同一个写域。
-  // 血缘来源：子代理创建时写入的 `session.header.parentSession`
+  // 为什么要它：子智能体跑在自己的会话里，holderId 是 `agent:<子会话 id>`，与父会话不等。
+  // 于是"父会话 claim src/ 再派子智能体改 src/"会被自己的锁硬拒绝（本部署 ask = deny），
+  // 而子智能体无权 release（只有持有者本人能）。父子是同一个写域。
+  // 血缘来源：子智能体创建时写入的 `session.header.parentSession`
   // （`dsh-subagent/lib/types/child-agent.js:117-123`）；祖先链写法照
   // `dsh-subagent/lib/types/continuation-activation.js:381-388` 的先例。
   //

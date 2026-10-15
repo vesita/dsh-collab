@@ -16,7 +16,7 @@
 
 - 判据：项目键 = 会话 cwd（`src/paths.ts`），状态文件名由 cwd 哈希（`src/collab-core.ts`），
   路径只在落在 cwd 下时才剥前缀。
-- 一手：子代理在 git worktree（如 `/tmp/xxx-tests`）里改 `tests/`，锁却声明在主仓库的 `tests/`；
+- 一手：子智能体在 git worktree（如 `/tmp/xxx-tests`）里改 `tests/`，锁却声明在主仓库的 `tests/`；
   两边落在**两个不同的状态文件**里、互不可见，而物理文件其实是同一份。
 - 方向：允许显式指定项目键（按 git 顶层目录派生），或让 worktree 与主仓库共用一份状态。
 
