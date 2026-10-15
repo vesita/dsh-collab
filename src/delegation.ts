@@ -27,9 +27,14 @@ export function installDelegation(
   // 而不是猜用户 ~/.dsh/skills/ 的落点。锁与留言板是产品本体，纪律只是附加项：
   // 字段缺失、文件缺失、解析失败一律**静默跳过**，绝不抛、也绝不阻断上面的工具注册。
   //
-  // 关键约束：偏好的值必须**活读**。Loader 改 volatile 字段时是就地更新 Config 引用
-  // （不是重建插件），所以每次读 `ctx.config` 都拿到当前值；`loader/volatile-update`
-  // 到达时重新结算交付物 —— 不需要重启进程。这里缓存的只是"读取器"，不是值本身。
+  // 关键约束：偏好的值必须**活读**。Loader 改 volatile 字段时是就地更新同一个 config 引用
+  // （不是重建插件），所以从 `apply(ctx, config)` 收到的那个对象上现读 `config[field]` 就能拿到
+  // 当前值；`loader/volatile-update` 到达时重新结算交付物 —— 不需要重启进程。
+  // 这里缓存的只是"读取器"，不是值本身。
+  //
+  // **别写 `ctx.config`**：Cordis 的 ctx 是代理，未 inject `config` 服务时读它会**抛错**，
+  // 而且在参数求值处就炸、try/catch 接不住。要可选地拿宿主配置用 `ctx.get('config')`，
+  // 拿到对象之后再读字段。
   let readSettings: (() => DelegationSettings) | null = null
   let skillStop: (() => void) | null = null
   let disciplineStop: (() => void) | null = null
