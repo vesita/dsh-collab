@@ -1,12 +1,11 @@
 // src/skill.ts
-// **随包 skill 的读盘与只读载荷**：正文与目录来自 <pkg>/skills/agent-delegation/。
-// 两个消费者共用本模块：delegation.ts（注册给 skills 服务）与 client-route.ts（只交出路径）。
+// **随包 skill 的读盘**：正文与目录来自 <pkg>/skills/agent-delegation/。
+// 消费者是 delegation.ts（把 skill 注册给宿主 skills 服务）。
 // 读盘结果（含失败）只算一次；任何失败都返回 null，绝不抛。
 
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
-import { DELEGATION_SETTINGS_NAMESPACE } from './spec.js'
-import type { BundledSkill, CollabSkillIndex } from './contract.js'
+import type { BundledSkill } from './contract.js'
 
 /** 随包发布的 skill：正文与目录都来自 <pkg>/skills/agent-delegation/。 */
 const BUNDLED_SKILL_FILE = '../skills/agent-delegation/SKILL.md'
@@ -61,28 +60,4 @@ export function loadBundledSkill(): BundledSkill | null {
     }
   } catch (e) {}
   return bundledSkillCache
-}
-
-/**
- * 纯函数：把「已加载或缺失的随包 skill」组装成只读路由的载荷。
- * 与读盘解耦，所以 node 里能直接断言「文件缺失 ⇒ skill 为 null」这条降级路径。
- * **绝不**带上 skill 正文：浏览器半边只拿路径与名称/描述，正文由右侧预览自己读文件。
- */
-export function buildSkillIndex(skill: BundledSkill | null): CollabSkillIndex {
-  return {
-    namespace: DELEGATION_SETTINGS_NAMESPACE,
-    items: [
-      {
-        field: 'exposeDelegationDiscipline',
-        skill: skill === null
-          ? null
-          : {
-              name: skill.name,
-              description: skill.description,
-              ...(skill.whenToUse === undefined ? {} : { whenToUse: skill.whenToUse }),
-              path: skill.path
-            }
-      }
-    ]
-  }
 }

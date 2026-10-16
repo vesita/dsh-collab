@@ -5,7 +5,6 @@
 //
 // 刻意不叫 types.ts：src/types/ 是 schema 派生产物的目录，同名会造成解析歧义。
 
-import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { ContextFormed } from '@deepseek-ai/dsh-llm'
 import type { Claim, ConflictInfo, HolderInput, Mode, PublishedClaim, StateDocument } from './collab-core.js'
 
@@ -150,15 +149,6 @@ export interface DelegationSettings {
 }
 
 /**
- * ctx.connection 中本插件实际使用的最小接口；**可选服务**。
- * 只读路由的围栏：Host/Origin 检查（防 DNS rebinding）+ 浏览器登录令牌，
- * 返回拒绝状态码，undefined 表示放行。
- */
-export interface ConnectionService {
-  requestRejection(request: unknown): number | undefined
-}
-
-/**
  * ctx.agentTeams 中本插件实际使用的最小接口；**可选服务**（0.11.0）。
  *
  * 来源：官方实验 bundle `@deepseek-ai/dsh-experimental-agent-team-profile`。服务是**进程级**注册的
@@ -179,31 +169,7 @@ export interface AgentTeamsServiceLike {
   }>
 }
 
-/**
- * ctx.webServer 中本插件实际使用的最小接口；**可选服务**。
- * 与部署里 open-in-app 注册路由的形态一致（kind/path/handler，返回 disposer）。
- */
-export interface WebServerService {
-  register(route: {
-    kind: 'exact' | 'prefix'
-    path: string
-    handler: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>
-  }): () => void
-}
-
-/** 路由载荷里的一项设置：字段名，以及它关联的随包 skill（无关联时为 null）。 */
-export interface CollabSkillItem {
-  field: string
-  skill: { name: string; description: string; whenToUse?: string; path: string } | null
-}
-
-/** 路由载荷：命名空间 + 条目表。**不含 skill 正文**（正文由右侧预览直接读文件）。 */
-export interface CollabSkillIndex {
-  namespace: string
-  items: CollabSkillItem[]
-}
-
-/** 已加载的随包 skill：路由只交出 name/description/whenToUse/path，正文永不过网。 */
+/** 已加载的随包 skill：注册给 skills 服务时交出名称/描述/正文与安装路径。 */
 export interface BundledSkill {
   name: string
   description: string
@@ -280,8 +246,6 @@ export interface CollabContext {
    * 返回 disposer；listener 作为当前 fiber 的 effect 注册，随 ctx 作用域自动回收。
    */
   on(event: string, handler: (...args: any[]) => any, options?: { global?: boolean; prepend?: boolean }): () => void
-  /** cordis 的动态依赖：deps 就绪时在子 fiber 里跑 callback；deferred 直到服务出现。 */
-  inject(deps: string[], callback: (ctx: CollabContext & { webServer?: WebServerService }) => void): unknown
 }
 
 /** 单个 op 的处理函数签名。 */

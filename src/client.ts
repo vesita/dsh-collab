@@ -4,16 +4,10 @@
     /**
      * dsh-collab 的浏览器半边：侧边栏「插件」页里 dsh-collab 那张 bundle 卡上的配置区。
      *
-     * 卡里的「委托与验收纪律」是一个开关（关闭 / 集群协作）与一个「预览」按钮：
-     * 预览用 DSH 自己的右侧文档面板打开随包技能正文，**不离开插件页** ——
-     * `plugins.bundle.config` 只给 `view` 一个 prop，也拿不到关闭句柄（详见 README）。
+     * 卡里是两个开关：「委托与验收纪律」（关闭 / 集群协作）与「原生写保护」（拦截 / 不拦截）。
      *
      * 偏好不在这里自存：表单是 `configForms` 上这张配置的控制器，写进去的字段就是本插件
      * 在 profile 里的 Config（0.1.7 起设置由当前 Profile 的插件配置保存）。
-     *
-     * 两处只能由 Host 交出的事实，走 host 半边注册的只读 loopback 路由
-     * `GET /dsh-collab/skill-index`：随包 skill 的**绝对路径**（浏览器拿不到包的安装
-     * 位置）与名称/描述。正文不过网 —— 右侧文档面板自己读文件。
      *
      * 手写 `__ModuleLoader__.load` 包装是浏览器半边的加载协议：客户端插件以「一个
      * 自带 id 的工厂」注册，`require` 由加载器注入。全文件不使用 JSX ——
@@ -51,8 +45,6 @@
     const FIELD = 'exposeDelegationDiscipline'
     /** 功能 C 的写保护开关（布尔，默认 **true**；字段名必须与 Host 半边 schema 逐字一致）。 */
     const WRITE_LOCK_FIELD = 'enforceWriteLock'
-    /** Host 半边注册的只读技能索引路由。 */
-    const SKILL_ROUTE = '/dsh-collab/skill-index'
     /** 侧边栏「插件」页里本插件那张配置卡的键：必须是 bundle 的包名（= package.json 的 name）。 */
     const BUNDLE_KEY = 'dsh-collab'
     /** 「委托与验收纪律」开关的两档状态词。 */
@@ -61,27 +53,6 @@
     /** 「原生写保护」开关的两档状态词。 */
     const LOCK_ON_LABEL = '拦截'
     const LOCK_OFF_LABEL = '不拦截'
-    /**
-     * `dsh-resource://file/session/<sessionId>/<path>` 前缀。
-     * 只读**会话作用域**：`absolute` 作用域在本部署读不了 —— 文档预览类型的
-     * `canOpen` 要求 `parseFileAddress(address)?.scope === 'session'`，
-     * 且 `sidebarRight.claim` 对无人认领的地址直接抛错。
-     */
-    const RESOURCE_PREFIX = 'dsh-resource://file/session/'
-
-    /**
-     * 把绝对路径编成资源地址的路径段：逐段 `encodeURIComponent`，分隔符不编码。
-     * Windows 盘符路径先归一成 `/` 分隔（部署的资源语法只认一种分隔符）。
-     */
-    function encodeSegments(path: string): string {
-      const normalized = /^[A-Za-z]:/.test(path) ? path.replace(/\\/g, '/') : path
-      return normalized.split('/').map(encodeURIComponent).join('/')
-    }
-
-    /** 用当前会话把绝对路径编成 session 作用域地址（相对路径不适用：技能在包目录里）。 */
-    function sessionFileAddress(sessionId: string, absolutePath: string): string {
-      return RESOURCE_PREFIX + encodeURIComponent(sessionId) + '/' + encodeSegments(absolutePath)
-    }
 
     /** 配置表单快照中本卡片真正用到的字段（对应 `configForms` 的 ConfigFormController 快照）。 */
     interface ScopeSnapshot {
@@ -92,20 +63,6 @@
       } | undefined
       writable: boolean
       revision: number | undefined
-    }
-
-    /** 随包技能：路由只交出路径与名称/描述，正文由右侧面板读文件。 */
-    interface SkillInfo {
-      name: string
-      description: string
-      whenToUse?: string
-      path: string
-    }
-
-    interface SkillState {
-      status: 'loading' | 'ready' | 'error'
-      skill: SkillInfo | null
-      error: string | null
     }
 
     /**
@@ -150,18 +107,6 @@
         padding: '0 10px',
         fontSize: '13px'
       },
-      button: {
-        appearance: 'none',
-        font: 'inherit',
-        cursor: 'pointer',
-        border: '1px solid var(--dsw-alias-border-l2)',
-        borderRadius: '8px',
-        padding: '5px 14px',
-        fontSize: '13px',
-        lineHeight: 1.5,
-        color: 'var(--dsw-alias-label-secondary)',
-        background: '0 0'
-      },
       /** 秒数输入框：与 select 同一套边框/底色 token，宽度收窄到够放四位数。 */
       number: {
         font: 'inherit',
@@ -204,16 +149,8 @@
       },
       /** 字段之间的发丝线（官方 fields.module.css 的 `.field + .field` 同款）。 */
       hr: { borderTop: '0.5px solid var(--dsw-alias-border-l2)' },
-      /** 预览行：按钮与技能描述同一行，放不下就折行。 */
-      previewRow: { display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' },
       hint: {
         color: 'var(--dsw-alias-label-tertiary)',
-        margin: 0,
-        fontSize: '12px',
-        lineHeight: 1.5
-      },
-      failed: {
-        color: 'var(--dsw-alias-label-error)',
         margin: 0,
         fontSize: '12px',
         lineHeight: 1.5
@@ -351,116 +288,13 @@
       }))
       ctx.effect(() => () => { formStore.dispose() })
 
-      /** 取一个可选服务；拿不到就返回 undefined（绝不抛）。 */
-      function service(name: string): any {
-        try {
-          return ctx.get(name)
-        } catch (e) {
-          return undefined
-        }
-      }
-
-      /** 当前选中的会话 id；设置页是全局面板，右侧栏却挂在会话上。 */
-      function currentSessionId(): string | null {
-        try {
-          const sessions = service('sessions')
-          const snapshot = sessions && sessions.list && typeof sessions.list.getSnapshot === 'function'
-            ? sessions.list.getSnapshot()
-            : null
-          const id = snapshot ? snapshot.current : null
-          return typeof id === 'string' && id.length > 0 ? id : null
-        } catch (e) {
-          return null
-        }
-      }
-
       /**
        * 侧边栏「插件」页里 dsh-collab 那张组合包卡上的配置区。
        *
        * 保存语义由官方表单原语承担（`SettingsForm` 的保存栏 + `SettingsFormModel` 的暂存）：
-       * 离开页面即丢弃未保存的草稿，只有点保存才写 Host。这里只负责画四个字段与技能预览。
+       * 离开页面即丢弃未保存的草稿，只有点保存才写 Host。这里只负责画两个字段。
        */
       function CollabConfigEntry(props: any) {
-        const [skill, setSkill] = React.useState({ status: 'loading', skill: null, error: null } as SkillState)
-        const [notice, setNotice] = React.useState(null as string | null)
-
-        // 技能索引只取一次：它回答的是「随包技能文件在哪」，与偏好无关。
-        React.useEffect(() => {
-          let live = true
-          const load = async () => {
-            try {
-              const response = await fetch(SKILL_ROUTE, { headers: { accept: 'application/json' } })
-              // 解析失败**不吞**：让 response.json() 的异常直接冒到下面的 catch。
-              // 曾经的写法是内层再包一个 try、失败就 payload={} —— 于是"远端返回了非 JSON"
-              // 会被降级成 items=[]、status='ready'、skill=null，UI 显示"技能路径不可用"，
-              // 把一次真实的响应格式故障说成了"这个技能没随包发布"。**能读懂的错误 > 好看的错误。**
-              const payload: any = await response.json()
-              if (!response.ok) throw new Error((payload && payload.error) || 'HTTP ' + response.status)
-              if (!live) return
-              const items = payload && Array.isArray(payload.items) ? payload.items : []
-              const match = items.find((entry: any) => entry && entry.field === FIELD) || null
-              const found = match && match.skill ? match.skill : null
-              setSkill({
-                status: 'ready',
-                skill: found && typeof found.path === 'string' && found.path.length > 0 ? found : null,
-                error: null
-              })
-            } catch (error) {
-              if (!live) return
-              setSkill({
-                status: 'error',
-                skill: null,
-                error: (error && error.message) || '无法读取技能索引'
-              })
-            }
-          }
-          void load()
-          return () => {
-            live = false
-          }
-        }, [])
-
-        React.useEffect(() => {
-          if (notice === null) return undefined
-          const timer = setTimeout(() => setNotice(null), 6000)
-          return () => clearTimeout(timer)
-        }, [notice])
-
-        /**
-         * 预览：让右侧栏的文档面板打开随包技能正文。
-         *
-         * 每一处都先确认服务在不在、调用会不会抛 —— 这是浏览器里唯一会失败的路径，
-         * 失败只落一句提示，绝不把异常丢进 React。
-         *
-         * 这里**刻意不调用** `layout.selectPanel(null)`：设置页不是 `layout` 的主面板，
-         * 它是 settings-general 里 `SettingsRoot` 的组件内部状态，`selectPanel(null)`
-         * 对它无效，反而会把中间主面板的选中项清空（把会话从中间列弄掉）。
-         * 本槽位也没有关闭设置页的句柄，见 README。
-         */
-        const preview = () => {
-          const path = skill.skill ? skill.skill.path : null
-          if (path === null) {
-            setNotice('技能路径不可用，无法预览。')
-            return
-          }
-          const sessionId = currentSessionId()
-          if (sessionId === null) {
-            setNotice('当前没有已打开的会话，无法在右侧预览。')
-            return
-          }
-          const sidebarRight = service('sidebarRight')
-          if (!sidebarRight || typeof sidebarRight.openResource !== 'function') {
-            setNotice('右侧栏不可用，无法预览。')
-            return
-          }
-          try {
-            sidebarRight.openResource(sessionFileAddress(sessionId, path))
-            setNotice('已在右侧打开技能预览。')
-          } catch (error) {
-            setNotice('打开预览失败：' + ((error && error.message) || '未知错误'))
-          }
-        }
-
         const state = props.useCollabForm((s: any) => s)
         // 表单未就绪（Host 还没服务这个命名空间）时整块不渲染 —— 官方页面同款：
         // `SettingsForm` 自己在 `available` 为假时画一句「不可用」，所以这里交给它。
@@ -488,30 +322,11 @@
             booleanSwitch(props, state, FIELD, '委托与验收纪律',
               '集群协作：把委托与验收纪律文本注入会话上下文，并注册随包技能；关闭则两者都撤回。',
               ON_LABEL, OFF_LABEL),
-            skill.status === 'error'
-              ? h('p', { style: styles.failed, role: 'status' }, '无法读取技能信息：' + skill.error)
-              : null,
-            skill.status === 'ready' && skill.skill !== null
-              ? h(
-                  'div',
-                  { style: styles.previewRow },
-                  h('button', {
-                    type: 'button',
-                    style: styles.button,
-                    onClick: () => {
-                      setNotice(null)
-                      preview()
-                    }
-                  }, '预览技能正文'),
-                  h('span', { style: styles.hint }, skill.skill.description)
-                )
-              : null,
             hr('hr-discipline'),
             booleanSwitch(props, state, WRITE_LOCK_FIELD, '原生写保护',
               '拦截：写入/修改他人已声明占用的路径前先走原生审批（本部署没有审批提示时，ask 会变成硬拒绝）；关闭则完全不拦。',
               LOCK_ON_LABEL, LOCK_OFF_LABEL),
-            hr('hr-lock'),
-            notice !== null ? h('p', { style: styles.hint, role: 'status' }, notice) : null
+            hr('hr-lock')
           )
         )
       }
@@ -541,7 +356,6 @@
 
     exports.apply = apply
     exports.inject = inject
-    exports.sessionFileAddress = sessionFileAddress
     return module.exports
   }
 })

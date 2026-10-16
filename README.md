@@ -109,8 +109,7 @@ DSH 自带一套实验性的 `Agent Teams`（`dsh-experimental-agent-team*`）�
 │   ├── push.ts                   # 功能 D：释放推送（唯一通道 agent.inject + 显式来源 form:'notice'）+ agent/disposed 生命周期
 │   ├── awareness.ts              # 协作态势注入（运行时上下文 order 130）
 │   ├── delegation.ts             # 委托纪律：settings 偏好 + 随包 skill + 常驻纪律块（order 131）
-│   ├── skill.ts                  # 随包 skill 读盘与 buildSkillIndex（delegation 与路由共用）
-│   ├── client-route.ts           # 浏览器半边只读 loopback 路由（技能索引）
+│   ├── skill.ts                  # 随包 skill 读盘（delegation 注册技能时消费）
 │   ├── client.ts                 # 浏览器半边：侧边栏 Plugins 页里 dsh-collab 卡上的配置区
 │   ├── host-shell.js             # 动态宿主形态的外壳模板（只留环境适配）；hostCode 由 scripts/build-host.mjs 构建期内联核心与状态层生成
 │   ├── schema/
@@ -144,7 +143,6 @@ DSH 自带一套实验性的 `Agent Teams`（`dsh-experimental-agent-team*`）�
     ├── collab-reap.mjs              # op=reap：确证死亡的显式回收（dry-run / confirm / 无自动触发路径）
     ├── collab-e2e.mjs               # 真实 fs + 临时 DSH_HOME 的端到端回归
     ├── collab-skill.mjs             # 随包 skill + 委托纪律 + 偏好设置回归
-    ├── collab-client-route.mjs      # Host 端技能索引路由（GET /dsh-collab/skill-index）回归
     ├── collab-client-config-page.mjs # 浏览器半边配置页注册面机械检查
     ├── collab-invariants-i1-i4.mjs  # 不变量 I1–I4：唯一存活判据 / 归属 / 有界 / 不误收
     ├── collab-oracle-liveness.mjs   # 存活 oracle 三态 + 只读不写状态（只读不留痕）
@@ -254,9 +252,7 @@ agents.currentInitiator()            → 正在装配的那个会话
 
 偏好能出现在 UI 里，靠的是插件带的浏览器半边 `lib/client.js`（`package.json` 声明 `dsh.client` 与 `exports["./client"]`）。原因很直接：插件页只**枚举**配置、从不解释它 —— 侧边栏 **Plugins** 页声明了 `plugins.bundle.config` 槽位（keyed，键是 bundle 的包名），由插件自己注册进来：**谁拥有配置，谁自带页面**。
 
-打开侧边栏的 **Plugins**，进 `dsh-collab` 那张组合包卡，即可看到两个字段 —— 「委托与验收纪律」（含一个打开随包技能正文的预览按钮）与「原生写保护」。页面用官方表单原语画（`SettingsForm` 的保存栏 + `SettingsFormValue` 字段 + `SettingsFormModel` 的暂存）：**改动先暂存，点保存才写 Host**，离开页面即丢弃草稿；被覆盖过的字段带「已覆盖」标记与「恢复默认」按钮。三种状态都如实呈现——Host 还没服务这个命名空间时 `SettingsForm` 自己画一句「不可用」，只读部署把控件置灰并说明原因。
-
-**预览按钮的行为**：点一下**直接**在右侧栏的文档面板打开随包技能正文，没有二次确认，**也不会离开插件页**——插件页照常开着，右侧栏多出一份技能文档。按钮就只是「在右侧栏打开技能文档」，文案与行为一致。
+打开侧边栏的 **Plugins**，进 `dsh-collab` 那张组合包卡，即可看到两个字段 —— 「委托与验收纪律」与「原生写保护」。页面用官方表单原语画（`SettingsForm` 的保存栏 + `SettingsFormValue` 字段 + `SettingsFormModel` 的暂存）：**改动先暂存，点保存才写 Host**，离开页面即丢弃草稿；被覆盖过的字段带「已覆盖」标记与「恢复默认」按钮。三种状态都如实呈现——Host 还没服务这个命名空间时 `SettingsForm` 自己画一句「不可用」，只读部署把控件置灰并说明原因。
 
 > **本落点拿不到关闭句柄**：`plugins.bundle.config` 只给 `view` 一个 prop（`'summary'` 出标题下的一句话、`'page'` 出表单正文；本槽位实际只被要 `page`），所以页面无法自行关闭或离开。需要关闭能力时改用 `settings.section` 落点——那里是 `renderSlot("settings.section", { close: onClose }, …)`。
 >
@@ -493,7 +489,6 @@ node tests/collab-access-gate.mjs      # 访问通知（agent.inject 的 notice 
 node tests/collab-reap.mjs             # op=reap 确证死亡的显式回收（dry-run / confirm / 无自动触发路径）
 node tests/collab-e2e.mjs              # 真实 fs 路径/语义端到端（临时 DSH_HOME）
 node tests/collab-skill.mjs            # 随包 skill + 委托纪律 + 偏好设置
-node tests/collab-client-route.mjs     # Host 端技能索引路由（GET /dsh-collab/skill-index）
 node tests/collab-client-config-page.mjs # 浏览器半边配置页注册面机械检查
 node tests/collab-invariants-i1-i4.mjs # 不变量 I1–I4：唯一存活判据 / 归属 / 有界 / 不误收
 node tests/collab-oracle-liveness.mjs  # 存活 oracle 三态（dead 立刻失效 / live 阻塞 / failed fail-closed）+ 只读不写状态

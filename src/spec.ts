@@ -1,15 +1,12 @@
 // src/spec.ts
 // **纯常量与纯函数**：工具读写路径规格、候选路径收集、去重签名、holderId -> sessionId、
-// 以及对外可见的常量（路由路径、设置命名空间与默认值、纪律文本）。
+// 以及对外可见的常量（设置命名空间与默认值、纪律文本）。
 // 全部不依赖 ctx，因此任何模块都可以直接 import，不需要接线。
 
 import z from '@deepseek-ai/schemastery'
 import { norm } from './collab-core.js'
 import type { Claim } from './collab-core.js'
 import type { DelegationSettings } from './contract.js'
-
-/** 浏览器半边读取「设置项 ↔ 随包 skill」关联的只读 loopback 路由。 */
-export const CLIENT_SKILL_ROUTE = '/dsh-collab/skill-index'
 
 /**
  * 偏好设置的命名空间。
