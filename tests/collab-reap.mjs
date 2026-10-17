@@ -105,11 +105,31 @@ async function boot (opts = {}) {
   await ctx.plugin(collabPlugin)
   await new Promise((r) => setTimeout(r, 20))
   const lock = tools.find((t) => t.name === 'collab_lock')
+  // 0.2.9：sweep 会自动回收确证死亡的声明。所以**预置的死声明必须先绕过 sweep 才能被测到**：
+  // 插件装载后（此时已完成它自己的首次 sweep）再把 opts.claims 原样写回盘上。
+  // 这样每条用例测的仍是 reap 本身，而不是"sweep 有没有把数据先吃掉"。
+  if (opts.claims) {
+    const doc = { schemaVersion: 1, seq: opts.claims.length, claims: opts.claims, messages: [], holders: [] }
+    store.set(statePath, JSON.stringify(doc))
+    versions.set(statePath, (versions.get(statePath) || 0) + 1)
+  }
   return {
     lock,
     stateRaw: () => store.get(statePath) || '',
     readState: () => JSON.parse(store.get(statePath) || '{}'),
-    claims: () => (JSON.parse(store.get(statePath) || '{}').claims || [])
+    claims: () => (JSON.parse(store.get(statePath) || '{}').claims || []),
+    // 0.2.9 起 sweep 会自动回收确证死亡的声明，所以"把一个死声明摆到 reap 面前"这件事
+    // 在正常流程里已经不可能发生了 —— 要测 reap 本身，就得**绕过 sweep** 把它塞回盘上，
+    // 这正是它真实存在的场景：另一个副本把一条已终结的声明并回来（删除在 join 下不单调，
+    // 墓碑挡住它，但如果墓碑被 GC 或副本更旧，reap 是最后一道显式回收）。
+    reinject: (rec) => {
+      const doc = JSON.parse(store.get(statePath) || '{}')
+      doc.claims = (doc.claims || []).filter((c) => c.claimId !== rec.claimId)
+      doc.claims.push(rec)
+      if (doc.released && rec.claimId in doc.released) delete doc.released[rec.claimId]
+      store.set(statePath, JSON.stringify(doc))
+      versions.set(statePath, (versions.get(statePath) || 0) + 1)
+    }
   }
 }
 

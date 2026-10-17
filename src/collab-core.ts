@@ -125,6 +125,8 @@ export interface SweepResult {
   droppedMessages: number
   prunedHolders: number
   prunedReleased?: number
+  /** 确证死亡而被回收的**声明**条数（0.2.9；以前这一项恒为"不碰 claims"）。 */
+  prunedClaims?: number
 }
 
 /** list 中按 holder 聚合的存活视图：holder 就活不活的唯一判据是 oracle（见 LivenessFn）。 */
@@ -617,14 +619,38 @@ export function messageBytes(m: Message): number {
 // 截断**不丢事实**：调用方始终能拿到 `holdersTotal`，自己看得出被折叠了。
 export const HOLDER_VIEW_LIMIT: number = 12
 
-// 惰性清理：过期声明 + 超额留言 + 确证死亡的 holder。
+// 惰性清理：确证死亡的声明 + 超额留言 + 确证死亡的 holder。
 // 返回各类清理数量，供上层附带诊断信息。
+//
+// **声明（claim）的回收判据（0.2.9 起）**：只有一条 —— oracle 说持有者 not-live。
+// 判据不可用（没有 liveness / 返回 'failed'）时不收（fail-closed）。
 //
 // **名册行（holder）的回收判据（改用活体 oracle 之后）**：不靠计时器，只有两条 ——
 //   1. oracle 说 not-live（`LivenessFn`，唯一存活判据）⇒ 行下一次 sweep 就走；
 //   2. `proc`：行上盖着写它的那个进程的身份令牌；这个进程不在了 ⇒ 行下一次 sweep 就走。
 //     —— 这一条覆盖 oracle 覆盖不到的"进程被杀但 agent 行还在"。
 // `dropHolder()`（agent/disposed）仍会立即摘行。没有任何一条会让行活得更久。
+/**
+ * 把一批声明记进 `released` 墓碑表（与 `collab-ops.ts` 的 `bury` 同一语义、同一份数据形状）。
+ *
+ * 为什么 core 里也要有一份：`collab-ops.ts` 单向依赖本文件（ops → core），core 不许反向
+ * import ops。这里只做最朴素的那 8 行（墓碑值 = 该声明的 Lamport seq），没有第二套规则 ——
+ * 两个写点写的是同一张表的同一列，语义由 `mergeReleased`（求并取大）统一。
+ *
+ * @param s - 要就地修改的状态文档。
+ * @param claims - 刚被拿掉的声明。
+ */
+function buryClaims(s: StateDocument, claims: Claim[]): void {
+  if (!Array.isArray(claims) || !claims.length) return
+  if (!s.released || typeof s.released !== 'object') s.released = {}
+  for (const c of claims) {
+    if (!c || typeof c.claimId !== 'string' || !c.claimId) continue
+    const v = Number(c.seq) || 0
+    const cur = s.released[c.claimId]
+    s.released[c.claimId] = cur === undefined || v > cur ? v : cur
+  }
+}
+
 export function sweep(s: StateDocument, opts: SweepOptions = {}): SweepResult {
   const maxMessages = Number.isInteger(opts.maxMessages) && opts.maxMessages > 0 ? opts.maxMessages : MAX_MESSAGES
   const maxMessagesBytes = Number.isInteger(opts.maxMessagesBytes) && opts.maxMessagesBytes > 0 ? opts.maxMessagesBytes : MAX_MESSAGES_BYTES
@@ -632,8 +658,45 @@ export function sweep(s: StateDocument, opts: SweepOptions = {}): SweepResult {
   const liveProcs: Set<string> | null = opts.liveProcs instanceof Set ? opts.liveProcs : null
   const procStamping = opts.procStamping === true
 
-  // **声明（claim）没有过期时间**，sweep 不碰它们：回收只有三条路径 —— 持有者 op=release、
-  // 句柄结束（agent/disposed）、确证死亡的 op=reap。
+  // **声明（claim）的回收**（0.2.9 起）：确证死亡（oracle=not-live）的持有者，其声明在
+  // 这里就收掉并立墓碑 —— 不再只靠 op=reap 手动清。
+  //
+  // 为什么必须加：`agent/disposed` 只覆盖**优雅退场**。进程被 SIGKILL（dsh 重启、整条 cgroup
+  // 被杀）时那个事件从头到尾没有发射机会，于是声明永久留在盘上。实测现场：5 条声明残留
+  // 2.88～3.64 天，所属进程（315976、43110）全已不存在、oracle 全 not-live，而没有**任何**
+  // 自动路径会删它们（reap 被刻意做成纯显式 + 默认 dry-run）。那不是"忘了删"，是回收机制的空档。
+  //
+  // 为什么这里不会误收活会话（**跨进程安全**是这里最硬的要求）：
+  //   · oracle（`liveness`）查的是**本进程**的 agents 注册表。多开一个 dsh 实例时，A 看不到
+  //     B 里活着的会话 ⇒ 单靠 oracle 会把 B 的锁当死锁删掉。实测本机曾经同时跑着本机会话与
+  //     noco 侧 dsh，这不是假想场景。所以 oracle=not-live **只是必要条件，不是充分条件**。
+  //   · 充分条件看声明的 `proc` 章（写这条声明时的进程身份令牌 `<pid>:<开机节拍>`）：
+  //     那个进程确实不在 `liveProcs` 里（= pid 没了，或同 pid 已换成另一个进程）。
+  //     两个判据**同时**成立才收 —— 与名册行回收同一套证据，只是名册行两条任一即可。
+  //   · 没有 `proc` 章的声明（老状态文件 / 盖不了章的形态）**不收**：证据不足，维持现状。
+  //   · 判据不可用（没有 liveness / 'failed' / liveProcs 不是 Set / 本形态不盖章）
+  //     一律**不回收**（fail-closed）—— 漏收只是维持现状，误收会删掉活会话的锁。
+  //   · 立墓碑（buryClaims）与 release/reap 同一处理：删除在 join 下不单调，
+  //     不立墓碑会被旧副本并回来。
+  let prunedClaims = 0
+  if (Array.isArray(s.claims) && typeof opts.liveness === 'function') {
+    const reclaimable = s.claims.filter(c => {
+      if (!c) return false
+      // 必要条件一：oracle 说这个持有者不在活名单里。
+      if (holderAlive(c.holderId, opts.liveness)) return false
+      // 必要条件二：这条声明盖着进程章，且那个进程确实不在了。
+      const proc = typeof c.proc === 'string' ? c.proc : ''
+      if (!proc) return false
+      // liveProcs 不是 Set ⇒ 进程判据不可用 ⇒ fail-closed（与名册行同一口径）。
+      if (!(liveProcs instanceof Set)) return false
+      return !liveProcs.has(proc)
+    })
+    if (reclaimable.length) {
+      s.claims = s.claims.filter(c => !reclaimable.includes(c))
+      buryClaims(s, reclaimable)
+      prunedClaims = reclaimable.length
+    }
+  }
   // 终态墓碑的**确定性** GC（见收敛层注释）：只按条数上限淘汰，规则只看数据（墓碑值 = 该声明的
   // Lamport seq + claimId），不看插入顺序、不看时钟 —— 同一份数据在任何副本上得到同一结果。
   let prunedReleased = 0
@@ -689,7 +752,7 @@ export function sweep(s: StateDocument, opts: SweepOptions = {}): SweepResult {
   })
   const prunedHolders = beforeHolders - s.holders.length
 
-  return { droppedMessages, prunedHolders, prunedReleased }
+  return { droppedMessages, prunedHolders, prunedReleased, prunedClaims }
 }
 
 // holder 存活视图：把 holders 数组翻译成"谁还活着"的可读判断。

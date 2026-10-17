@@ -27,6 +27,9 @@ class Claim:
     # 单元 C：Lamport 序号 + 写者戳（id = c_<seq>@<writer>；两个写者撞 seq 也不撞 id）
     seq: int = 0
     writer: str = ""
+    # 0.2.9：写这条声明的进程身份令牌（<pid>:<开机节拍>）。自动回收的第二证据 ——
+    # oracle 说持有者不活了 + 这个进程确实不在了，两条同时成立才删锁。老状态文件没有它。
+    proc: str = ""
 
 @dataclass
 class Message:

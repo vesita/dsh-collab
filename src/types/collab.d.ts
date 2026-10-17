@@ -29,6 +29,13 @@ export interface Claim {
    * （`c_<seq>@<writer>`）。**可选**：老状态文件缺省为空串。
    */
   writer?: string;
+  /**
+   * 写这条声明的进程身份令牌（`<pid>:<开机节拍>`，0.2.9）。自动回收的**第二证据**：
+   * oracle 说持有者不活了 + 这个进程确实不在了，两条同时成立才删锁（只有 oracle 不够 ——
+   * 它查的是本进程的 agents 注册表，多开一个 dsh 实例会误判另一个进程里的活会话）。
+   * 可选：老状态文件与盖不了章的形态没有它 ⇒ 届时自动回收不生效（fail-closed）。
+   */
+  proc?: string;
 }
 
 export interface Message {

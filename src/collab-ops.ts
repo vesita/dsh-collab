@@ -503,6 +503,13 @@ export function claim(state: StateDocument, h: HolderInput, a: ClaimInput, tNow:
     const w = writerOf(state)
     const n = ++state.seq
     cl = { claimId: recordId('c_', n, w), holderId: h.holderId, holderName: h.name, paths, mode, note, createdAt: t, readable, seq: n, writer: w }
+    // 0.2.9：给声明也盖进程章（名册行一直都有，声明此前没有）。
+    // 自动回收（sweep）要**同时**有两个证据才敢删一条锁：oracle 说持有者不活了，
+    // **并且**写这条声明的进程确实不在了。只有 oracle 是不够的 —— 它查的是本进程的
+    // agents 注册表，多开一个 dsh 实例时会把另一个进程里活着的会话判成 not-live。
+    // 盖不了章的形态（受限动态宿主拿不到宿主进程信息）就不盖，届时自动回收对它不生效
+    // （fail-closed：证据不足就维持现状）。
+    if (typeof h.proc === 'string' && h.proc) cl.proc = h.proc
     state.claims.push(cl)
   }
   return { ok: true, changed: true, state, tNow, data: { claim: publish(cl), serverTime: t, merged } }

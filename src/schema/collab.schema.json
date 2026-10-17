@@ -70,6 +70,10 @@
         "writer": {
           "type": "string",
           "description": "写者戳（单元 C）：产生这条记录的进程身份。claimId 形如 c_<seq>@<writer>，两个写者撞同一个 seq 也不会撞 id。可选（老状态文件缺省空串）。"
+        },
+        "proc": {
+          "type": "string",
+          "description": "写这条声明的进程身份令牌（`<pid>:<开机节拍>`，0.2.9）。自动回收要它作为第二证据：oracle 说持有者不活了 + 这个进程确实不在了，两条同时成立才删锁。可选：老状态文件与盖不了章的形态没有它（届时自动回收不生效，fail-closed）。"
         }
       }
     },

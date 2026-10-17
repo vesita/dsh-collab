@@ -743,17 +743,35 @@ console.log('# op=reap (host inline form): dry-run default / confirm removes onl
   const doc = JSON.parse(map.get(sp))
   for (const c of doc.claims) { c.createdAt = Date.now() - 1000 * 1000 }
   map.set(sp, JSON.stringify(doc))
-  const before = map.get(sp)
 
+  // 0.2.9 的自动回收需要**两个证据同时成立**：oracle 说不活了 + 声明上的 proc 章指向的进程
+  // 确实不在了。本形态（受限动态宿主）拿不到进程身份 ⇒ `selfProcToken()` 返回 null ⇒
+  // 声明根本不盖 proc 章 ⇒ 自动回收**不生效**（fail-closed：证据不足就维持现状）。
+  // 这里钉住的正是这条 fail-closed 契约 —— 它对宿主形态是常态，不是缺陷。
+  const afterSweep = JSON.parse(map.get(sp))
+  const sweptIds = (afterSweep.claims || []).map((c) => c.holderId).sort()
+  ok(JSON.stringify(sweptIds) === JSON.stringify(['agent:agent-dead', 'agent:agent-lived', 'agent:agent-reaper']),
+    '宿主形态没有 proc 章 ⇒ 自动回收不生效（fail-closed，三条声明都还在）', JSON.stringify(sweptIds))
+  ok(sweptIds.length && afterSweep.claims.every((c) => c.proc === undefined),
+    '宿主形态写的声明不带 proc 章', JSON.stringify(afterSweep.claims.map((c) => c.proc)))
+
+  // 因此 reap 仍是宿主形态回收死声明的唯一路径 —— 它对 agent-dead 应当有候选。
+  const before = map.get(sp)
   const dry = await lockLocal.execute({ op: 'reap' }, REAPER)
   ok(dry.ok === true && dry.data.dryRun === true, '宿主 reap 默认 dry-run', JSON.stringify(dry && dry.data && dry.data.dryRun))
   const cand = (dry.data && dry.data.candidates) || []
-  ok(cand.length === 1 && cand[0].holderId === 'agent:agent-dead', '宿主 dry-run 只列 oracle 说 not-live 的那条', JSON.stringify(cand.map((c) => c.holderId)))
+  ok(cand.length === 1 && cand[0].holderId === 'agent:agent-dead',
+    '宿主 reap 仍能列出死声明（自动回收在无 proc 章时不代劳）', JSON.stringify(cand.map((c) => c.holderId)))
   ok(map.get(sp) === before, '宿主 dry-run 后状态零变化（逐字节）')
+
+  // 负向对照：活着的与自己的一条都不在候选里。
+  const aliveStill = (JSON.parse(map.get(sp)).claims || []).map((c) => c.holderId).sort()
+  ok(JSON.stringify(aliveStill) === JSON.stringify(['agent:agent-dead', 'agent:agent-lived', 'agent:agent-reaper']),
+    'dry-run 不动任何声明', JSON.stringify(aliveStill))
 
   const conf = await lockLocal.execute({ op: 'reap', confirm: true }, REAPER)
   ok(conf.ok === true && conf.data.dryRun === false && conf.data.reaped.length === 1 && conf.data.reaped[0].holderId === 'agent:agent-dead',
-    '宿主 confirm:true 只回收那条僵尸声明', JSON.stringify(conf && conf.data && conf.data.reaped && conf.data.reaped.map((c) => c.holderId)))
+    'confirm:true 只回收那条僵尸声明', JSON.stringify(conf && conf.data && conf.data.reaped && conf.data.reaped.map((c) => c.holderId)))
   const ids = (JSON.parse(map.get(sp)).claims || []).map((c) => c.holderId).sort()
   ok(JSON.stringify(ids) === JSON.stringify(['agent:agent-lived', 'agent:agent-reaper']),
     '宿主 confirm:true 后活着的与自己的一条都没动', JSON.stringify(ids))

@@ -177,11 +177,55 @@ console.log('# overview / related')
 }
 
 // ===== 7. expire / sweep：到期清理与状态膨胀上限 =====
-console.log('# sweep（声明不过期；sweep 只清理留言与名册行）')
+console.log('# sweep（声明回收要两个证据；留言与名册行按上限清理）')
 {
+  // 没有 oracle ⇒ 声明一条也不动（fail-closed）。claim 本身仍然没有过期时间。
   const st = init(); claim(st, { holderId: 'agent:a', name: 'A' }, { paths: ['src/a/'] }, () => 1000)
   sweep(st)
-  ok(st.claims.length === 1, 'sweep 绝不动声明（claim 没有过期时间）', JSON.stringify(st.claims.length))
+  ok(st.claims.length === 1, '没有 oracle 时 sweep 不动声明（claim 没有过期时间）', JSON.stringify(st.claims.length))
+}
+{
+  // 0.2.9：自动回收**两个证据同时成立**才删锁 —— oracle 说 not-live + proc 章的进程确实不在。
+  const deadProc = '4242:999'
+  const mk = (claimId, holderId, proc) => {
+    const st = init()
+    st.claims.push({ claimId, holderId, paths: ['src/x/'], mode: 'exclusive', createdAt: 1000, readable: true, ...(proc ? { proc } : {}) })
+    return st
+  }
+  const oracle = (id) => (id === 'agent:alive' ? 'live' : 'not-live')
+
+  // 正例：双证据齐 ⇒ 回收 + 立墓碑
+  const a = mk('c_1', 'agent:dead', deadProc)
+  const ra = sweep(a, { liveness: oracle, liveProcs: new Set([]) })
+  ok(a.claims.length === 0, '双证据齐 ⇒ 死声明被回收', JSON.stringify(a.claims.length))
+  ok(ra.prunedClaims === 1, 'prunedClaims 报出回收条数', JSON.stringify(ra.prunedClaims))
+  ok(a.released['c_1'] !== undefined, '回收必须立墓碑，否则旧副本会并回来', JSON.stringify(a.released))
+
+  // 负例 1：oracle 说活着 ⇒ 不回收
+  const b = mk('c_2', 'agent:alive', deadProc)
+  sweep(b, { liveness: oracle, liveProcs: new Set() })
+  ok(b.claims.length === 1, 'oracle 说活着 ⇒ 不回收（哪怕 proc 不在）', JSON.stringify(b.claims.length))
+
+  // 负例 2：oracle 说不活了，但 proc 章指向的进程**还活着** ⇒ 不回收。
+  // 这正是多开 dsh 实例时保护另一个进程里活会话的那条判据。
+  const c = mk('c_3', 'agent:dead', '7777:111')
+  sweep(c, { liveness: oracle, liveProcs: new Set(['7777:111']) })
+  ok(c.claims.length === 1, 'proc 还活着 ⇒ 不回收（防跨进程误删）', JSON.stringify(c.claims.length))
+
+  // 负例 3：声明没有 proc 章（老状态文件 / 盖不了章的形态）⇒ 证据不足，维持现状
+  const d = mk('c_4', 'agent:dead', null)
+  sweep(d, { liveness: oracle, liveProcs: new Set() })
+  ok(d.claims.length === 1, '没有 proc 章 ⇒ 不回收（fail-closed）', JSON.stringify(d.claims.length))
+
+  // 负例 4：进程判据不可用（liveProcs 不是 Set）⇒ 不回收
+  const e = mk('c_5', 'agent:dead', deadProc)
+  sweep(e, { liveness: oracle })
+  ok(e.claims.length === 1, '进程判据不可用 ⇒ 不回收（fail-closed）', JSON.stringify(e.claims.length))
+
+  // 负例 5：没有 oracle ⇒ 即便 proc 全死也不动
+  const f = mk('c_6', 'agent:dead', deadProc)
+  sweep(f, { liveProcs: new Set() })
+  ok(f.claims.length === 1, '没有 oracle ⇒ 不回收', JSON.stringify(f.claims.length))
 }
 {
   // 留言保留最近 N 条

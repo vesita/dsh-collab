@@ -41,6 +41,8 @@ export interface StateCorePure {
   related(s: StateDocument, paths: string[], opts?: { liveness?: LivenessFn }): Claim[]
   filterMessages(s: StateDocument, a: ReadInput): FilterMessagesResult
   blockers(s: StateDocument, h: HolderInput, paths: string[], liveness?: LivenessFn): Claim[]
+  /** 持有者此刻是否还活着（唯一存活判据的包装）；list 的 claims 视图用它过滤。 */
+  holderAlive(holderId: string, liveness?: LivenessFn): boolean
   reap(s: StateDocument, h: HolderInput, a: ReapInput, t: number, liveness?: LivenessFn): OpResult
   norm(p: string): string | null
   /** 单元 C：半格 join（收敛的唯一事实源在 collab-core）。 */
@@ -355,7 +357,9 @@ export function createStateCore(ports: StateCorePorts): StateCore {
       }
     }
     const live = typeof ports.liveProcsOf === 'function' ? ports.liveProcsOf(toks) : null
-    return { liveProcs: live, procStamping: PROC_TOKEN !== null }
+    // liveness 必须一起传：0.2.9 起 sweep 也回收**确证死亡的声明**（不只是名册行）。
+    // 以前这里只传进程判据，声明永远不被自动回收，只能等某个会话记得敲一次 op=reap。
+    return { liveProcs: live, procStamping: PROC_TOKEN !== null, liveness: livenessFn(ports) }
   }
 
   const pub = (c: Claim): PublishedClaim => core.publish(c)
@@ -739,7 +743,16 @@ export function createStateCore(ports: StateCorePorts): StateCore {
     const t = now()
     // 先 sweep 再取视图：死掉的名册行（句柄结束 / 写它的进程不在了）在返回里根本不出现。
     const swept = core.sweep(state, sweepOpts(state))
-    const holders = core.holderView(state, t, { liveness: livenessFn(ports) })
+    const liveness = livenessFn(ports)
+    const holders = core.holderView(state, t, { liveness })
+    // `claims` 与 `holders` 必须用**同一个** liveness 判据：以前这里直接 `state.claims.map(pub)`，
+    // 于是同一份状态里 `overview` 报 0 条、`status` 报 0 条阻挡、名册 0 行，而 `list` 仍在报
+    // 5 条锁 —— 调用方看到的是"锁没释放"，实际那些持有者的会话早已不在注册表里
+    // （oracle=not-live、proc 也已死）。已失效的声明留不留盘上是回收策略的事，
+    // 但**视图必须与别的 op 一致**，否则同一个状态机对同一个问题给出两种答案。
+    const claims = typeof liveness === 'function'
+      ? state.claims.filter(c => core.holderAlive(c.holderId, liveness))
+      : state.claims
     const data: Record<string, unknown> = {
       seq: state.seq,
       serverTime: t,
@@ -751,7 +764,11 @@ export function createStateCore(ports: StateCorePorts): StateCore {
       // holdersTotal 恒在，调用方自己看得出被折叠了。
       holders: holders.slice(0, core.HOLDER_VIEW_LIMIT),
       holdersTotal: holders.length,
-      claims: state.claims.map(pub)
+      claims: claims.map(pub),
+      // 已失效但还留在盘上的声明条数（只报数，不列内容）：它们不挡人，也不在本视图里，
+      // 但要让人看得出"盘上还有东西没清、可用 op=reap 收掉"。没有这条数字，
+      // 视图干净了反而会让人以为已经清完了。
+      staleClaims: state.claims.length - claims.length
     }
     return { ok: true, data: withWarn(data, warn) }
   }
