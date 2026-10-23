@@ -462,8 +462,8 @@ export function claim(state: StateDocument, h: HolderInput, a: ClaimInput, tNow:
       //     旧实现无条件跳过 shared ⇒ 后来的 exclusive 被**静默批准**：前一秒还在 shared 里
       //     干活的会话，下一秒写入就被门控硬拒（本部署 ask == deny），而"冲突"这件事双方都没
       //     看见 —— 后来者反客为主。现在改为报冲突，让它去协商 / 等待 / 换路径：
-      //     返回的 ConflictInfo 里已带 suggestedAction(wait|negotiate)、holderName、
-      //     remainingSec、overlapsWith，正是协商所需的全部信息。
+      //     返回的 ConflictInfo 里已带 claimId、holderName、path、overlapsWith 与
+      //     suggestedAction（当前恒为 negotiate），正是协商所需的全部信息。
       //   · 我请求 shared ⇒ 只与已在场的 exclusive 冲突（"shared 会被他人独占挡住"是它的定义）；
       //     与已在场的 shared 不冲突（共享方互不挡死，保持 0.9.x 起的语义）。
       if (mode === 'shared' && c.mode === 'shared') continue

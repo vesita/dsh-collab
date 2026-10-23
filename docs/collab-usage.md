@@ -92,30 +92,28 @@ collab_lock op=claim paths=["src/backend/models/"] mode=exclusive note="调整�
 
 与他人**独占**声明重叠时（前缀匹配：`src/backend/` 与 `src/backend/models/` 重叠；`src/foo` 与 `src/foobar` 不重叠），返回 `conflict` 及冲突详情：
 
-- `overlapsWith`：具体重叠的声明路径；
-- `remainingSec`：该占用剩余存续秒数；
-- `suggestedAction`：
-  - `remainingSec <= 30` → `wait`（短暂等待对方释放）；
-  - `remainingSec > 30` → `negotiate`（用 `collab_board` 沟通）；
-  - 或 `switch_path` 切换到无冲突的模块继续推进。
+- `claimId` / `holderId` / `holderName`：冲突的声明及其持有者；
+- `path` / `overlapsWith`：本次请求的路径与重叠的声明路径；
+- `mode`：冲突声明的模式；
+- `suggestedAction`：`negotiate`（用 `collab_board` 沟通），或换一条路径继续推进。
 
 ### 2.3 查询
 
 | op | 用途 |
 | --- | --- |
-| `list` | 全部声明 + holder 存活视图 + `expiredCount` + `staleHolders` |
+| `list` | 全部声明 + holder 存活视图 + `staleClaims`（盘上留着但持有者已失效的声明条数） |
 | `overview` | **按 holder 分组**的占用全景（`totalClaims` + 每个 holder 的 claimCount / mode / paths / claims）；同一 holder 持有多种 mode 时为 `mixed` |
 | `status paths=[...]` | 给定路径的 related + exclusive 声明 |
 
-`list` 的 `holders` 是**存活视图**，按 `lastSeenAt` 降序，每项含：
+`list` 的 `holders` 是**存活视图**：只列会话注册表里还活着的 holder，按 `lastSeenAt` 降序，每项含：
 
 | 字段 | 含义 |
 | --- | --- |
-| `ageSec` | 距上次出现的秒数 |
-| `active` | 该 holder 当前是否持有未过期声明 |
-| `stale` | 无活跃声明且静默 ≥ 1h（预警阈值；回收仍按 24h 执行） |
+| `holderId` / `name` / `kind` / `sessionId` | 持有者身份 |
+| `lastSeenAt` | 最近一次出现在名册里的时刻（毫秒时间戳） |
+| `active` | 该 holder 当前是否持有声明 |
 
-顶层 `staleHolders` 给出计数，便于区分"正在干活的会话"与"上一会话的残留"。
+顶层 `holdersTotal` 是截断前的名册条数（`holders` 有界返回）；`staleClaims` 是**盘上还留着、但持有者已被判失效**的声明条数 —— 它们不挡人、不出现在 `list` / `status` 的视图里，要清掉用 `op=reap`（默认 dry-run，`confirm:true` 才真删）。
 
 ### 2.4 等待释放
 

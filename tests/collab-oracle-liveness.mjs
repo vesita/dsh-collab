@@ -268,7 +268,7 @@ console.log('=== 检查：claim 有效性 = livenessOf，不再靠时钟 ===')
           holderId: 'agent:dead-young',
           paths: ['src/young/'],
           mode: 'exclusive', // 刚创建 10 秒
-          createdAt: NOW - 10 * 1000,    // ageSec = 10 << 600
+          createdAt: NOW - 10 * 1000,    // 距现在 10 秒（声明没有过期判据，这个值只影响名册的 lastSeenAt）
           readable: true,
         },
         {

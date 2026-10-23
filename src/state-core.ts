@@ -558,8 +558,19 @@ export function createStateCore(ports: StateCorePorts): StateCore {
    * 只用于**写路径**（读路径仍以盘上为准，行为不变）。它只在 merge 与 sweep 的收敛规则下
    * 增长与收缩：已过期的记录会被 sweep 再清一次，越限留言会被同一条确定性规则再截一次，
    * 墓碑（`released`）参与 join 因而"释放"不会被旧副本翻案。所以它不会把状态带偏。
+   *
+   * **按目标状态文件隔离**（0.2.10）：一个 dsh 进程只有一份 `createStateCore()`，而同一进程会
+   * 服务多个项目（不同会话 cwd ⇒ 不同状态文件）。副本若是闭包单例，A 项目的声明会被 merge 进
+   * B 项目的写盘（实测：`~/.dsh/collab/projects/` 下四个项目文件里出现同一批 6 个 claimId，
+   * 而每条只属于其中一个项目）。键用 `fs.processPath(target)`，与 `otherProjects()` 判"是不是
+   * 同一个文件"用同一份不透明句柄 → 路径的转换；**同一个文件**仍然共享同一份副本（收敛性的
+   * 唯一理由），**跨文件**互不可见。
    */
-  let replica: StateDocument | null = null
+  const replicas = new Map<string, StateDocument>()
+  const replicaOf = (target: FileRef): StateDocument | null => replicas.get(fs.processPath(target)) || null
+  const setReplica = (target: FileRef, doc: StateDocument): void => {
+    replicas.set(fs.processPath(target), core.normalizeDoc(doc))
+  }
 
   /**
    * 写后验证（单元 C）：落盘成功 **不等于** 这份内容还在盘上。
@@ -617,7 +628,8 @@ export function createStateCore(ports: StateCorePorts): StateCore {
         fpBefore = msgFingerprint(state.messages)
         core.sweep(next, sweepOpts(next))
       } else {
-        // 「我的」= 盘上 ∪ 本实例的副本（半格 join）。首次写盘时副本为空 ⇒ 与旧行为逐字相同。
+        // 「我的」= 盘上 ∪ **这个目标文件**的副本（半格 join）。首次写盘时副本为空 ⇒ 与旧行为逐字相同。
+        const replica = replicaOf(target)
         const mine = replica ? core.mergeDocs(state, replica) : core.normalizeDoc(state)
         // 盖上**本次写者**的戳：它既是拿出去落盘的 `writer`，也是本事务里分配 id 的写者戳
         // （`claim`/`post`/`releaseOnDispose` 从 state.writer 取），还是写后验证的判据。
@@ -629,7 +641,7 @@ export function createStateCore(ports: StateCorePorts): StateCore {
         // 把"盘上学到的 ∪ 副本 ∪ 本次 sweep 的确定性清理"立刻留在副本里：即使本次 op 被挡回
         // （错误分支与 not-found 都不写盘），下一次也能看见这次的清理结果 —— 否则一块已到期的
         // 墓碑会把某条路径永久卡在"盘上有、副本以为没有"的状态里。
-        replica = core.normalizeDoc(mine)
+        setReplica(target, mine)
         let out: OpResult | undefined
         try {
           out = fn(mine)
@@ -677,7 +689,7 @@ export function createStateCore(ports: StateCorePorts): StateCore {
       }
       // 先把本次结果留在副本里，再验证：验证失败（被别人覆盖）时下一轮就是
       // merge(新盘, 我的结果) —— 我的改动不会被丢掉。
-      replica = core.normalizeDoc(next)
+      setReplica(target, next)
       // **写后验证**：落盘成功不等于这份内容还在盘上（replaceIfVersion 是 probe → rename，
       // 两个写者可以同时 probe 成功、各自 rename 成功）。重读主文件确认写者戳还是我自己；
       // 不是（被别人覆盖了）⇒ 重读 + 重合并 + 重试。观测不到时不判定（见 writeLanded）。

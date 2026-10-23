@@ -477,6 +477,7 @@ node tests/collab-write-merge.mjs      # 两个写者并发写盘不丢更新（
 node tests/collab-merge-golden.mjs     # 合并语义黄金语料逐字节对拍（改了语义没重跑语料即红）
 node tests/collab-integration.mjs      # Cordis 插件端到端（fake ctx）
 node tests/collab-state-split.mjs      # 主文件 + 留言旁挂的磁盘布局、两形态等价
+node tests/collab-cross-project.mjs    # 副本按状态文件隔离：跨项目不污染 + 同文件仍收敛
 node tests/collab-hostcode-parity.mjs  # 动态宿主形态**行为**对拍
 node tests/collab-inline-parity.mjs    # 两形态**同名函数**逐输出对拍（30 个 + 集合回归守护）
 node tests/collab-contract-derivation.mjs # 契约派生守卫（schema ⇄ d.ts ⇄ Python ⇄ 真实工具 schema）
@@ -513,8 +514,8 @@ pnpm run test:real                     # 真实 DSH 部署上的委托纪律端�
 | **确证死亡的显式回收** | **仅 `op=reap` + `confirm:true`** | **绝不自动**：dry-run 默认；判据只有一条 —— 会话注册表说持有者不在了 |
 | 留言保留 | 最近 `MAX_MESSAGES = 2000` 条 **且** 总量 ≤ `MAX_MESSAGES_BYTES = 256 KiB` | 两个上限**取先到者**，超出都从最旧的开始丢弃；写入时回报 `swept.droppedMessages`（`swept` 是**条件字段**：仅当本次确有清理时才出现在返回里）。字节口径 = 每条留言 JSON 序列化的 UTF-8 字节之和（不含数组分隔符与外层键名） |
 | 单条留言正文上限 | `MESSAGE_BODY_MAX_CHARS = 8000` 字符 | 只封条数会让状态"任意大"（一条 5MB 实测原样落盘）；超限由 `post()` 以 `bad-request` **显式挡回**，不静默截断 |
-| 陈旧 holder 回收 | 无活跃声明且 `HOLDER_TTL_MS = 24h` 未出现 | 回收由 `sweep()` 执行；`list` 另用 `holderView()` 给出 `ageSec` / `active` / `stale` 与 `staleHolders`，并在有 stale 条目时附 `holdersNote` 说明「`holders` 是名册不是锁」 |
-| holder 废弃预警 | 无活跃声明且静默 `HOLDER_STALE_WARN_MS = 1h` | `stale` 走这条更短的阈值，因此它是"看起来已废弃"的先行信号，在 `list` 上始终可达 |
+| 失效声明回收 | 会话注册表说持有者不在活名单（`not-live`）**且** 声明带 `proc` 章且该进程不在活进程表 | 两个判据同时成立时 `sweep()` 才收掉声明并立墓碑。没有 `proc` 章的声明（老状态文件 / 盖不了章的形态）不收；判据不可用（没有 liveness、`failed`、`liveProcs` 不是 Set）也不收 —— 证据不足时维持现状（fail-closed） |
+| 名册行回收 | 会话注册表说持有者不在活名单，**或** 名册行的 `proc` 章对应进程已不在活进程表 | 有活跃声明的行一律保留；无声明时两条任一成立即从 `holders` 移除。判据与声明回收同一套证据 |
 | 损坏状态自愈 | JSON 解析失败 | 备份为 `<state>.corrupt-<ts>` 后重置为空状态，并以 `warning` 上报；旧备份只保留最近 3 份（`fs.listDir` 拿不到时静默跳过清理，绝不让自愈失败） |
 | 旁挂损坏自愈 | 留言旁挂 JSON 解析失败 | 同样先备份为 `<name>.messages.json.corrupt-<ts>` 再按无留言继续（**不删不覆盖**），旧备份与主文件**共用同一份保留份数**（最近 3 份） |
 
