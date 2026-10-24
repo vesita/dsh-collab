@@ -60,6 +60,28 @@ if (!lockTool || !boardTool) {
 const exec1 = { agent: { id: 'agent-1' } }
 const exec2 = { agent: { id: 'agent-2' } }
 
+// 0. 漏传 op / 传错 op 必须给出可区分的报错（backlog 第 4 条）。
+//    旧行为两者都是「未知操作：undefined」/「未知操作：xxx」，调用方反推不出该补参数还是改取值。
+{
+  const missLock = await lockTool.execute({}, exec1)
+  if (missLock.ok !== false || missLock.error !== 'bad-request') throw new Error('missing op must be bad-request')
+  if (!String(missLock.message).includes('missing op')) throw new Error('missing op 文案必须点明 missing op，实际 = ' + missLock.message)
+  if (!String(missLock.message).includes('claim')) throw new Error('missing op 文案必须列出合法取值，实际 = ' + missLock.message)
+
+  const badLock = await lockTool.execute({ op: 'nonsense' }, exec1)
+  if (badLock.ok !== false || badLock.error !== 'bad-request') throw new Error('unknown op must be bad-request')
+  if (!String(badLock.message).includes('unknown op')) throw new Error('unknown op 文案必须点明 unknown op，实际 = ' + badLock.message)
+  if (String(badLock.message).includes('missing op')) throw new Error('unknown op 不得被误报成 missing op')
+
+  const missBoard = await boardTool.execute({}, exec1)
+  if (!String(missBoard.message).includes('missing op')) throw new Error('board 漏 op 也必须点明 missing op')
+  if (!String(missBoard.message).includes('post')) throw new Error('board missing op 文案必须列出合法取值')
+
+  // 负向对照：合法 op 不受影响（报错分流不能把正常路径弄坏）
+  const goodList = await lockTool.execute({ op: 'list' }, exec1)
+  if (!goodList.ok) throw new Error('合法 op 仍须成功，实际 = ' + JSON.stringify(goodList))
+}
+
 // 1. claim
 const claimRes = await lockTool.execute({ op: 'claim', paths: ['src/core/'], note: 'refactoring' }, exec1)
 if (!claimRes.ok) throw new Error('claim failed')

@@ -8,7 +8,7 @@
 import { inFamily } from './collab-core.js'
 import { claimsCovering, relToProject, isReadable, modeLabel, holderLabel } from './collab-ops.js'
 import type { Claim } from './collab-core.js'
-import { pathArgsFor } from './spec.js'
+import { pathArgsFor, SHELL_TOOLS, shellPathMentions } from './spec.js'
 import type { AgentLike, CollabContext } from './contract.js'
 import type { StateStore } from './store.js'
 /** 把 holder 的 agent:<sessionId> 交给 harness 的活体 oracle（三态原样透传；取不到算 failed）。 */
@@ -164,6 +164,57 @@ export function installGate(ctx: CollabContext, store: StateStore, prefs: GatePr
     push.pushNotice(agent, text, label)
   }
 
+  /**
+   * 旁路提示（0.2.12，backlog 第 1 条）：shell 类工具的写入**不受**门控保护，而模型侧此前
+   * 拿不到任何运行时提示 —— 设置卡片写着"拦截"，同一路径用 `bash` 就绕过去了，静默。
+   *
+   * 纪律：
+   *   - **只提示，绝不拒绝**（返回 void，调用方照常 next()）：靠分词猜目标路径做拒绝，
+   *     假阳性会变成硬拒绝（本部署 ask == deny），把合法读取也拦掉 —— 那正是当初不把
+   *     shell 列入写工具的理由，现在也不推翻它；
+   *   - 判据是**反向匹配**：拿他人已声明的路径去命令文本里找字面出现，而不是猜命令要写哪里
+   *     （见 spec.ts 的 shellPathMentions）。没提到 ⇒ 一句话都不投，不制造噪声；
+   *   - 与写门控同源过滤：不认自家家族、不认 shared/read、只看未过期的 exclusive；
+   *   - 任何失败都静默 —— 提示是旁路，不影响工具本身。
+   */
+  async function shellBypassNotice(execCtx: any): Promise<void> {
+    if (!push) return
+    if (!prefs.enforceWriteLockEnabled()) return
+    const toolName = execCtx && typeof execCtx.name === 'string' ? execCtx.name : ''
+    if (!SHELL_TOOLS.includes(toolName)) return
+    const args = (execCtx && execCtx.arguments) || {}
+    const command = typeof args.command === 'string' ? args.command : ''
+    if (!command) return
+    const agent = execCtx && execCtx.agent as AgentLike | undefined
+    const id = agent && (agent as AgentLike).id ? String((agent as AgentLike).id) : null
+    const cwd = await store.cwdOf(id, agent)
+    const me = store.holderOf(execCtx)
+    const { state } = await store.load(id, agent)
+    // 只拿**他人**的、未过期的 exclusive 声明路径作为反向匹配的字典。
+    const live = isLiveFn(store)
+    const candidates: string[] = []
+    for (const c of state.claims) {
+      if (inFamily(me, c.holderId)) continue
+      if (c.mode === 'shared' || c.mode === 'read') continue
+      if (live(c.holderId) === 'not-live') continue
+      for (const p of c.paths) if (typeof p === 'string' && p && !candidates.includes(p)) candidates.push(p)
+    }
+    if (!candidates.length) return
+    const hits = shellPathMentions(command, candidates)
+    if (!hits.length) return
+    // 把命中路径映射回声明，才能说出"被谁占着"。
+    const shown = hits.slice(0, 2)
+    const parts = shown.map((p) => {
+      const c = state.claims.find((x) => x.paths.includes(p))
+      return c ? p + '（' + holderLabel(c.holderId, c.holderName) + '，' + modeLabel(c.mode) + '）' : p
+    })
+    const more = hits.length > 2 ? '；另有 ' + (hits.length - 2) + ' 条' : ''
+    const text = '[dsh-collab] 旁路提示：这条 ' + toolName + ' 命令提到了被占用的路径 ' +
+      parts.join('；') + more + '。shell 写入**不受**本插件门控保护（自由文本命令无法可靠解析目标），' +
+      '这次不会被拦下 —— 如果确实要改这些路径，先 collab_lock op=wait 或 collab_board 协商。'
+    push.pushNotice(agent, text, 'collab shell 旁路 · ' + shown[0])
+  }
+
   // ---- 功能 C：写/读的原生审批门控 ----
   // 未命中任何他人声明（或工具不是写/读类、或开关关掉）→ return next() 原样放行。
   // 本部署的已知后果：审批提示被禁用时 dsh-tools 的 serviceAsk 把 ask 变成 deny
@@ -182,6 +233,12 @@ export function installGate(ctx: CollabContext, store: StateStore, prefs: GatePr
       await teamScopeNotice(execCtx)
     } catch (e) {
       // 预警是旁路：任何失败都不影响工具本身。
+    }
+    // shell 旁路提示同样在放行之后发（它本来就不拦，只补一条模型侧可见的提醒）。
+    try {
+      await shellBypassNotice(execCtx)
+    } catch (e) {
+      // 提示是旁路：任何失败都不影响工具本身。
     }
     return next()
   })

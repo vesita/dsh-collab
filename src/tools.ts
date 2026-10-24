@@ -27,6 +27,16 @@ export function installTools(ctx: CollabContext, store: StateStore): void {
     }
   }
 
+  // 漏传 op 与传了非法 op 是**两种**错，报错必须能区分：前者调用方只需补参数，
+  // 后者要它去核对取值。混成一句「未知操作：undefined」时反推不出是哪一种 ——
+  // 会话记录里因此把几百字正文重发过（docs/collab-ux-backlog.md 第 4 条）。
+  const LOCK_OPS = 'claim, release, list, overview, status, wait, reap'
+  const BOARD_OPS = 'post, read'
+  const missingOp = (ops: string): ToolResult =>
+    ({ ok: false, error: 'bad-request', message: 'missing op (one of: ' + ops + ')' })
+  const unknownOp = (op: unknown, ops: string): ToolResult =>
+    ({ ok: false, error: 'bad-request', message: 'unknown op「' + String(op) + '」(one of: ' + ops + ')' })
+
   const lockHandler = exec((a, h, aId, agent) => {
     if (a.op === 'claim') return claimWithTeamAdvisory(a, h, aId, agent)
     if (a.op === 'release') return store.mutate(s => release(s, h, a, store.now), aId, agent)
@@ -35,7 +45,8 @@ export function installTools(ctx: CollabContext, store: StateStore): void {
     if (a.op === 'status') return store.status(a, aId, agent)
     if (a.op === 'wait') return store.waitFor(a, h, aId, agent)
     if (a.op === 'reap') return store.reapOp(a, h, aId, agent)
-    return { ok: false, error: 'bad-request', message: '未知操作：' + String(a.op) }
+    if (a.op === undefined || a.op === null || a.op === '') return missingOp(LOCK_OPS)
+    return unknownOp(a.op, LOCK_OPS)
   })
 
   /**
@@ -69,7 +80,8 @@ export function installTools(ctx: CollabContext, store: StateStore): void {
   const boardHandler = exec((a, h, aId, agent) => {
     if (a.op === 'post') return store.mutate(s => post(s, h, a, store.now), aId, agent)
     if (a.op === 'read') return store.msgs(a, aId, agent)
-    return { ok: false, error: 'bad-request', message: '未知操作：' + String(a.op) }
+    if (a.op === undefined || a.op === null || a.op === '') return missingOp(BOARD_OPS)
+    return unknownOp(a.op, BOARD_OPS)
   })
 
   const render = (args: CollabArgs, value: unknown) => [{ type: 'text', text: JSON.stringify(value, null, 2) }]

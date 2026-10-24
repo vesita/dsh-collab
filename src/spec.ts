@@ -72,7 +72,40 @@ export const DELEGATION_DISCIPLINE_TEXT = [
 // 刻意**不**把 shell 类工具（bash / pwsh，dsh-tool-bash:260 / dsh-tool-pwsh:234）列为写工具：
 // 它们的 schema 里没有"目标路径"参数，只有一个自由文本 `command`。要靠分词去猜目标路径，
 // 假阳性会直接变成硬拒绝（本部署 ask == deny），例如把 `cat src/a/1` 判成写而拦掉合法读取。
-// 代价是 shell 写入不受本门控保护 —— 这是**已知旁路**，写在 README 与报告里，不假装覆盖。
+// 代价是 shell 写入不受本门控保护 —— 这是**已知旁路**。
+//
+// 0.2.12 起为这条旁路补**旁路提示**（只提示、绝不拒绝）：判据不是"猜命令要写哪个路径"，
+// 而是反向的 —— 拿**已声明的路径**去命令文本里找字面出现（见 SHELL_TOOLS / shellPathMentions）。
+// 反向匹配的好处是假阳性方向安全：没提到被占路径 ⇒ 一句话都不投；提到了 ⇒ 投一条 advisory，
+// 让调用方知道"这次 shell 写没被门控保护，而它可能碰到别人的锁"。不改变任何门控语义。
+/** shell 类工具名：它们的 `command` 是自由文本，门控不拦，只做旁路提示。 */
+export const SHELL_TOOLS: readonly string[] = ['bash', 'pwsh', 'run_code']
+
+/**
+ * 从 shell 命令文本里找出**被声明路径的字面出现**（反向匹配，不猜目标路径）。
+ *
+ * 判据刻意保守：只认"路径作为独立片段出现"，即前后不是标识符字符 ——
+ * `src/a/` 命中 `rm -rf src/a/x` 与 `sed -i s/x/y/ src/a/b.ts`，但**不**命中
+ * `src/a` 出现在 `src/abc` 或 `xsrc/a` 里的情况。返回命中的声明路径（去重、保序）。
+ *
+ * @param command - 工具的 `command` 参数原文
+ * @param claimedPaths - 当前**他人**的未过期 exclusive 声明路径（已归一）
+ */
+export function shellPathMentions(command: string, claimedPaths: readonly string[]): string[] {
+  const text = typeof command === 'string' ? command : ''
+  if (!text) return []
+  const out: string[] = []
+  for (const p of claimedPaths) {
+    const needle = typeof p === 'string' ? p.replace(/\/+$/, '') : ''
+    if (!needle) continue
+    if (out.includes(p)) continue
+    // 前后不得是标识符字符：`src/a` 不该命中 `src/abc`，也不该命中 `xsrc/a`。
+    const esc = needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const re = new RegExp('(^|[^\\w./-])' + esc + '(/|$|[^\\w-])')
+    if (re.test(text)) out.push(p)
+  }
+  return out
+}
 /** 工具 -> { write: 写/改类目标参数, read: 只读类目标参数 }。 */
 export const TOOL_PATH_SPECS: Record<string, { write: string[]; read: string[] }> = {
   write: { write: ['file_path'], read: [] },

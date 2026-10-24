@@ -532,7 +532,18 @@ export function release(state: StateDocument, h: HolderInput, a: ReleaseInput, t
     const paths = (Array.isArray(a.paths) ? a.paths : []).map(norm).filter(Boolean)
     if (!paths.length) return { ok: false, changed: false, state, tNow, data: { error: 'bad-request', message: 'claimId or paths required' } }
     rel = state.claims.filter(c => c.holderId === h.holderId && c.paths.some(cp => paths.some(p => ov(p, cp))))
-    if (!rel.length) return { ok: true, changed: false, state, tNow, data: { released: [], serverTime: t } }
+    // 一条都没匹配上时**不能只回 ok:true**：调用方拿 `ok` 判"我还持有吗"，空数组配 ok:true
+    // 会制造虚假的完成感（docs/collab-ux-backlog.md 第 5 条）。保持 ok:true（没有失败发生、
+    // 状态确实无需变更），但带上 `warning` 让调用方能从返回值本身看出"什么都没释放"。
+    if (!rel.length) {
+      return {
+        ok: true, changed: false, state, tNow,
+        data: {
+          released: [], serverTime: t,
+          warning: 'no claim matched these paths: ' + paths.join(' ') + '（你当前没有覆盖它们的声明；可能已释放、或声明在别的路径上）'
+        }
+      }
+    }
   }
   state.claims = state.claims.filter(c => !rel.includes(c))
   bury(state, rel)

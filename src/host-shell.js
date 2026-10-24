@@ -293,6 +293,11 @@ return {
     // （claim/release/post/holder 的最后一个参数）。h.name 也是 collab-core
     // 取名字的入口（旧的宿主副本走独立的 name 形参）。
     const exec = (fn) => async (args, e) => { args = args || {}; const h = holderOf(e); const name = hname(h); h.name = name; const aId = h.sessionId || null; try { return await fn(args, h, name, aId, h.agent) } catch (err) { return { ok: false, error: 'internal', message: String((err && err.message) || err) } } }
+    // 漏传 op 与传了非法 op 分开报（与包形态 tools.ts 同一语义，见 collab-ux-backlog 第 4 条）。
+    const LOCK_OPS = 'claim, release, list, overview, status, wait, reap'
+    const BOARD_OPS = 'post, read'
+    const missingOp = (ops) => ({ ok: false, error: 'bad-request', message: 'missing op (one of: ' + ops + ')' })
+    const unknownOp = (op, ops) => ({ ok: false, error: 'bad-request', message: 'unknown op「' + String(op) + '」(one of: ' + ops + ')' })
     // op=claim + 官方 Agent Teams 的 advisory 交叉预警（0.11.0，与包形态 tools.ts 同语义）：
     // claim 的结果与冲突判定**一字不动**，只在成功返回的 data 上追加 teamOverlaps。
     async function claimWithTeamAdvisory(a, h, name, aId, agent) {
@@ -316,13 +321,16 @@ return {
       if (a.op === 'status') return store.status(a, aId, agent)
       if (a.op === 'wait') return store.waitFor(a, h, aId, agent)
       if (a.op === 'reap') return store.reapOp(a, h, aId, agent)
-      return { ok: false, error: 'bad-request', message: '未知操作：' + String(a.op) }
+      // 漏传 op 与传了非法 op 分开报（与包形态 tools.ts 同语义，见 collab-ux-backlog 第 4 条）。
+      if (a.op === undefined || a.op === null || a.op === '') return missingOp(LOCK_OPS)
+      return unknownOp(a.op, LOCK_OPS)
     })
     // 留言板**没有投递面**（两形态一致）：post 只写共享状态文件。
     const board = exec((a, h, name, aId, agent) => {
       if (a.op === 'post') return store.mutate(s => post(s, h, a, now), aId, agent)
       if (a.op === 'read') return store.msgs(a, aId, agent)
-      return { ok: false, error: 'bad-request', message: '未知操作：' + String(a.op) }
+      if (a.op === undefined || a.op === null || a.op === '') return missingOp(BOARD_OPS)
+      return unknownOp(a.op, BOARD_OPS)
     })
     const render = (args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }]
     const lockTool = harness.defineTool({

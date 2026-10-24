@@ -488,6 +488,14 @@ await runTest('T9', 'hostCode 形态：状态目录绝对、不含 ~、且走 se
   if (!res || res.ok !== true) {
     throw new CheckFail('hostCode 形态 collab_lock list 未成功', '返回 = ' + JSON.stringify(res))
   }
+  // 两形态同源守卫：漏 op / 错 op 的报错必须与包形态一致（backlog 第 4 条）。
+  // 这里单独断言，是因为 host-shell 有一份自己的 op 分发；漏改它就会静默分叉。
+  const hostMiss = await lock.execute({}, { agent: { id: 'agent-host-1' } })
+  expect(hostMiss && hostMiss.ok === false && String(hostMiss.message).includes('missing op'),
+    'hostCode 形态漏 op 未报 missing op（两形态分叉）', '返回 = ' + JSON.stringify(hostMiss))
+  const hostBad = await lock.execute({ op: 'nonsense' }, { agent: { id: 'agent-host-1' } })
+  expect(hostBad && hostBad.ok === false && String(hostBad.message).includes('unknown op'),
+    'hostCode 形态错 op 未报 unknown op（两形态分叉）', '返回 = ' + JSON.stringify(hostBad))
   const sp = res.data && (res.data.statePath || res.data.stateDir)
   expect(typeof sp === 'string' && !!sp, 'hostCode 形态没有 statePath', 'data = ' + JSON.stringify(res.data))
   notes.push('hostCode statePath = ' + sp)

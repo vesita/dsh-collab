@@ -104,6 +104,24 @@ console.log('# release')
   ok(st.claims.length === 0, 'release clears claim')
 }
 
+// ===== 4.1 release 空匹配必须能从返回值看出来（backlog 第 5 条）=====
+console.log('# release: 空匹配不再只有 ok:true')
+{
+  const st = init(); claim(st, { holderId: 'agent:a', name: 'A' }, { paths: ['src/a/'] }, T)
+  // 拿一个**自己没持有**的路径去 release：一条都不匹配。
+  // 旧行为只回 {ok:true, changed:false, released:[]} —— 调用方拿 ok 判"我还持有吗"会被骗。
+  const miss = release(st, { holderId: 'agent:a', name: 'A' }, { paths: ['src/nope/'] }, T)
+  ok(miss.ok === true, 'release 空匹配仍 ok:true（没有失败发生）')
+  ok(miss.changed === false, 'release 空匹配 changed:false')
+  ok(miss.data.released.length === 0, 'release 空匹配 released 为空数组')
+  ok(typeof miss.data.warning === 'string' && miss.data.warning.includes('no claim matched'),
+    'release 空匹配必须带 warning，否则 ok:true 制造虚假完成感', JSON.stringify(miss.data))
+  // 负向对照：真的匹配上时**不该**有 warning（否则 warning 变成噪声，人就学会无视它）
+  const hit = release(st, { holderId: 'agent:a', name: 'A' }, { paths: ['src/a/'] }, T)
+  ok(hit.ok === true && hit.changed === true, 'release 命中时 changed:true')
+  ok(hit.data.warning === undefined, 'release 命中时不得带 warning（负向对照）', JSON.stringify(hit.data))
+}
+
 // ===== 5. post / filterMessages =====
 console.log('# board: post / read')
 {
@@ -541,6 +559,39 @@ console.log('# reap 级联清 holders')
   const r = reap(st2, { holderId: 'agent:me' }, { confirm: true }, T())
   ok(r.changed === false && st2.holders.length === 1, '没有 oracle：一个也不收，holders 不动', JSON.stringify(st2.holders.length))
   ok(r.data.livenessCheck === 'unavailable', '没有 oracle ⇒ livenessCheck=unavailable', JSON.stringify(r.data.livenessCheck))
+}
+
+// ===== 20. shellPathMentions：shell 旁路提示的反向匹配（0.2.12）=====
+// 判据：拿**已声明路径**去命令文本里找字面出现，而不是猜命令要写哪里。
+// 这个方向是刻意的 —— 假阳性的代价是"多一条 advisory"，而不是"合法命令被拒"。
+console.log('# shellPathMentions')
+{
+  const { shellPathMentions, SHELL_TOOLS } = await import('../lib/spec.js')
+
+  ok(SHELL_TOOLS.includes('bash') && SHELL_TOOLS.includes('pwsh'), 'SHELL_TOOLS 含 bash / pwsh')
+
+  // 正例：各种真实写法都要认出来
+  ok(shellPathMentions('sed -i s/a/b/ src/a/1.ts', ['src/a/']).length === 1, 'sed -i 命中目录声明')
+  ok(shellPathMentions('rm -rf src/a/x', ['src/a/']).length === 1, 'rm -rf 命中')
+  ok(shellPathMentions('cat src/a/1.ts', ['src/a/1.ts']).length === 1, '精确文件路径命中')
+  ok(shellPathMentions('python3 - <<EOF\nopen("src/a/1.ts","w").write("x")\nEOF', ['src/a/1.ts']).length === 1, 'heredoc 里的路径也命中')
+  ok(shellPathMentions('echo hi >> src/a/', ['src/a/']).length === 1, '重定向命中')
+  ok(shellPathMentions('cd src/a && make', ['src/a']).length === 1, '无尾斜杠声明也能命中')
+
+  // 负例（这些是"不许误报"的核心）：前缀不是路径边界
+  ok(shellPathMentions('cat src/abc/1.ts', ['src/a/']).length === 0, 'src/abc 不算 src/a 的命中')
+  ok(shellPathMentions('cat xsrc/a/1.ts', ['src/a/']).length === 0, 'xsrc/a 不算命中（左侧是标识符字符）')
+  ok(shellPathMentions('echo src/ab', ['src/a']).length === 0, 'src/ab 不算 src/a 的命中')
+  ok(shellPathMentions('npm test && git status', ['src/a/']).length === 0, '完全无关命令 -> 空数组')
+  ok(shellPathMentions('', ['src/a/']).length === 0, '空命令 -> 空数组')
+  ok(shellPathMentions('cat src/a/1.ts', []).length === 0, '没有声明路径 -> 空数组')
+
+  // 去重与保序
+  const multi = shellPathMentions('cp src/a/1 src/b/2', ['src/a/', 'src/b/'])
+  ok(multi.length === 2 && multi[0] === 'src/a/' && multi[1] === 'src/b/', '多条命中保序返回', JSON.stringify(multi))
+
+  // 特殊字符不被当成正则
+  ok(shellPathMentions('cat "a+b/c.ts"', ['a+b/c.ts']).length === 1, '路径里的 + 按字面匹配，不当正则')
 }
 
 h.finish()

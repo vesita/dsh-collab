@@ -707,6 +707,63 @@ console.log('# C: 不触发时原样放行（next() 恰好一次）')
   ok(unrelated.decision.kind === 'allow' && unrelated.nextCalls === 1, '无关路径放行')
 }
 
+// ── 功能 C 旁路提示（0.2.12，backlog 第 1 条）──────────────────────────
+// shell 写入不受门控保护是**设计选择**（自由文本无法可靠解析目标路径）。这里钉的是：
+// 放行照旧（绝不改成拒绝），但模型侧要能看见一条 advisory —— 此前是完全静默的。
+console.log('# C: shell 旁路提示（只提示、不拒绝）')
+{
+  const foreign = mkClaim({ claimId: 'c_dir2', holderId: 'agent:other', holderName: 'Other Session', paths: ['src/a/']})
+  const h = await makeHarness({ claims: [foreign] })
+
+  // 1) 命令里**提到**被占路径 -> 放行（不是 ask）+ 投一条 notice
+  resetInject()
+  const hit = await h.pre(execOf('bash', { command: 'sed -i s/x/y/ src/a/1.ts' }))
+  ok(hit.decision.kind === 'allow', 'shell 命中被占路径仍然放行（绝不改成拒绝）', JSON.stringify(hit.decision))
+  ok(hit.nextCalls === 1, 'shell 命中时 next() 仍恰好一次', String(hit.nextCalls))
+  ok(injectLog.length === 1, 'shell 命中被占路径 -> 投且只投一条提示', JSON.stringify(injectLog))
+  const body = noticeText(injectLog[0])
+  ok(body.includes('旁路提示'), '提示正文点明这是旁路', body)
+  ok(body.includes('src/a/'), '提示正文含被占路径', body)
+  ok(body.includes('Other Session'), '提示正文含持有者', body)
+  ok(body.includes('不受'), '提示正文说明 shell 写入不受门控保护', body)
+  ok(body.includes('collab_lock') && body.includes('collab_board'), '提示正文给出协商出口', body)
+
+  // 2) 负向对照：命令**没提到**任何被占路径 -> 一句话都不投（不制造噪声）
+  resetInject()
+  const clean = await h.pre(execOf('bash', { command: 'npm test && git status' }))
+  ok(clean.decision.kind === 'allow' && clean.nextCalls === 1, '无关 shell 命令放行')
+  ok(injectLog.length === 0, '无关 shell 命令不投任何提示（负向对照）', JSON.stringify(injectLog))
+
+  // 3) 负向对照：提到的是**兄弟路径**（src/abc 不是 src/a）-> 不投
+  resetInject()
+  const sibling = await h.pre(execOf('bash', { command: 'cat src/abc/1.ts' }))
+  ok(sibling.decision.kind === 'allow', '兄弟路径放行')
+  ok(injectLog.length === 0, '兄弟路径不算命中（前缀不是路径边界）', JSON.stringify(injectLog))
+
+  // 4) 负向对照：只读类 shell 命令命中也要提示吗？—— 提示不区分读写（无法判定），
+  //    但它只提示不拒绝，所以误提示的代价是"多一条 advisory"，不是"合法读取被拦"。
+  resetInject()
+  const readCmd = await h.pre(execOf('bash', { command: 'cat src/a/1.ts' }))
+  ok(readCmd.decision.kind === 'allow' && readCmd.nextCalls === 1, '只读 shell 命令照常放行')
+  ok(injectLog.length === 1, '只读 shell 命中被占路径也给一条提示（不区分读写，代价可接受）')
+
+  // 5) 自己的声明不提示
+  resetInject()
+  const mine = mkClaim({ claimId: 'c_mine2', holderId: ME_HOLDER, paths: ['src/mine/']})
+  const h2 = await makeHarness({ claims: [mine] })
+  const own = await h2.pre(execOf('bash', { command: 'rm -rf src/mine/x' }))
+  ok(own.decision.kind === 'allow' && own.nextCalls === 1, '自己的路径 shell 放行')
+  ok(injectLog.length === 0, '自己的声明不给自己发旁路提示（负向对照）', JSON.stringify(injectLog))
+
+  // 6) shared / read 声明不提示（与写门控同源过滤）
+  resetInject()
+  const shared = mkClaim({ claimId: 'c_sh2', holderId: 'agent:other', paths: ['src/sh/'], mode: 'shared'})
+  const h3 = await makeHarness({ claims: [shared] })
+  const sh = await h3.pre(execOf('bash', { command: 'echo x > src/sh/1' }))
+  ok(sh.decision.kind === 'allow', 'shared 声明下 shell 放行')
+  ok(injectLog.length === 0, 'shared 声明不发旁路提示（与写门控同源过滤）', JSON.stringify(injectLog))
+}
+
 console.log('# C: 可读性 —— 只有 readable:false 才拦读')
 {
   const openClaim = mkClaim({ claimId: 'c_open', holderId: 'agent:other', paths: ['src/a/'], readable: true})
