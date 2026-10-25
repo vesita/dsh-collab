@@ -44,6 +44,42 @@ class Message:
     replyTo: Optional[str] = None
     # 单元 C：写者戳（msgId = m_<seq>@<writer>）
     writer: str = ""
+    # 条目类型：缺省 note = 普通留言（老写法行为逐字节不变）
+    kind: Literal["note", "handoff", "handoff-accept"] = "note"
+    # 仅 kind=handoff 时有值
+    handoff: Optional["Handoff"] = None
+
+
+@dataclass
+class Handoff:
+    status: Literal["draft", "final"]
+    items: list["HandoffItem"]
+    # 接手者 holderId：只由接手方写，有值者胜
+    acceptedBy: Optional[str] = None
+    acceptedAt: Optional[int] = None
+
+
+@dataclass
+class HandoffItem:
+    text: str
+    status: Literal["done", "unverified", "blocked"]
+    # status=done 时必填
+    negativeControl: Optional["NegativeControl"] = None
+    # status=blocked 时必填
+    reason: Optional[str] = None
+    claim: Optional["HandoffClaim"] = None
+
+
+@dataclass
+class NegativeControl:
+    command: str
+    became: str
+
+
+@dataclass
+class HandoffClaim:
+    strength: Literal["measured", "inferred"]
+    evidence: Optional[str] = None
 
 @dataclass
 class Holder:

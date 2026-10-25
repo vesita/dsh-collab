@@ -73,6 +73,27 @@ function randDoc (r, ids) {
       body: 'b' + i
     }
     if (r() < 0.7) m.writer = pick(r, ['w1', 'w2'])
+    // 交接条目（2026-10）：必须进随机语料，否则 handoff 的 join 规则不会被代数律
+    // 覆盖 —— 而"新增字段不参与合并"正是跨进程静默丢数据的那类洞。
+    if (r() < 0.35) {
+      m.kind = pick(r, ['handoff', 'handoff-accept'])
+      if (m.kind === 'handoff') {
+        const items = []
+        const nI = Math.floor(r() * 3)
+        for (let j = 0; j < nI; j++) {
+          const it = { text: 'i' + pick(r, ['0', '1', '2']), status: pick(r, ['done', 'unverified', 'blocked']) }
+          if (r() < 0.5) it.negativeControl = { command: 'x', became: 'y' }
+          if (r() < 0.3) it.reason = 'why'
+          if (r() < 0.4) {
+            it.claim = { strength: pick(r, ['measured', 'inferred']) }
+            if (r() < 0.5) it.claim.evidence = 'ev'
+          }
+          items.push(it)
+        }
+        m.handoff = { status: pick(r, ['draft', 'final']), items }
+        if (r() < 0.3) { m.handoff.acceptedBy = pick(r, ['agent:A', 'agent:B']); m.handoff.acceptedAt = 2000 }
+      }
+    }
     doc.messages.push(m)
   }
   const nH = Math.floor(r() * 3)

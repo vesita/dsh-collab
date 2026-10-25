@@ -123,6 +123,135 @@
         "writer": {
           "type": "string",
           "description": "写者戳（单元 C）：产生这条留言的进程身份。msgId 形如 m_<seq>@<writer>，两个写者撞同一个 seq 也不会撞 id。可选（老状态文件缺省空串，游标按 (seq, \"\") 处理）。"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "note",
+            "handoff",
+            "handoff-accept"
+          ],
+          "default": "note",
+          "description": "条目类型。缺省 note = 普通留言（老写法的行为逐字节不变）。handoff = 一份结构化交接；handoff-accept = 声明接手了某份交接。"
+        },
+        "handoff": {
+          "$ref": "#/$defs/Handoff",
+          "description": "仅 kind=handoff 时有值。"
+        }
+      }
+    },
+    "Handoff": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "items"
+      ],
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": [
+            "draft",
+            "final"
+          ],
+          "description": "draft = 还在写；final = 定稿（正文末行必须是 HANDOFF_FINAL_MARK）。只有 final 才允许被接手。"
+        },
+        "items": {
+          "type": "array",
+          "maxItems": 200,
+          "items": {
+            "$ref": "#/$defs/HandoffItem"
+          }
+        },
+        "acceptedBy": {
+          "type": "string",
+          "description": "接手者的 holderId。只由接手方写；有值者胜（并发接手时按 join 规则收敛，只留一个）。"
+        },
+        "acceptedAt": {
+          "type": "integer",
+          "description": "接手时刻（Unix 毫秒）。与 acceptedBy 同源写入。"
+        }
+      }
+    },
+    "HandoffItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "text",
+        "status"
+      ],
+      "properties": {
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500,
+          "description": "一条交接事项：一句话说清做了什么/没做什么。"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "done",
+            "unverified",
+            "blocked"
+          ],
+          "description": "done = 做完了且**有负向对照**；unverified = 做了但没验证；blocked = 没做（必须给 reason）。"
+        },
+        "negativeControl": {
+          "$ref": "#/$defs/NegativeControl",
+          "description": "status=done 时必填：负向对照的命令与变红证据。"
+        },
+        "reason": {
+          "type": "string",
+          "maxLength": 500,
+          "description": "status=blocked 时必填：为什么没做。"
+        },
+        "claim": {
+          "$ref": "#/$defs/HandoffClaim",
+          "description": "这条事项如果包含一条结论，用它标注证据强度。"
+        }
+      }
+    },
+    "NegativeControl": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "command",
+        "became"
+      ],
+      "properties": {
+        "command": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500,
+          "description": "破坏被测行为的那条命令。"
+        },
+        "became": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "description": "执行后观察到的变红现象（如「3 failed」）。"
+        }
+      }
+    },
+    "HandoffClaim": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "strength"
+      ],
+      "properties": {
+        "strength": {
+          "type": "string",
+          "enum": [
+            "measured",
+            "inferred"
+          ],
+          "description": "measured = 实测过；inferred = 读代码推断。measured 必须给 evidence。"
+        },
+        "evidence": {
+          "type": "string",
+          "maxLength": 800,
+          "description": "strength=measured 时必填：命令 + 输出摘要。"
         }
       }
     },

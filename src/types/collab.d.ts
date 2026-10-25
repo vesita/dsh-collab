@@ -57,6 +57,70 @@ export interface Message {
    * 两个写者撞同一个 seq 也不会撞 id。**可选**：老状态文件缺省为空串（游标按 `(seq, "")` 处理）。
    */
   writer?: string;
+  /**
+   * 条目类型（SSOT `$defs.Message.properties.kind`）。
+   * 缺省 `note` = 普通留言 —— **老写法的行为逐字节不变**。
+   * `handoff` = 一份结构化交接；`handoff-accept` = 声明接手了某份交接。
+   */
+  kind?: 'note' | 'handoff' | 'handoff-accept';
+  /** 仅 `kind='handoff'` 时有值。 */
+  handoff?: Handoff;
+}
+
+/**
+ * 结构化交接（SSOT `$defs.Handoff`）。
+ *
+ * 为什么不用自由文本：接手方要判断"能不能开始"，而散文里没有可判定的字段 ——
+ * 那天一份 `READTHIS.md` 写了 300 行，接手方仍不知道哪条做完了、哪条只是声称。
+ */
+export interface Handoff {
+  /** `draft` 还在写；`final` 定稿（正文末行必须是 HANDOFF_FINAL_MARK）。只有 final 允许被接手。 */
+  status: 'draft' | 'final';
+  items: HandoffItem[];
+  /**
+   * 接手者 holderId。**只由接手方写**；并发接手时按 join 规则收敛（有值者胜），只留一个。
+   */
+  acceptedBy?: string;
+  /** 接手时刻（Unix 毫秒）。与 acceptedBy 同源写入。 */
+  acceptedAt?: number;
+}
+
+/** 一条交接事项（SSOT `$defs.HandoffItem`）。 */
+export interface HandoffItem {
+  /** 一句话说清做了什么 / 没做什么。 */
+  text: string;
+  /**
+   * `done` = 做完了**且有负向对照**；`unverified` = 做了但没验证；`blocked` = 没做（必须给 reason）。
+   *
+   * 三值而不是布尔：把"没验证"与"没做"混成一个 false，接手方就没法区分
+   * "可以直接用"与"还得自己验一遍"。
+   */
+  status: 'done' | 'unverified' | 'blocked';
+  /** `status='done'` 时必填。 */
+  negativeControl?: NegativeControl;
+  /** `status='blocked'` 时必填。 */
+  reason?: string;
+  /** 这条事项若含结论，用它标注证据强度。 */
+  claim?: HandoffClaim;
+}
+
+/** 负向对照（SSOT `$defs.NegativeControl`）：破坏被测行为后观察到的变红。 */
+export interface NegativeControl {
+  /** 破坏被测行为的那条命令。 */
+  command: string;
+  /** 执行后观察到的变红现象（如「3 failed」）。 */
+  became: string;
+}
+
+/**
+ * 结论的证据强度（SSOT `$defs.HandoffClaim`）。
+ *
+ * `measured` 必须给 `evidence` —— 否则"我测过了"就成了一句可以随便说的话。
+ */
+export interface HandoffClaim {
+  strength: 'measured' | 'inferred';
+  /** `strength='measured'` 时必填：命令 + 输出摘要。 */
+  evidence?: string;
 }
 
 export interface Holder {

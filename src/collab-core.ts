@@ -7,10 +7,10 @@
 // /*__COLLAB_CORE__*/ 位置，生成动态宿主形态的 hostCode。改这里 = 两形态同时改
 //（tests/collab-inline-parity.mjs 断言内联区与 lib/collab-core.js 去 export 后逐字节一致）。
 
-import type { Claim, ConflictInfo, Holder, Message, Mode, StateDocument } from './types/collab.js'
+import type { Claim, ConflictInfo, Handoff, HandoffClaim, HandoffItem, Holder, Message, Mode, StateDocument } from './types/collab.js'
 
 // 公共类型面（src/types/collab.d.ts）从这里统一再导出，方便调用方只依赖本模块。
-export type { Claim, ConflictInfo, Holder, Message, Mode, StateDocument } from './types/collab.js'
+export type { Claim, ConflictInfo, Handoff, HandoffClaim, HandoffItem, Holder, Message, Mode, StateDocument } from './types/collab.js'
 
 /** 注入式时钟：返回当前毫秒时间戳。 */
 export type Clock = () => number
@@ -417,7 +417,99 @@ function joinMessage(a: Message, b: Message): Message {
   if (replyTo !== undefined) out.replyTo = replyTo
   const writer = joinMaxStr(a.writer, b.writer)
   if (writer !== undefined) out.writer = writer
+  const kind = joinKind(a.kind, b.kind)
+  if (kind !== undefined) out.kind = kind
+  const handoff = joinHandoff(a.handoff, b.handoff)
+  if (handoff !== undefined) out.handoff = handoff
   return out
+}
+
+/**
+ * `kind` 的 join：有值者胜；两边都有且不同时取字典序大的。
+ *
+ * 取字典序而不是"后者胜"是为了**交换律** —— 合并的两个操作数没有顺序语义，
+ * 谁先谁后必须得到一样的结果。同一条 msgId 的 kind 理论上不会变（不一致说明有 bug），
+ * 但**即便有 bug 也必须收敛到确定值**，否则跨进程同步会让状态在两个值之间抖动。
+ */
+function joinKind(a?: Message['kind'], b?: Message['kind']): Message['kind'] | undefined {
+  if (a === undefined) return b
+  if (b === undefined) return a
+  if (a === b) return a
+  return a > b ? a : b
+}
+
+/**
+ * 交接的 join（半格）。
+ *
+ * ⚠️ 这是这次改动**最容易漏的一处**：加了字段但不参与合并，跨进程并发时会**静默丢数据**
+ * —— 而现有的并发测试都用旧形状，不会覆盖到它。
+ *
+ * 各项为什么要这么 merge：
+ *
+ *   · `status`      draft < final，取大 —— **只前进**（单调），与"定稿后不再变"的语义一致
+ *   · `items`       按 `text` 为键求并 —— 两边可能各补了一部分条目
+ *   · `item.status` unverified < done；blocked 是终态 —— 待办只会前进
+ *   · `negativeControl` / `evidence` / `reason`  有值者胜 —— 只写一次的事实
+ *   · `acceptedBy`  有值者胜 —— 接手只该发生一次（并发时确定性地留一个）
+ */
+function joinHandoff(a?: Handoff, b?: Handoff): Handoff | undefined {
+  if (a === undefined) return b
+  if (b === undefined) return a
+  const out: Handoff = {
+    status: joinStatusRank(a.status) >= joinStatusRank(b.status) ? a.status : b.status,
+    items: joinHandoffItems(a.items || [], b.items || [])
+  }
+  const acceptedBy = joinMaxStr(a.acceptedBy, b.acceptedBy)
+  if (acceptedBy !== undefined) out.acceptedBy = acceptedBy
+  // acceptedAt 与 acceptedBy 同源：只有 acceptedBy 存在时才写，避免出现"有时间没人"
+  const acceptedAt = joinMaxNum(a.acceptedAt ?? 0, b.acceptedAt ?? 0)
+  if (acceptedBy !== undefined && acceptedAt > 0) out.acceptedAt = acceptedAt
+  return out
+}
+
+/** draft < final。用数字序而不是字符串比较，避免 `'draft' > 'final'` 这种字典序陷阱。 */
+function joinStatusRank(status: Handoff['status']): number {
+  return status === 'final' ? 1 : 0
+}
+
+/**
+ * 事项列表的 join：**整份取更完整的那一份**，不逐项拼接。
+ *
+ * ## 为什么不能按 `text` 折叠（实测踩到）
+ *
+ * 第一版按 `text` 为键求并，结果**幂等律直接失败**（`mergeDocs(a,a) !== normalizeDoc(a)`）：
+ * `normalizeDoc` 只按 `msgId` 折叠、不碰 items，所以一份含两条同 `text` 事项的文档
+ * 原样保留 2 条；而我的 join 把它们并成 1 条。`merge(a,a)` 于是与 `normalize(a)` 不等。
+ *
+ * ## 为什么"整份取胜"在语义上也对
+ *
+ * `items` 不是"可以各补一部分的集合"，而是**一次写入的完整快照** —— 作者写交接时
+ * 手里有整张清单，不会出现"两个写者各写了半张"。所以并发时该取更完整的那个副本，
+ * 而不是拼接。
+ *
+ * 判"更完整"用与 `status` 相同的单调序：`final` 的那份 > 项数多的 > `draft` 的。
+ * 三项都是确定性的比较，因此交换律、结合律、幂等律同时成立。
+ */
+function joinHandoffItems(a: HandoffItem[], b: HandoffItem[]): HandoffItem[] {
+  // 先比"整体成熟度"，再看项数；都不变时用序列化比较兜底，保证结果唯一。
+  const rankOf = (items: HandoffItem[]): number => {
+    let done = 0
+    for (const item of items) if (item.status === 'done') done += 1
+    return done
+  }
+  const rankA = rankOf(a)
+  const rankB = rankOf(b)
+  let chosen: HandoffItem[]
+  if (rankA !== rankB) chosen = rankA > rankB ? a : b
+  else if (a.length !== b.length) chosen = a.length > b.length ? a : b
+  else {
+    // 同成熟度同长度：取序列化更大的那份（确定且交换），与 joinKind 同一条思路。
+    const sa = JSON.stringify(a)
+    const sb = JSON.stringify(b)
+    chosen = sa >= sb ? a : b
+  }
+  // 返回副本，避免调用方拿到共享引用（join 的约定是不改操作数）。
+  return chosen.map((item) => ({ ...item }))
 }
 
 /** 名册行的逐字段 join（同 holderId 的两份；lastSeenAt 取大，进程章有值者胜出）。 */
