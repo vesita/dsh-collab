@@ -429,7 +429,10 @@ return {
         const t = now()
         // 只按"是否过期"筛；**不**在这里按 holderId 筛（那是读取侧的事，见 digestCache 的注释）。
         const active = state.claims
-        digestCache.set(cwd, { claims: active, at: t })
+        // 交接也进缓存（与包形态 src/awareness.ts 同）：接手提示与占用是同一份上下文
+        // 的两个部分，而同步的 text() 里读不了盘。
+        const handoffs = state.messages.filter(m => m.kind === 'handoff')
+        digestCache.set(cwd, { claims: active, handoffs: handoffs, at: t })
       } catch (e) {
         // 尽力而为：保留上一份缓存。
       } finally { digestBusy.delete(cwd) }
@@ -456,6 +459,16 @@ return {
             const teamLine = teamTaskScopeLine(team)
             const xwarn = teamCrossWarnLine(team, others)
             const lines = [others.length ? renderDigest(others) : OPEN_HINT]
+            // 接手交互（2026-10，与包形态 src/awareness.ts 同语义）。
+            // 判据全在 core 的 pendingHandoffsFor / renderPendingHandoffs 里（唯一事实源），
+            // 这里只喂本会话的家族与声明路径。
+            const myPaths = (hit ? hit.claims : [])
+              .filter(c => fam.has(c.holderId))
+              .flatMap(c => c.paths)
+            const handoffLine = renderPendingHandoffs(
+              pendingHandoffsFor(hit ? hit.handoffs : [], init.id ? 'agent:' + String(init.id) : 'human:console', fam, myPaths)
+            )
+            if (handoffLine) lines.push(handoffLine)
             if (teamLine) lines.push(teamLine)
             if (xwarn) lines.push(xwarn)
             return lines.join('\\n')

@@ -6,8 +6,8 @@
 // 依赖：状态存取面（store）。对外暴露 AwarenessSurface：delegation 复用它注册常驻纪律块
 // （同一个 systemPrompt 服务、同一个总开关）。
 
-import { renderDigest, teamTaskScopeLine, teamCrossWarnLine } from './collab-ops.js'
-import type { Claim } from './collab-core.js'
+import { pendingHandoffsFor, renderDigest, renderPendingHandoffs, teamTaskScopeLine, teamCrossWarnLine } from './collab-ops.js'
+import type { Claim, Message } from './collab-core.js'
 import type { AgentLike, CollabContext, PromptContextService } from './contract.js'
 import type { StateStore } from './store.js'
 
@@ -43,7 +43,7 @@ export function installAwareness(ctx: CollabContext, store: StateStore): Awarene
   // 之后同 cwd 的所有会话都会读到这份"含自己锁"的缓存 —— 持有者被自己的占用误导。
   // 结论：**视角是读取侧的事**，按当前发起者现场过滤；渲染（renderDigest）与时间无关，
   // 所以按 cwd 缓存原始列表是安全的（谁刷新都一样，不再有"后写覆盖先写"的语义）。
-  const digestCache = new Map<string, { claims: Claim[]; at: number }>()
+  const digestCache = new Map<string, { claims: Claim[]; handoffs: Message[]; at: number }>()
   const digestBusy = new Set<string>()
 
   // 摘要文本必须**时间稳定**，否则会毁掉 DSH 自己的快照去重：
@@ -61,7 +61,10 @@ export function installAwareness(ctx: CollabContext, store: StateStore): Awarene
       const t = store.now()
       // 只按"是否过期"筛；**不**在这里按 holderId 筛（那是读取侧的事，见 digestCache 的注释）。
       const active = state.claims
-      digestCache.set(cwd, { claims: active, at: t })
+      // 交接也进缓存：接手提示与占用是同一份上下文的两个部分，分两次读盘没有意义
+      // （而且同步的 text() 里读不了盘）。只留交接条目，别的留言与这里无关。
+      const handoffs = state.messages.filter((m) => m.kind === 'handoff')
+      digestCache.set(cwd, { claims: active, handoffs, at: t })
     } catch (e) {
       // 态势刷新是尽力而为：失败时保留上一份缓存，绝不打断任何模型步或工具调用。
     } finally {
@@ -102,6 +105,20 @@ export function installAwareness(ctx: CollabContext, store: StateStore): Awarene
           const teamLine = teamTaskScopeLine(team)
           const xwarn = teamCrossWarnLine(team, others)
           const lines: string[] = [others.length ? renderDigest(others) : OPEN_HINT]
+          // 接手交互（2026-10）：把"有份交接等着人接"并进同一行上下文。
+          //
+          // 为什么不新增投递面：`collab_board` 按设计"不投递、不唤醒"，而这里本来就
+          // 每步注入一次 —— 交接只要成为这一行的一部分，就不需要推送。
+          //
+          // 三条约束都在 pendingHandoffsFor 里：只给声明了相关路径的人看、
+          // 已接手的不提示、自己（含家族）写的不提示。
+          const myPaths = (hit ? hit.claims : [])
+            .filter((c) => fam.has(c.holderId))
+            .flatMap((c) => c.paths)
+          const handoffLine = renderPendingHandoffs(
+            pendingHandoffsFor(hit ? hit.handoffs : [], init.id ? 'agent:' + String(init.id) : 'human:console', fam, myPaths),
+          )
+          if (handoffLine) lines.push(handoffLine)
           if (teamLine) lines.push(teamLine)
           if (xwarn) lines.push(xwarn)
           return lines.join('\n')

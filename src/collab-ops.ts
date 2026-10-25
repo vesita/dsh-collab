@@ -88,6 +88,81 @@ export function renderDigest(claims: Claim[]): string {
   return '[dsh-collab] 同项目其他会话当前占用：' + parts.join('；') + more + '。改动这些路径前请先执行 collab_lock op=wait 或用 collab_board 协商。'
 }
 
+// ---- 接手交互（2026-10）：把"有一份交接等着人接"注入到相关会话的下一步 ----
+//
+// ## 为什么走 awareness 而不是新增投递面
+//
+// `collab_board` 的定位明写"不投递、不唤醒任何会话"，`AGENTS.md` §1 又规定跨会话通知
+// 只能经 `agent.inject` + 自造显式来源消息。两条约束加起来，看起来"让人知道有新交接"
+// 是做不到的。
+//
+// 但 `awareness` 本来就**每一步都注入**同项目的实时占用（order 130，`systemPrompt.context`）。
+// 于是"交接有人等着接"不需要推送 —— 它只要成为那一行里的一部分：
+// **不是"发一条消息"，是"下一步的上下文里本来就有这一行"。**
+//
+// ## 三条约束（防止它退化成噪声）
+//
+// 1. **只给相关的人看**：声明了交接涉及路径的会话才看到
+// 2. **不重复**：已接手的不再提示（`acceptedBy` 有值即退出）
+// 3. **不报自己的**：自己（含会话家族）写的交接不会被当成"待接手"报回来
+
+/**
+ * 挑出「该让这个持有者看到的待接手交接」。
+ *
+ * @param messages 状态里的全部留言
+ * @param viewerHolderId 当前会话的 holderId
+ * @param viewerFamily 当前会话家族（自己 + 祖先 + 后代）—— 自家子智能体的交接不需要提醒自己
+ * @param viewerPaths 当前会话声明占用的路径（没有声明 ⇒ 只能看到 channel 为 general 的交接）
+ */
+export function pendingHandoffsFor(
+  messages: Message[],
+  viewerHolderId: string,
+  viewerFamily: ReadonlySet<string>,
+  viewerPaths: string[] = [],
+): Message[] {
+  const mine = new Set(viewerFamily)
+  mine.add(viewerHolderId)
+  return messages.filter((m) => {
+    if (m.kind !== 'handoff') return false
+    const handoff = m.handoff
+    if (handoff === undefined) return false
+    // 约束 2：已被接手的、还是草稿的，都不提示
+    if (handoff.acceptedBy !== undefined && handoff.acceptedBy !== '') return false
+    if (handoff.status !== 'final') return false
+    // 约束 3：自己（含家族）写的不提示
+    if (mine.has(m.author)) return false
+    // 约束 1：只给相关的人看。channel `path:<相对路径>` 与声明路径同一套写法，
+    // 因此这里用与 claim 冲突判定同源的 `ov()` 比前缀。
+    if (!m.channel.startsWith('path:')) return viewerPaths.length === 0
+    const target = m.channel.slice('path:'.length)
+    if (!target) return viewerPaths.length === 0
+    return viewerPaths.some((p) => ov(p, target) || ov(target, p))
+  })
+}
+
+/**
+ * 渲染「待接手」提示行；没有则返回空串。
+ *
+ * 文本**时间稳定**（不含"剩 N 分钟"之类）—— 与 renderDigest 同一条理由：
+ * 相对时间会让整块快照每分钟重发一次，毁掉 DSH 的快照去重。
+ */
+export function renderPendingHandoffs(messages: Message[]): string {
+  if (!messages.length) return ''
+  const ordered = messages.slice().sort((a, b) => compareSeqWriter(a.seq, a.writer, b.seq, b.writer))
+  const parts = ordered.slice(0, 3).map((m) => {
+    const handoff = m.handoff
+    if (handoff === undefined) return m.msgId
+    const done = handoff.items.filter((item) => item.status === 'done').length
+    const blocked = handoff.items.filter((item) => item.status === 'blocked').length
+    const shape = handoff.items.length + ' 项（' + done + ' 完成'
+      + (blocked > 0 ? '，' + blocked + ' 阻塞' : '') + '）'
+    return m.msgId + ' 来自 ' + m.author + '：' + shape
+  })
+  const more = ordered.length > 3 ? '；另有 ' + (ordered.length - 3) + ' 份' : ''
+  return '[dsh-collab] 有 ' + ordered.length + ' 份交接等你接手：' + parts.join('；') + more
+    + '。用 collab_board op=read 读全文；接手后 post 一条 kind=handoff-accept 并带 replyTo。'
+}
+
 // ---- 官方 Agent Teams 交叉预警（0.11.0）：只读团队任务的 advisory 写域 ----
 //
 // 定位（README「与官方 Agent Teams 的分工」）：官方管**树内**（成员派生 + 任务 DAG），
