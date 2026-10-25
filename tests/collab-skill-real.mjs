@@ -1,4 +1,4 @@
-import { createHarness, skippedOrRejected, loadCosmokit } from './_harness.mjs'
+import { createHarness, skippedOrRejected, loadCosmokit } from './_harness.mts'
 
 // collab-skill-real.mjs
 // 委托纪律（随包 skill + 常驻 PromptContext + dsh-collab 偏好设置）的**真实服务**端到端测试。

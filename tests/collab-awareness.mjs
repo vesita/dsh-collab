@@ -1,4 +1,4 @@
-import { createHarness } from './_harness.mjs'
+import { createHarness } from './_harness.mts'
 
 // collab-awareness.mjs
 // 多 DSH 会话协同的**实时态势注入**回归测试。

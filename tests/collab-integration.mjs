@@ -6,7 +6,7 @@ import os from 'node:os'
 import path from 'node:path'
 import fsp from 'node:fs/promises'
 import { projectStateFile, collabDir } from '../lib/paths.js'
-import { readStateMerged, sidecarPathOf } from './_harness.mjs'
+import { readStateMerged, sidecarPathOf } from './_harness.mts'
 
 // 隔离：把状态目录指到临时 DSH_HOME，避免测试污染真实 ~/.dsh。
 // paths.ts 在**调用时**读取 process.env，所以在 import 之后设置依然生效。

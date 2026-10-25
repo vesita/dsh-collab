@@ -15,7 +15,7 @@
 //   现在只有操作者显式设置 COLLAB_ALLOW_SKIP=1 才允许跳过，且必须打印"未验证"横幅。
 //
 // 用法：
-//   import { createHarness } from './_harness.mjs'
+//   import { createHarness } from './_harness.mts'
 //   const h = createHarness()                 // 无 skipped 变体
 //   const h = createHarness({ skipped: true })// 汇总行带 ", N skipped" 的变体
 //   const { ok } = h
@@ -152,19 +152,24 @@ export function skippedOrRejected (what) {
   return false
 }
 
+export interface HarnessOptions {
+  skipped?: boolean
+  name?: string
+}
+
 /**
  * 创建一套计数器 + ok/skip/summary/finish。
  * @param {{ skipped?: boolean, name?: string }} [options]
  *        skipped: true 时汇总行追加 ", N skipped"（保持 readers-push 的历史格式）
  */
-export function createHarness (options = {}) {
+export function createHarness (options: HarnessOptions = {}) {
   const trackSkipped = options.skipped === true
   let pass = 0
   let fail = 0
   let skipped = 0
   let bannerShown = false
 
-  const ok = (cond, label, extra) => {
+  const ok = (cond: unknown, label: string, extra?: unknown) => {
     if (cond) { pass++; console.log('  ok  ' + label) }
     else { fail++; console.log('  FAIL ' + label + (extra ? '  <-- ' + extra : '')) }
   }

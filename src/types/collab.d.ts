@@ -208,6 +208,6 @@ export interface CollabBoardParams {
   channel?: string;
   body?: string;
   replyTo?: string;
-  since?: number;
+  since?: number | string;
   limit?: number;
 }

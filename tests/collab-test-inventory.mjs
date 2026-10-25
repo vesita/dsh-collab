@@ -17,11 +17,12 @@
 import { readFileSync, readdirSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { createHarness } from './_harness.mjs'
+import { createHarness } from './_harness.mts'
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
-const RUN_RE = /node\s+(tests\/[A-Za-z0-9._-]+\.mjs)/g
-const LINE_RE = /^node\s+(tests\/[A-Za-z0-9._-]+\.mjs)/
+// 支持 .mjs / .mts / .ts：测试正在从 .mjs 逐步迁移到 TS。
+const RUN_RE = /node\s+(tests\/[A-Za-z0-9._-]+\.(?:mjs|mts|ts))/g
+const LINE_RE = /^node\s+(tests\/[A-Za-z0-9._-]+\.(?:mjs|mts|ts))/
 
 /** 某个 npm script 命令里按顺序引用的测试文件。 */
 const runsIn = (cmd) => [...String(cmd || '').matchAll(RUN_RE)].map(m => m[1])
@@ -64,7 +65,7 @@ const { ok } = h
 
 const pkg = JSON.parse(readFileSync(path.join(ROOT, 'package.json'), 'utf8'))
 const readme = readFileSync(path.join(ROOT, 'README.md'), 'utf8')
-const files = readdirSync(path.join(ROOT, 'tests')).filter(f => f.endsWith('.mjs')).sort()
+const files = readdirSync(path.join(ROOT, 'tests')).filter(f => /\.(?:mjs|mts|ts)$/.test(f)).sort()
 
 console.log('# 1. 仓库现状')
 const now = auditSuite({ files, scripts: pkg.scripts, readme })

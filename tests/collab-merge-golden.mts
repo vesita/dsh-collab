@@ -15,7 +15,7 @@
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
-import { createHarness } from './_harness.mjs'
+import { createHarness } from './_harness.mts'
 import { mergeDocs, normalizeDoc } from '../lib/collab-core.js'
 
 const HERE = dirname(fileURLToPath(import.meta.url))

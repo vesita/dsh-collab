@@ -19,7 +19,7 @@
 //
 // 运行：node tests/collab-write-merge.mjs
 
-import { createHarness, readStateMerged } from './_harness.mjs'
+import { createHarness, readStateMerged } from './_harness.mts'
 import { createStateCore } from '../lib/state-core.js'
 import * as pureCore from '../lib/collab-core.js'
 import * as pureOps from '../lib/collab-ops.js'
@@ -61,19 +61,19 @@ function makeDisk () {
  * @param opts.bypassGuard   true = 版本守卫**不生效**（照实测：两个写者同时 probe 成功、各自 rename 都成功）
  * @param opts.onWrite       每次写入时的回调（断言"确实写了两份"）
  */
-function makeFs (disk, opts = {}) {
+function makeFs (disk: any, opts: any = {}) {
   const view = opts.snapshot || disk.files
-  const versionOf = (p) => (opts.snapshot ? 1 : (disk.versions.get(p) || 1))
+  const versionOf = (p: string) => (opts.snapshot ? 1 : (disk.versions.get(p) || 1))
   return {
-    resolve: async (p) => ({ displayPath: p, path: p }),
-    stat: async (t) => (view.has(t.path) ? { version: versionOf(t.path) } : null),
-    readText: async (t) => view.get(t.path) || '',
-    writeText: async (t, content, o) => {
+    resolve: async (p: string) => ({ displayPath: p, path: p }),
+    stat: async (t: any) => (view.has(t.path) ? { version: versionOf(t.path) } : null),
+    readText: async (t: any) => view.get(t.path) || '',
+    writeText: async (t: any, content: string, o: any) => {
       if (!opts.bypassGuard && o && o.kind === 'replaceIfVersion') {
         const cur = disk.files.has(t.path) ? (disk.versions.get(t.path) || 1) : null
         if (cur === null || cur !== o.version) {
           const e = new Error('cannot write "' + t.path + '": file changed since it was read')
-          e.code = 'FS_STALE_VERSION'
+          ;(e as any).code = 'FS_STALE_VERSION'
           throw e
         }
       }
@@ -89,7 +89,7 @@ function makeFs (disk, opts = {}) {
 }
 
 /** 一个写者（= 一个 createStateCore 实例）。writerId 必须不同 —— 它就是记录的写者戳。 */
-function makeStore (disk, writerId, opts = {}) {
+function makeStore (disk: any, writerId: string, opts: any = {}) {
   return createStateCore({
     fs: makeFs(disk, opts.fs || {}),
     core: opts.core || pure,
@@ -227,7 +227,7 @@ console.log('# 4. 撞 seq 的留言一条不丢（复合游标迭代读）')
   const seen = []
   let cursor = pure.cursorKey({ seq: 1, writer: '' })
   for (let i = 0; i < 10; i++) {
-    const page = await A.msgs({ op: 'read', since: cursor, limit: 2 }, null)
+    const page = await A.msgs({ op: 'read', since: cursor, limit: 2 }, null as any)
     ok(page.ok === true, '按复合游标 read 成功', show(page))
     for (const m of page.data.messages) seen.push(m.msgId)
     if (!page.data.hasMore) break

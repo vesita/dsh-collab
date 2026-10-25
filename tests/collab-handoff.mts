@@ -14,7 +14,7 @@ import { mergeDocs, normalizeDoc } from '../lib/collab-core.js'
 
 let passed = 0
 let failed = 0
-function ok(cond, name, detail) {
+function ok(cond: unknown, name: string, detail?: string) {
   if (cond) { passed++; console.log('  ok  ' + name) }
   else { failed++; console.log('  FAIL ' + name + (detail ? '  <-- ' + detail : '')) }
 }
@@ -49,7 +49,7 @@ console.log('# 缺省 kind=note：老写法逐字节不变')
 
 console.log('# ① final 必须带定稿标记')
 {
-  const items = [{ text: '做了一件事', status: 'unverified' }]
+  const items: any = [{ text: '做了一件事', status: 'unverified' }]
   const missing = postOp(init(), H, { body: '没有标记', kind: 'handoff', handoff: { status: 'final', items } }, T)
   ok(badRequest(missing), 'final 但末行没有标记 ⇒ 挡回', JSON.stringify(missing?.data))
   ok(String(missing.data.message).includes(HANDOFF_FINAL_MARK), '报错里说明了该写什么标记')
@@ -142,15 +142,17 @@ console.log('# ④ measured 必须有 evidence')
 
 console.log('# 其他非法输入也要挡回，不静默忽略')
 {
-  ok(badRequest(postOp(init(), H, { body: 'x', kind: 'nonsense' }, T)), '未知 kind ⇒ 挡回')
-  ok(badRequest(postOp(init(), H, { body: 'x', handoff: { status: 'final', items: [] } }, T)),
+  // 负向测试故意传非法类型（运行时有人不按 TS 契约调用时，必须挡回而不是崩溃）。
+  // 加 `as any` 是为了不让负向测试代码自身报类型错。
+  ok(badRequest(postOp(init(), H, { body: 'x', kind: 'nonsense' as any }, T)), '未知 kind ⇒ 挡回')
+  ok(badRequest(postOp(init(), H, { body: 'x', handoff: { status: 'final', items: [] } as any }, T)),
     'kind 不是 handoff 却带了 handoff ⇒ 挡回（否则写入也读不到）')
   ok(badRequest(postOp(init(), H, { body: 'x', kind: 'handoff' }, T)), 'handoff 缺内容 ⇒ 挡回')
-  ok(badRequest(postOp(init(), H, { body: 'x', kind: 'handoff', handoff: { status: 'nonsense', items: [] } }, T)),
+  ok(badRequest(postOp(init(), H, { body: 'x', kind: 'handoff', handoff: { status: 'nonsense' as any, items: [] } }, T)),
     '非法 status ⇒ 挡回')
-  ok(badRequest(postOp(init(), H, { body: 'x', kind: 'handoff', handoff: { status: 'draft', items: 'nope' } }, T)),
+  ok(badRequest(postOp(init(), H, { body: 'x', kind: 'handoff', handoff: { status: 'draft', items: 'nope' as any } }, T)),
     'items 不是数组 ⇒ 挡回')
-  ok(badRequest(postOp(init(), H, { body: 'x', kind: 'handoff', handoff: { status: 'draft', items: [{}] } }, T)),
+  ok(badRequest(postOp(init(), H, { body: 'x', kind: 'handoff', handoff: { status: 'draft', items: [{}] as any } }, T)),
     '事项缺 text ⇒ 挡回')
   ok(badRequest(postOp(init(), H, {
     body: 'x', kind: 'handoff',

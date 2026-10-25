@@ -1,4 +1,4 @@
-import { createHarness, readStateMerged } from './_harness.mjs'
+import { createHarness, readStateMerged } from './_harness.mts'
 
 // collab-hostcode-parity.mjs
 // 动态宿主形态（hostCode）行为对拍测试。

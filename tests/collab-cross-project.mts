@@ -17,7 +17,7 @@
 
 import path from 'node:path'
 import os from 'node:os'
-import { createHarness } from './_harness.mjs'
+import { createHarness } from './_harness.mts'
 
 const cordis = await import('@deepseek-ai/cordis').catch(() => import('../node_modules/.pnpm/node_modules/@deepseek-ai/cordis/lib/index.js'))
 const { Context } = cordis
@@ -55,18 +55,18 @@ function makeFs (initial) {
         const kind = (o && o.kind) || 'replace'
         if (kind === 'createIfAbsent' && store.has(t.path)) {
           const e = new Error('cannot overwrite existing "' + t.path + '" without reading it first')
-          e.code = 'FS_NOT_OBSERVED'
+          ;(e as any).code = 'FS_NOT_OBSERVED'
           throw e
         }
         if (kind === 'replaceIfVersion') {
           if (!store.has(t.path)) {
             const e = new Error('cannot write "' + t.path + '": file changed since it was read')
-            e.code = 'FS_STALE_VERSION'
+            ;(e as any).code = 'FS_STALE_VERSION'
             throw e
           }
           if (Number(o && o.version) !== (versions.get(t.path) || 1)) {
             const e = new Error('cannot write "' + t.path + '": file changed since it was read')
-            e.code = 'FS_STALE_VERSION'
+            ;(e as any).code = 'FS_STALE_VERSION'
             throw e
           }
         }
@@ -75,11 +75,11 @@ function makeFs (initial) {
         return { operation: 'create', version: v }
       },
       processPath: (t) => t.path,
-      listDir: async (d) => {
+      listDir: async (d: any) => {
         const dir = typeof d === 'string' ? d : d.path
         return [...store.keys()]
-          .filter((k) => path.dirname(k) === dir)
-          .map((k) => ({ name: path.basename(k), type: 'file', target: { displayPath: k, path: k } }))
+          .filter((k) => path.dirname(k as string) === dir)
+          .map((k) => ({ name: path.basename(k as string), type: 'file', target: { displayPath: k, path: k } }))
       }
     }
   }

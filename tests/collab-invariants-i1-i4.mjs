@@ -12,7 +12,7 @@
 //
 // 运行：node tests/collab-invariants-i1-i4.mjs
 
-import { createHarness } from './_harness.mjs'
+import { createHarness } from './_harness.mts'
 import { init, sweep, holderView, MAX_RELEASED } from '../lib/collab-core.js'
 import {
   renderDigest,

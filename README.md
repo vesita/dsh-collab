@@ -474,14 +474,16 @@ claim 增加可读性维度（`readable`，默认 `true`；缺字段的老状态
 pnpm run build          # 测试与发布均针对 lib/ 产物
 npm test                # 依次运行下列全部测试（清单与 `test` 脚本的一致性由 tests/collab-test-inventory.mjs 守卫）
 
-node tests/collab-proc-id.mjs          # 进程身份（<pid>:<开机节拍>）：活进程不误判成死
-node tests/collab-pure-logic.mjs       # 纯逻辑 + hostCode 漂移守护
-node tests/collab-convergence.mjs      # merge 的代数律（交换/结合/幂等）+ id 唯一 + 游标无损 + 终态化
-node tests/collab-write-merge.mjs      # 两个写者并发写盘不丢更新（含负向对照）+ release 终态化
-node tests/collab-merge-golden.mjs     # 合并语义黄金语料逐字节对拍（改了语义没重跑语料即红）
+node tests/collab-proc-id.mts          # 进程身份（<pid>:<开机节拍>）：活进程不误判成死
+node tests/collab-pure-logic.mts       # 纯逻辑 + hostCode 漂移守护
+node tests/collab-handoff.mts          # 结构化交接的四条不变量（final 定稿标记 / done 负向对照 / blocked 原因 / measured 证据）
+node tests/collab-handoff-awareness.mts # 接手交互：awareness 每步注入"有份交接等你接手"（只给相关、不重复、不报自己）
+node tests/collab-convergence.mts      # merge 的代数律（交换/结合/幂等）+ id 唯一 + 游标无损 + 终态化（含 handoff）
+node tests/collab-write-merge.mts      # 两个写者并发写盘不丢更新（含负向对照）+ release 终态化
+node tests/collab-merge-golden.mts     # 合并语义黄金语料逐字节对拍（改了语义没重跑语料即红）
 node tests/collab-integration.mjs      # Cordis 插件端到端（fake ctx）
-node tests/collab-state-split.mjs      # 主文件 + 留言旁挂的磁盘布局、两形态等价
-node tests/collab-cross-project.mjs    # 副本按状态文件隔离：跨项目不污染 + 同文件仍收敛
+node tests/collab-state-split.mts      # 主文件 + 留言旁挂的磁盘布局、两形态等价
+node tests/collab-cross-project.mts    # 副本按状态文件隔离：跨项目不污染 + 同文件仍收敛
 node tests/collab-hostcode-parity.mjs  # 动态宿主形态**行为**对拍
 node tests/collab-inline-parity.mjs    # 两形态**同名函数**逐输出对拍（30 个 + 集合回归守护）
 node tests/collab-contract-derivation.mjs # 契约派生守卫（schema ⇄ d.ts ⇄ Python ⇄ 真实工具 schema）

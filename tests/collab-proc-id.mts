@@ -20,16 +20,16 @@ import { readFileSync } from 'node:fs'
 
 let pass = 0
 let fail = 0
-const ok = (cond, label, extra) => {
+const ok = (cond: unknown, label: string, extra?: unknown) => {
   if (cond) { pass++; console.log('  ok  ' + label) }
   else { fail++; console.log('  FAIL ' + label + (extra ? '  <-- ' + extra : '')) }
 }
 const show = (v) => { try { return JSON.stringify(v) } catch (e) { return String(v) } }
 
-const procId = await import(new URL('../lib/proc-id.js', import.meta.url))
+const procId = await import(new URL('../lib/proc-id.js', import.meta.url).href)
 const core = {
-  ...(await import(new URL('../lib/collab-core.js', import.meta.url))),
-  ...(await import(new URL('../lib/collab-ops.js', import.meta.url)))
+  ...(await import(new URL('../lib/collab-core.js', import.meta.url).href)),
+  ...(await import(new URL('../lib/collab-ops.js', import.meta.url).href))
 }
 
 console.log('# 判据可用性')

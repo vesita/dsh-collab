@@ -1,4 +1,4 @@
-import { createHarness, fakeAgentsService, readStateMerged, writeStateSplit } from './_harness.mjs'
+import { createHarness, fakeAgentsService, readStateMerged, writeStateSplit } from './_harness.mts'
 
 // collab-access-gate.mjs
 // 功能 A（访问时的路径相关通知）与功能 C（可读性 + 原生写保护）的回归测试。
@@ -38,7 +38,7 @@ import { createHarness, fakeAgentsService, readStateMerged, writeStateSplit } fr
 import path from 'node:path'
 import os from 'node:os'
 import { readFileSync } from 'node:fs'
-import { loadCosmokit } from './_harness.mjs'
+import { loadCosmokit } from './_harness.mts'
 
 const cordis = await import('@deepseek-ai/cordis').catch(() => import('../node_modules/.pnpm/node_modules/@deepseek-ai/cordis/lib/index.js'))
 const { Context } = cordis

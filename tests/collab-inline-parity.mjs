@@ -29,7 +29,7 @@
 
 import { readFileSync } from 'node:fs'
 import path from 'node:path'
-import { createHarness } from './_harness.mjs'
+import { createHarness } from './_harness.mts'
 // 内联整形规则与 scripts/build-host.mjs **共用一份**：守卫与构建若各写一条规则，
 // 比的就成了"另一条规则"，守不住真正的同源。
 import { stripCrossModuleImports, stripTopLevelExports } from '../scripts/inline-source.mjs'

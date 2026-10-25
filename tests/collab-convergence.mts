@@ -18,7 +18,7 @@
 //
 // 运行：node tests/collab-convergence.mjs
 
-import { createHarness } from './_harness.mjs'
+import { createHarness } from './_harness.mts'
 import { init, mergeDocs, normalizeDoc, sweep, parseCursor, cursorKey, MAX_RELEASED } from '../lib/collab-core.js'
 import { claim, release, post, filterMessages } from '../lib/collab-ops.js'
 
@@ -49,11 +49,11 @@ function randDoc (r, ids) {
   const doc = init()
   const nC = Math.floor(r() * 4)
   for (let i = 0; i < nC; i++) {
-    const c = {
+    const c: any = {
       claimId: pick(r, ids),
       holderId: pick(r, ['agent:A', 'agent:B']),
       paths: [pick(r, ['src/a/', 'src/b/'])],
-      mode: 'exclusive',
+      mode: 'exclusive' as const,
       createdAt: 1000 + Math.floor(r() * 3)
     }
     if (r() < 0.5) c.readers = [pick(r, ['agent:X', 'agent:Y'])]
@@ -64,7 +64,7 @@ function randDoc (r, ids) {
   }
   const nM = Math.floor(r() * 4)
   for (let i = 0; i < nM; i++) {
-    const m = {
+    const m: any = {
       msgId: 'm_' + pick(r, ['1', '2', '3']) + '@' + pick(r, ['w1', 'w2']),
       seq: 1 + Math.floor(r() * 3),
       channel: 'general',
@@ -78,10 +78,10 @@ function randDoc (r, ids) {
     if (r() < 0.35) {
       m.kind = pick(r, ['handoff', 'handoff-accept'])
       if (m.kind === 'handoff') {
-        const items = []
+        const items: any[] = []
         const nI = Math.floor(r() * 3)
         for (let j = 0; j < nI; j++) {
-          const it = { text: 'i' + pick(r, ['0', '1', '2']), status: pick(r, ['done', 'unverified', 'blocked']) }
+          const it: any = { text: 'i' + pick(r, ['0', '1', '2']), status: pick(r, ['done', 'unverified', 'blocked']) }
           if (r() < 0.5) it.negativeControl = { command: 'x', became: 'y' }
           if (r() < 0.3) it.reason = 'why'
           if (r() < 0.4) {
@@ -98,7 +98,7 @@ function randDoc (r, ids) {
   }
   const nH = Math.floor(r() * 3)
   for (let i = 0; i < nH; i++) {
-    const x = { holderId: pick(r, ['agent:A', 'agent:B']), name: 'H' + i, kind: 'agent' }
+    const x: any = { holderId: pick(r, ['agent:A', 'agent:B']), name: 'H' + i, kind: 'agent' }
     if (r() < 0.6) x.lastSeenAt = 1000 + Math.floor(r() * 3)
     if (r() < 0.4) x.proc = '123:456'
     doc.holders.push(x)
@@ -260,7 +260,7 @@ console.log('# 游标是 (seq, writer) 复合值：撞 seq 时按游标迭代一
 console.log('# release 终态化：墓碑让"已释放"不被旧副本翻案，且 GC 规则确定性')
 {
   const live = () => ({
-    claimId: 'c_9@wA', holderId: 'agent:A', holderName: 'A', paths: ['src/a/'], mode: 'exclusive',
+    claimId: 'c_9@wA', holderId: 'agent:A', holderName: 'A', paths: ['src/a/'], mode: 'exclusive' as const,
     createdAt: 1000, seq: 9, writer: 'wA'
   })
   // 旧副本（A 的声明仍然活着）

@@ -1,4 +1,4 @@
-import { createHarness } from './_harness.mjs'
+import { createHarness } from './_harness.mts'
 import { stripCrossModuleImports, stripTopLevelExports } from '../scripts/inline-source.mjs'
 
 // collab-pure-logic.mjs
@@ -138,7 +138,8 @@ console.log('# board: post / read')
   ok(typeof p2.data.deliveryNote === 'string' && p2.data.deliveryNote.includes('不投递') && p2.data.deliveryNote.includes('不唤醒'),
     'post 回 deliveryNote 说明不投递/不唤醒', String(p2.data.deliveryNote))
   const stM = init()
-  const p3 = post(stM, { holderId: 'agent:a', name: 'A' }, { body: 'hi', mentions: ['agent:b'] }, T)
+  // 负向测试：传已废弃的 mentions，必须报错而非静默忽略
+  const p3 = post(stM, { holderId: 'agent:a', name: 'A' }, { body: 'hi', mentions: ['agent:b'] } as any, T)
   ok(p3.ok === false && p3.data.error === 'bad-request' && String(p3.data.message).includes('mentions 已移除'),
     'post 收到 mentions ⇒ bad-request（fail-loud，不静默忽略）', JSON.stringify(p3.data))
   ok(stM.messages.length === 0, '被挡回时**不写入**消息（调用方去掉 mentions 重发即可）')
@@ -257,7 +258,7 @@ console.log('# sweep（声明回收要两个证据；留言与名册行按上限
   // 名册行的回收：oracle 说 not-live 才走；没有 oracle 时一条也不动（fail-closed）
   const st = init()
   claim(st, { holderId: 'agent:live', name: 'Live' }, { paths: ['src/live/'] }, () => 1000)
-  st.holders.push({ holderId: 'agent:ghost', name: 'Ghost', lastSeenAt: 0 })
+  st.holders.push({ holderId: 'agent:ghost', name: 'Ghost', kind: 'agent', lastSeenAt: 0 })
   const kept = sweep(st, { liveProcs: null, procStamping: false })
   ok(kept.prunedHolders === 0 && st.holders.some(h => h.holderId === 'agent:ghost'),
     'sweep: 没有 oracle 时不动名册行（fail-closed）')
@@ -300,7 +301,7 @@ console.log('# sweep（声明回收要两个证据；留言与名册行按上限
   ok(b2.length > 0 && !b2.some(b => b1.includes(b)),
     'filterMessages: 带写者戳时按 nextSince 翻页**不重送**（旧实现会把 seq 相等的那条再送一遍）',
     JSON.stringify({ page1: b1, nextSince: a1.nextSince, page2: b2 }))
-  let cur = '0@', rounds = 0
+  let cur: string | number = '0@', rounds = 0
   const seen = new Set()
   for (;;) {
     const r = filterMessages(st, { since: cur, limit: 4 })
@@ -369,11 +370,11 @@ console.log('# mode=read semantics')
 {
   // 未知/畸形 mode 必须被显式拒绝，而不是替调用方猜一个（猜成 exclusive 会静默升级为最强锁）
   for (const bad of ['bogus', 'READ', 'Exclusive', 42, {}]) {
-    const r = claim(init(), { holderId: 'agent:n' }, { paths: ['src/n/'], mode: bad }, T)
+    const r = claim(init(), { holderId: 'agent:n' }, { paths: ['src/n/'], mode: bad as any }, T)
     ok(r.ok === false && r.data.error === 'bad-request', 'unknown mode rejected with bad-request: ' + JSON.stringify(bad))
   }
   for (const good of ['exclusive', 'shared', 'read']) {
-    ok(claim(init(), { holderId: 'agent:n' }, { paths: ['src/n/'], mode: good }, T).data.claim.mode === good, 'mode accepted: ' + good)
+    ok(claim(init(), { holderId: 'agent:n' }, { paths: ['src/n/'], mode: good as any }, T).data.claim.mode === good, 'mode accepted: ' + good)
   }
   ok(claim(init(), { holderId: 'agent:n' }, { paths: ['src/n/'] }, T).data.claim.mode === 'exclusive', 'omitted mode defaults to exclusive')
   ok(MODES.join(',') === 'exclusive,shared,read', 'MODES lists the three valid modes')
@@ -522,7 +523,7 @@ console.log('# 会话家族（血缘）豁免')
   ok(blockers(st5, stranger, ['src/deploy/']).length === 1, 'blockers 对陌生会话仍然算阻塞')
 
   // 血缘不落盘：holder() 只写已知字段
-  ok(st1.holders.every((x) => x.family === undefined), 'holders 表里不出现 family 字段（血缘不落盘）')
+  ok(st1.holders.every((x) => (x as any).family === undefined), 'holders 表里不出现 family 字段（血缘不落盘）')
 }
 
 // ===== reap 级联清 holders（0.9.11，C4）=====
@@ -531,7 +532,7 @@ console.log('# reap 级联清 holders')
   const mkZombie = () => {
     const st = init()
     const old = T() - 3600 * 1000
-    const mk = (claimId, holderId, p) => ({ claimId, holderId, holderName: holderId, paths: [p], mode: 'exclusive', createdAt: old, readable: true })
+    const mk = (claimId: string, holderId: string, p: string) => ({ claimId, holderId, holderName: holderId, paths: [p], mode: 'exclusive' as const, createdAt: old, readable: true })
     st.claims.push(mk('c_z', 'agent:zombie', 'src/z/'))
     st.claims.push(mk('c_live', 'agent:live', 'src/l/'))
     st.claims.push(mk('c_me', 'agent:me', 'src/m/'))

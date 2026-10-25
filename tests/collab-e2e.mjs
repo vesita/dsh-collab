@@ -30,7 +30,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import assert from 'node:assert'
-import { skippedOrRejected } from './_harness.mjs'
+import { skippedOrRejected } from './_harness.mts'
 
 // ════════════════════════════════════════════════════════════════════════
 // 0. 隔离环境

@@ -14,7 +14,7 @@ import { pendingHandoffsFor, renderPendingHandoffs } from '../lib/collab-ops.js'
 
 let passed = 0
 let failed = 0
-function ok(cond, name, detail) {
+function ok(cond: unknown, name: string, detail?: string) {
   if (cond) { passed++; console.log('  ok  ' + name) }
   else { failed++; console.log('  FAIL ' + name + (detail ? '  <-- ' + detail : '')) }
 }
@@ -25,7 +25,7 @@ const T = () => 5000
 const FINAL_BODY = '正文\n\n' + HANDOFF_FINAL_MARK
 
 /** 造一份状态：A 在 channel=path:src/a/ 写了一份 final 交接。 */
-function stateWithHandoff({ channel = 'path:src/a/', status = 'final', acceptedBy } = {}) {
+function stateWithHandoff({ channel = 'path:src/a/', status = 'final', acceptedBy }: { channel?: string; status?: 'draft' | 'final'; acceptedBy?: string } = {}) {
   const st = init()
   postOp(st, { holderId: 'agent:a', name: 'A' }, {
     body: FINAL_BODY,
@@ -40,7 +40,7 @@ function stateWithHandoff({ channel = 'path:src/a/', status = 'final', acceptedB
   return st
 }
 
-const NOBODY = new Set()
+const NOBODY = new Set<string>()
 
 // ── 约束 ①：只给相关的人看 ────────────────────────────────────────
 

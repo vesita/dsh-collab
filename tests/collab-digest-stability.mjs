@@ -1,4 +1,4 @@
-import { createHarness } from './_harness.mjs'
+import { createHarness } from './_harness.mts'
 
 // collab-digest-stability.mjs
 // 态势摘要**文本时间稳定性**回归测试 —— 针对一个实测过的真实退化。

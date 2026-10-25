@@ -17,7 +17,7 @@
 //
 // 运行：node tests/collab-reap.mjs   退出码非 0 即失败
 
-import { createHarness } from './_harness.mjs'
+import { createHarness } from './_harness.mts'
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'

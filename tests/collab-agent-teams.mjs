@@ -1,4 +1,4 @@
-import { createHarness, fakeAgentsService, readStateMerged } from './_harness.mjs'
+import { createHarness, fakeAgentsService, readStateMerged } from './_harness.mts'
 
 // tests/collab-agent-teams.mjs
 // 0.11.0 **只读、advisory** 桥接官方 Agent Teams 的回归测试。

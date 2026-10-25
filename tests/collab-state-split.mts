@@ -16,7 +16,7 @@
 //
 // 运行：node tests/collab-state-split.mjs
 
-import { createHarness, readStateMerged, sidecarPathOf } from './_harness.mjs'
+import { createHarness, readStateMerged, sidecarPathOf } from './_harness.mts'
 import path from 'node:path'
 import os from 'node:os'
 import { existsSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs'
@@ -42,7 +42,7 @@ const A = { agent: { id: 'agent-A' } }
 
 const B = (n) => Buffer.byteLength(n, 'utf8')
 const msg = (i, body) => ({ msgId: 'm_' + i, seq: i, channel: 'general', author: 'agent:x', ts: 1000 + i, body: body === undefined ? ('msg-' + i) : body })
-const msgsOf = (n, body) => Array.from({ length: n }, (_, k) => msg(k + 1, body))
+const msgsOf = (n: number, body: string = 'm') => Array.from({ length: n }, (_, k) => msg(k + 1, body))
 
 // ---------- 假 fs（包形态）：记账每次 writeText 的**字节数**与目标路径 ----------
 function makeFs (initial) {
@@ -63,11 +63,11 @@ function makeFs (initial) {
         return { operation: 'create', version: v }
       },
       processPath: (t) => t.path,
-      listDir: async (d) => {
+      listDir: async (d: any) => {
         const dir = typeof d === 'string' ? d : d.path
         return [...store.keys()]
-          .filter((k) => path.dirname(k) === dir)
-          .map((k) => ({ name: path.basename(k), type: 'file', target: { displayPath: k, path: k } }))
+          .filter((k) => path.dirname(k as string) === dir)
+          .map((k) => ({ name: path.basename(k as string), type: 'file', target: { displayPath: k, path: k } }))
       }
     }
   }
@@ -91,10 +91,10 @@ function makeHostHarness (store) {
   const versions = new Map()
   const writes = []
   let v = 0
-  const makeTarget = (abs) => {
-    const t = { displayPath: abs, path: abs, targetKey: abs }
+  const makeTarget = (abs: string) => {
+    const t: any = { displayPath: abs, path: abs, targetKey: abs }
     const plain = () => ({ displayPath: abs, path: abs, targetKey: abs })
-    t.then = (f, r) => Promise.resolve(plain()).then(f, r)
+    t.then = (f: any, r: any) => Promise.resolve(plain()).then(f, r)
     return t
   }
   const fs = {
@@ -159,7 +159,7 @@ console.log('# 1. 迁移：主文件带 messages 的旧布局')
   const claim = await lock.execute({ op: 'claim', paths: ['src/core/']}, A)
   ok(claim.ok === true, '旧布局上跑一次 claim 成功（迁移就发生在这一次写盘）', JSON.stringify(claim))
 
-  const mainRaw = env.store.get(STATE)
+  const mainRaw = env.store.get(STATE) as string
   const main = JSON.parse(mainRaw)
   ok(!('messages' in main), '迁移后主文件里**没有** messages 键', Object.keys(main).join(','))
   ok(JSON.stringify(Object.keys(main)) === JSON.stringify(['schemaVersion', 'seq', 'writer', 'claims', 'holders', 'released']),
@@ -167,7 +167,7 @@ console.log('# 1. 迁移：主文件带 messages 的旧布局')
   ok(Array.isArray(main.claims) && main.claims.length === 1, '声明仍在主文件里', JSON.stringify(main.claims.length))
 
   ok(env.store.has(SIDE), '留言旁挂文件已生成', SIDE)
-  const side = JSON.parse(env.store.get(SIDE) || '{}')
+  const side = JSON.parse((env.store.get(SIDE) as string) || '{}')
   ok(Array.isArray(side.messages) && side.messages.length === LEGACY_MSGS.length,
     '旁挂条数 == 迁移前条数（' + LEGACY_MSGS.length + '）', String(side.messages && side.messages.length))
   ok(JSON.stringify(side.messages) === JSON.stringify(LEGACY_MSGS),
@@ -273,7 +273,7 @@ console.log('# 3b. 端到端：默认 MAX_MESSAGES_BYTES 下 post 的截断与�
   ok(merged.messages[merged.messages.length - 1].body === '最新的那条', '最新那条（本次 post）在')
   ok(merged.messages.every((m) => m.body !== 'w'.repeat(8000)) || merged.messages.filter((m) => m.body === 'w'.repeat(8000)).length < 40,
     '最旧的那批被丢掉')
-  const mainKeys = Object.keys(JSON.parse(env.store.get(STATE)))
+  const mainKeys = Object.keys(JSON.parse(env.store.get(STATE) as string))
   ok(!mainKeys.includes('messages'), '截断结果落在旁挂，主文件仍无 messages 键', mainKeys.join(','))
 }
 
@@ -374,9 +374,9 @@ console.log('# 4c. 混合版本：主文件 [m1,m2] + 旁挂 [m2,m3] ⇒ 并集 
 
   const claim = await lock.execute({ op: 'claim', paths: ['src/union/']}, A)
   ok(claim.ok === true, '混合布局上跑一次写操作成功（迁移就发生在这一次写盘）', JSON.stringify(claim))
-  const mainAfter = JSON.parse(env.store.get(STATE))
+  const mainAfter = JSON.parse(env.store.get(STATE) as string)
   ok(!('messages' in mainAfter), '迁移后主文件里没有 messages 键', Object.keys(mainAfter).join(','))
-  const sideAfter = JSON.parse(env.store.get(SIDE) || '{}')
+  const sideAfter = JSON.parse((env.store.get(SIDE) as string) || '{}')
   ok(JSON.stringify((sideAfter.messages || []).map((x) => x.msgId)) === JSON.stringify(['m_1', 'm_2', 'm_3']),
     '迁移把**并集**完整搬进旁挂（旧行为会在这里丢掉旁挂那份 m_3）',
     JSON.stringify((sideAfter.messages || []).map((x) => x.msgId)))
@@ -487,15 +487,15 @@ console.log('# 4f. 两形态等价（claim → post → release → list）')
     JSON.stringify([hRun.claim.ok, hRun.post.ok, hRun.rel.ok, hRun.list.ok]))
 
   // ---- 磁盘布局一致 ----
-  const pKeys = Object.keys(JSON.parse(pEnv.store.get(STATE)))
-  const hKeys = Object.keys(JSON.parse(hStore.get(STATE)))
+  const pKeys = Object.keys(JSON.parse(pEnv.store.get(STATE) as string))
+  const hKeys = Object.keys(JSON.parse(hStore.get(STATE) as string))
   ok(JSON.stringify(pKeys) === JSON.stringify(['schemaVersion', 'seq', 'writer', 'claims', 'holders', 'released']),
     '包形态主文件键集合恰是 {schemaVersion, seq, writer, claims, holders, released}', JSON.stringify(pKeys))
   ok(JSON.stringify(hKeys) === JSON.stringify(pKeys),
     '外壳形态主文件键集合与包形态逐个相同', JSON.stringify({ pkg: pKeys, host: hKeys }))
   ok(!pKeys.includes('messages') && !hKeys.includes('messages'), '两形态的主文件都不含 messages')
-  const pSide = JSON.parse(pEnv.store.get(SIDE) || '{}')
-  const hSide = JSON.parse(hStore.get(SIDE) || '{}')
+  const pSide = JSON.parse((pEnv.store.get(SIDE) as string) || '{}')
+  const hSide = JSON.parse((hStore.get(SIDE) as string) || '{}')
   ok(pEnv.store.has(SIDE) && hStore.has(SIDE), '两形态都生成了留言旁挂文件')
   ok((pSide.messages || []).length === (hSide.messages || []).length,
     '两形态旁挂的留言条数相同', JSON.stringify({ pkg: (pSide.messages || []).length, host: (hSide.messages || []).length }))

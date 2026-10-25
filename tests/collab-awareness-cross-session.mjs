@@ -17,7 +17,7 @@
 
 import path from 'node:path'
 import os from 'node:os'
-import { createHarness } from './_harness.mjs'
+import { createHarness } from './_harness.mts'
 
 const ROOT = path.dirname(new URL(import.meta.url).pathname)
 

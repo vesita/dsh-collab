@@ -1,5 +1,5 @@
-import { createHarness } from './_harness.mjs'
-import { loadCosmokit } from './_harness.mjs'
+import { createHarness } from './_harness.mts'
+import { loadCosmokit } from './_harness.mts'
 
 // collab-skill.mjs
 // 随包发布的 agent-delegation skill + 委托纪律常驻上下文 + 偏好设置的回归测试。
