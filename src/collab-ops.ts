@@ -8,9 +8,9 @@
 // 同一个作用域，顺序是核心在前 —— scripts/build-host.mjs 会把本段顶部的跨模块
 // import 语句剥掉（自包含是那边 `new Function` 装得起来的硬约束）。
 
-import type { Claim, ConflictInfo, Holder, Message, Mode, StateDocument } from './types/collab.js'
+import type { Claim, ConflictInfo, Handoff, HandoffItem, Holder, Message, Mode, StateDocument } from './types/collab.js'
 import type { ClaimInput, Clock, CollabConflictError, FilterMessagesResult, HolderInput, OpResult, OverviewResult, PostInput, PublishedClaim, ReadInput, ReapInput, ReleaseInput , LivenessFn } from './collab-core.js'
-import { MAX_MESSAGES, MESSAGE_BODY_MAX_CHARS, compareSeqWriter, cursorKey, inFamily, mergeDocs, norm, ov, parseCursor, recordId, seg, sweep, writerOf, holderAlive } from './collab-core.js'
+import { HANDOFF_FINAL_MARK, HANDOFF_ITEM_TEXT_MAX_CHARS, HANDOFF_MAX_ITEMS, MAX_MESSAGES, MESSAGE_BODY_MAX_CHARS, compareSeqWriter, cursorKey, inFamily, mergeDocs, norm, ov, parseCursor, recordId, seg, sweep, writerOf, holderAlive } from './collab-core.js'
 
 function bury(s: StateDocument, claims: Claim[]): void {
   if (!Array.isArray(claims) || !claims.length) return
@@ -646,14 +646,133 @@ export function post(state: StateDocument, h: HolderInput, a: PostInput, tNow: C
   if (body.length > MESSAGE_BODY_MAX_CHARS) {
     return { ok: false, changed: false, state, tNow, data: { error: 'bad-request', message: 'body 过长：' + body.length + ' 字符 > 上限 ' + MESSAGE_BODY_MAX_CHARS + '；本条**没有写入**，超限不截断，请精简或拆分后重发' } }
   }
+  // ---- 结构化交接的四条不变量（2026-10）----
+  //
+  // 全部在这一层**挡回**而不是降级：降级会让"我测过了""我做完了"变成可以随口说的话，
+  // 而接手方没有任何办法分辨。判据与文案见 validateHandoff()。
+  const kind = normalizePostKind(a.kind)
+  if (kind === 'invalid') {
+    return { ok: false, changed: false, state, tNow, data: { error: 'bad-request', message: '未知的 kind「' + String((a as { kind?: unknown }).kind) + '」(one of: note, handoff, handoff-accept)' } }
+  }
+  let handoff: Handoff | undefined
+  if (kind === 'handoff') {
+    const checked = validateHandoff(a.handoff, body)
+    if (checked.ok === false) return { ok: false, changed: false, state, tNow, data: { error: 'bad-request', message: checked.message } }
+    handoff = checked.handoff
+  } else if (a.handoff !== undefined) {
+    // kind 不是 handoff 却带了 handoff 内容：挡回，避免"写了但不会被读到"的静默丢失。
+    return { ok: false, changed: false, state, tNow, data: { error: 'bad-request', message: 'handoff 内容只允许与 kind=\'handoff\' 一起写' } }
+  }
   holder(state, h, h.name, tNow)
   const w = writerOf(state)
   const n = ++state.seq
   const m: Message = { msgId: recordId('m_', n, w), seq: n, channel: (typeof a.channel === 'string' && a.channel.trim()) ? a.channel.trim() : 'general', author: h.holderId, ts: tNow(), body }
   if (w) m.writer = w
   if (typeof a.replyTo === 'string' && a.replyTo) m.replyTo = a.replyTo
+  // kind 只在非缺省时才写：老形状的 state 文件里不会多出 `"kind":"note"`，
+  // 保证"老写法的落盘结果逐字节不变"。
+  if (kind !== 'note') m.kind = kind
+  if (handoff !== undefined) m.handoff = handoff
   state.messages.push(m)
   return { ok: true, changed: true, state, tNow, data: { msgId: m.msgId, seq: state.seq, ts: m.ts, channel: m.channel, delivered: false, deliveryNote: BOARD_NO_DELIVERY_HINT } }
+}
+
+/** `kind` 归一：缺省 note；非法值返回 `'invalid'`（由调用方挡回）。 */
+function normalizePostKind(value: unknown): 'note' | 'handoff' | 'handoff-accept' | 'invalid' {
+  if (value === undefined || value === null || value === '') return 'note'
+  if (value === 'note' || value === 'handoff' || value === 'handoff-accept') return value
+  return 'invalid'
+}
+
+/**
+ * 校验一份交接，返回可直接落盘的 `Handoff` 或一条挡回理由。
+ *
+ * ## 四条不变量（每条都对应一次真实的踩坑）
+ *
+ * 1. **`final` 必须带定稿标记**：正文末行逐字等于 `HANDOFF_FINAL_MARK`。
+ *    没有它，接手方在纯文本里分不清"A 写完了"与"A 写到一半被切断"。
+ * 2. **`done` 必须有负向对照**：`command` + `became`。
+ *    那次一条名为 `postpones` 的用例**从没调用过被测函数**，删掉实现照样绿 ——
+ *    是我事后翻出来的。"做完了"必须是"我破坏过它、它变红了"。
+ * 3. **`blocked` 必须给 reason**：否则接手方不知道该绕开还是该等。
+ * 4. **`claim.strength='measured'` 必须有 evidence**。
+ *    那次审计说"每条回复都被判成未送达"，我实测发现不成立 —— 如果我不复核
+ *    就照着修，会去改一个没坏的地方。**不许降级成 inferred**：那会让"我测过了"
+ *    变成一句可以随便说的话。
+ */
+function validateHandoff(
+  raw: PostInput['handoff'],
+  body: string,
+): { ok: true; handoff: Handoff } | { ok: false; message: string } {
+  const fail = (message: string): { ok: false; message: string } => ({ ok: false, message })
+  if (raw === undefined || raw === null || typeof raw !== 'object') {
+    return fail('kind=\'handoff\' 需要 handoff 内容（status 与 items）')
+  }
+  const status = raw.status
+  if (status !== 'draft' && status !== 'final') {
+    return fail('handoff.status 只能是 draft 或 final，收到「' + String(status) + '」')
+  }
+  // 不变量 1
+  if (status === 'final') {
+    const lastLine = body.split('\n').map((line) => line.trim()).filter((line) => line !== '').pop() ?? ''
+    if (lastLine !== HANDOFF_FINAL_MARK) {
+      return fail('handoff.status=final 时，正文末行必须是「' + HANDOFF_FINAL_MARK + '」，实际末行是「' + lastLine + '」')
+    }
+  }
+  const rawItems = raw.items
+  if (!Array.isArray(rawItems)) return fail('handoff.items 必须是数组')
+  if (rawItems.length > HANDOFF_MAX_ITEMS) {
+    return fail('handoff.items 最多 ' + HANDOFF_MAX_ITEMS + ' 条，收到 ' + rawItems.length + ' 条')
+  }
+  const items: HandoffItem[] = []
+  for (const [index, item] of rawItems.entries()) {
+    const at = 'handoff.items[' + index + ']'
+    if (item === null || typeof item !== 'object') return fail(at + ' 必须是对象')
+    const text = typeof item.text === 'string' ? item.text.trim() : ''
+    if (!text) return fail(at + '.text 必填')
+    if (text.length > HANDOFF_ITEM_TEXT_MAX_CHARS) {
+      return fail(at + '.text 最长 ' + HANDOFF_ITEM_TEXT_MAX_CHARS + ' 字符，收到 ' + text.length)
+    }
+    const itemStatus = item.status
+    if (itemStatus !== 'done' && itemStatus !== 'unverified' && itemStatus !== 'blocked') {
+      return fail(at + '.status 只能是 done / unverified / blocked，收到「' + String(itemStatus) + '」')
+    }
+    const out: HandoffItem = { text, status: itemStatus }
+    // 不变量 2
+    if (itemStatus === 'done') {
+      const nc = item.negativeControl
+      if (nc === null || typeof nc !== 'object'
+        || typeof nc.command !== 'string' || nc.command.trim() === ''
+        || typeof nc.became !== 'string' || nc.became.trim() === '') {
+        return fail(at + ' 的状态是 done，必须给 negativeControl（command + became）——'
+          + '「做完了」的判据是「我破坏过它、它变红了」。没有负向对照请用 status=unverified')
+      }
+      out.negativeControl = { command: nc.command.trim(), became: nc.became.trim() }
+    }
+    // 不变量 3
+    if (itemStatus === 'blocked') {
+      if (typeof item.reason !== 'string' || item.reason.trim() === '') {
+        return fail(at + ' 的状态是 blocked，必须给 reason')
+      }
+      out.reason = item.reason.trim()
+    }
+    // 不变量 4
+    if (item.claim !== undefined && item.claim !== null) {
+      const claim = item.claim
+      if (claim.strength !== 'measured' && claim.strength !== 'inferred') {
+        return fail(at + '.claim.strength 只能是 measured 或 inferred，收到「' + String(claim.strength) + '」')
+      }
+      const evidence = typeof claim.evidence === 'string' ? claim.evidence.trim() : ''
+      if (claim.strength === 'measured' && evidence === '') {
+        return fail(at + '.claim.strength=measured 必须给 evidence（命令 + 输出摘要）——'
+          + '没有证据的「我测过了」不许写进交接')
+      }
+      out.claim = evidence === '' ? { strength: claim.strength } : { strength: claim.strength, evidence }
+    }
+    items.push(out)
+  }
+  const handoff: Handoff = { status, items }
+  return { ok: true, handoff }
 }
 
 // 按 holder 分组的占用全景。holder 的 mode 在多条声明不一致时聚合为 'mixed'。

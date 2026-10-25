@@ -85,6 +85,19 @@ export interface PostInput {
   body?: string
   channel?: string
   replyTo?: string
+  /** 条目类型。缺省 `note`（= 老写法，行为逐字节不变）。 */
+  kind?: 'note' | 'handoff' | 'handoff-accept'
+  /** 仅 `kind='handoff'` 时给：结构化交接内容。 */
+  handoff?: {
+    status?: 'draft' | 'final'
+    items?: Array<{
+      text?: string
+      status?: 'done' | 'unverified' | 'blocked'
+      negativeControl?: { command?: string; became?: string }
+      reason?: string
+      claim?: { strength?: 'measured' | 'inferred'; evidence?: string }
+    }>
+  }
 }
 
 /** board read 操作的输入参数。 */
@@ -673,6 +686,23 @@ export const MAX_MESSAGES: number = 2000
 // 超限由 `post()` **显式挡回**（`bad-request`），**绝不静默截断** —— 截断会悄悄改掉调用方的话。
 // 口径：按 `body.length`（UTF-16 单元）计，对星平面字符比 JSON Schema 的 `maxLength` 更严。
 export const MESSAGE_BODY_MAX_CHARS: number = 8000
+
+/**
+ * 交接定稿的标记（末行必须逐字等于它）。
+ *
+ * 为什么用一个固定串而不是"看 status 字段"：`status` 是**结构化字段**，
+ * 而接手方拿到手的第一份东西往往是**渲染出来的文本**（交接文档、board 的 read 输出）。
+ * 文本里能一眼判"完了没"的只有这一个标记 —— 没有它，"A 写到一半被切断"与
+ * "A 说写完了"在纯文本里长得一样。
+ *
+ * 那条协同里我最后就是靠它收尾的：末行写 `写完了`，接手方才敢开始。
+ */
+export const HANDOFF_FINAL_MARK: string = '写完了'
+
+/** 一份交接最多几条事项。超过不值当（那时该拆成多份交接）。 */
+export const HANDOFF_MAX_ITEMS = 200
+/** 一条事项的文字上限。 */
+export const HANDOFF_ITEM_TEXT_MAX_CHARS = 500
 // 留言**总量**的字节预算（0.15.0，R2）。为什么除了条数还要封字节：`MAX_MESSAGES = 2000` 条
 // × 每条上限 8000 字符，最坏仍约 2 MB；真实状态文件的 97% 就是留言（实测 82,248 B 里 79,815 B）。
 // 两者**取先到者**，超出都从**最旧**开始丢（同一个方向，`swept.droppedMessages` 如实报数）。
