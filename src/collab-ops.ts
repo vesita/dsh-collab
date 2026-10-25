@@ -24,6 +24,30 @@ function bury(s: StateDocument, claims: Claim[]): void {
   }
 }
 
+/** 声明的终态类型：主动释放 / 会话句柄销毁自动释放 / 进程确证死亡回收。 */
+export type ClaimTerminalState = 'released' | 'disposed' | 'reaped';
+
+/**
+ * 声明生命周期状态机：Active -> [Released | Disposed | Reaped]
+ *
+ * ## 为什么需要收敛到唯一原语
+ *
+ * 过去三处释放场景（release / releaseOnDispose / reap）各自手写：
+ * `state.claims = filter(...)` + `bury(...)`。
+ * 漏掉任何一步就会产生"已删声明在合并时被旧副本复活"的并发脏锁。
+ * 收敛到这一个原语后，声明离开 active 态的原子动作（出列表 + 立墓碑）得到结构性保证。
+ */
+export function terminateClaims(
+  state: StateDocument,
+  claims: Claim[],
+  _reason: ClaimTerminalState,
+): PublishedClaim[] {
+  if (!Array.isArray(claims) || !claims.length) return []
+  state.claims = state.claims.filter(c => !claims.includes(c))
+  bury(state, claims)
+  return claims.map(publish)
+}
+
 export function clockUtc(ms: number): string {
   const d = new Date(ms)
   const p = (n: number): string => String(n).padStart(2, '0')
@@ -414,9 +438,7 @@ export const AUTO_RELEASE_AUTHOR: string = 'system:dsh-collab'
 export function releaseOnDispose(state: StateDocument, holderId: string, holderName: string, t: number): OpResult {
   const mine = state.claims.filter(c => c.holderId === holderId)
   if (!mine.length) return { ok: true, changed: false, data: { released: [] } }
-  state.claims = state.claims.filter(c => !mine.includes(c))
-  bury(state, mine)
-  const released = mine.map(publish)
+  const released = terminateClaims(state, mine, 'disposed')
   // 路径去重保序后折叠：与通知文案同一口径（最多列 3 条，其余计数）。
   const uniq: string[] = []
   for (const c of released) for (const p of c.paths) if (!uniq.includes(p)) uniq.push(p)
@@ -620,9 +642,8 @@ export function release(state: StateDocument, h: HolderInput, a: ReleaseInput, t
       }
     }
   }
-  state.claims = state.claims.filter(c => !rel.includes(c))
-  bury(state, rel)
-  return { ok: true, changed: true, state, tNow, data: { released: rel.map(publish), serverTime: t } }
+  const publishedRel = terminateClaims(state, rel, 'released')
+  return { ok: true, changed: true, state, tNow, data: { released: publishedRel, serverTime: t } }
 }
 
 // ---- 确证死亡声明的显式回收（0.9.8，op=reap）----
@@ -684,9 +705,9 @@ export function reap(s: StateDocument, h: HolderInput, a: ReapInput, t: number, 
   if (!hits.length) {
     return { ok: true, changed: false, state: s, data: Object.assign({ dryRun: false }, base, { reaped: [], reapedHolders: [] }) }
   }
-  s.claims = s.claims.filter(c => !hits.includes(c))
-  // reap（显式回收）也是"把声明拿掉"，同样立墓碑：否则被回收的声明会被另一份旧副本并回来。
-  bury(s, hits)
+  // reap 也是"把声明拿掉"，统一经状态机终态跃迁立墓碑：
+  // 否则被回收的声明会被另一份旧副本并回来。
+  terminateClaims(s, hits, 'reaped')
   const reapedHolders = s.holders.filter(hh => deadHolder(hh.holderId)).map(hh => hh.holderId)
   const dead = new Set(reapedHolders)
   s.holders = s.holders.filter(hh => !dead.has(hh.holderId))
@@ -730,40 +751,15 @@ export function post(state: StateDocument, h: HolderInput, a: PostInput, tNow: C
     return { ok: false, changed: false, state, tNow, data: { error: 'bad-request', message: '未知的 kind「' + String((a as { kind?: unknown }).kind) + '」(one of: note, handoff, handoff-accept)' } }
   }
   let handoff: Handoff | undefined
-  let targetHandoffMsg: Message | undefined
   if (kind === 'handoff') {
     const checked = validateHandoff(a.handoff, body)
     if (checked.ok === false) return { ok: false, changed: false, state, tNow, data: { error: 'bad-request', message: checked.message } }
     handoff = checked.handoff
   } else if (kind === 'handoff-accept') {
-    // ---- handoff-accept：声明接手某份交接 ----
-    //
-    // 不变量：
-    //   · 必须有 replyTo 指向目标 msgId（接的是哪份必须确定）
-    //   · 目标必须存在、必须是 kind='handoff'、必须是 status='final'（草稿不许接）
-    //   · 目标若已被接手，挡回（不静默覆盖别人的接手）
-    //   · 不能接手自己（含会话家族）写的交接（自己接自己毫无意义）
-    const replyTo = typeof a.replyTo === 'string' ? a.replyTo.trim() : ''
-    if (!replyTo) {
-      return { ok: false, changed: false, state, tNow, data: { error: 'bad-request', message: 'kind=\'handoff-accept\' 必须带 replyTo（指向要接手的那份交接的 msgId）' } }
+    const accepted = transitionHandoffToAccepted(state, a.replyTo, h, tNow())
+    if (accepted.ok === false) {
+      return { ok: false, changed: false, state, tNow, data: { error: accepted.error, message: accepted.message } }
     }
-    const target = state.messages.find((item) => item.msgId === replyTo)
-    if (!target) {
-      return { ok: false, changed: false, state, tNow, data: { error: 'not-found', message: '找不到要接手的交接：' + replyTo } }
-    }
-    if (target.kind !== 'handoff' || !target.handoff) {
-      return { ok: false, changed: false, state, tNow, data: { error: 'bad-request', message: replyTo + ' 不是一份交接条目（kind=' + String(target.kind) + '）' } }
-    }
-    if (target.handoff.status !== 'final') {
-      return { ok: false, changed: false, state, tNow, data: { error: 'bad-request', message: replyTo + ' 还是草稿（status=draft），只有定稿（final）才允许接手' } }
-    }
-    if (target.handoff.acceptedBy !== undefined && target.handoff.acceptedBy !== '') {
-      return { ok: false, changed: false, state, tNow, data: { error: 'conflict', message: replyTo + ' 已由 ' + target.handoff.acceptedBy + ' 接手，不能重复接手' } }
-    }
-    if (inFamily(h, target.author)) {
-      return { ok: false, changed: false, state, tNow, data: { error: 'bad-request', message: '不能接手自己或自家子智能体写的交接（' + target.author + ' 与你在同一家族）' } }
-    }
-    targetHandoffMsg = target
   } else if (a.handoff !== undefined) {
     // kind 不是 handoff 却带了 handoff 内容：挡回，避免"写了但不会被读到"的静默丢失。
     return { ok: false, changed: false, state, tNow, data: { error: 'bad-request', message: 'handoff 内容只允许与 kind=\'handoff\' 一起写' } }
@@ -778,16 +774,48 @@ export function post(state: StateDocument, h: HolderInput, a: PostInput, tNow: C
   // 保证"老写法的落盘结果逐字节不变"。
   if (kind !== 'note') m.kind = kind
   if (handoff !== undefined) m.handoff = handoff
-  // handoff-accept 成功：把目标交接的 acceptedBy 与 acceptedAt 一并置位。
-  //
-  // 放在 state.messages.push 之前或之后都满足原子性（都在这一个事务里落盘）。
-  // 这里写在 push 之前：即使下面异常，整个事务也会回滚，不会留下半更新。
-  if (targetHandoffMsg && targetHandoffMsg.handoff) {
-    targetHandoffMsg.handoff.acceptedBy = h.holderId
-    targetHandoffMsg.handoff.acceptedAt = tNow()
-  }
   state.messages.push(m)
   return { ok: true, changed: true, state, tNow, data: { msgId: m.msgId, seq: state.seq, ts: m.ts, channel: m.channel, delivered: false, deliveryNote: BOARD_NO_DELIVERY_HINT } }
+}
+
+/**
+ * 交接条目状态机跃迁：Final -> Accepted
+ *
+ * ## 守卫的不变量
+ * 1. 目标必须存在且必须是 kind='handoff'
+ * 2. 只有 final 允许接手（draft 不许接）
+ * 3. 目标若已被接手，报 conflict（幂等防护，不覆盖别人的接手）
+ * 4. 不能接手自己或同家族成员写的交接
+ */
+export function transitionHandoffToAccepted(
+  state: StateDocument,
+  replyTo: string | undefined,
+  actor: HolderInput,
+  tNowMs: number,
+): { ok: true; target: Message } | { ok: false; error: 'bad-request' | 'not-found' | 'conflict'; message: string } {
+  const targetId = typeof replyTo === 'string' ? replyTo.trim() : ''
+  if (!targetId) {
+    return { ok: false, error: 'bad-request', message: 'kind=\'handoff-accept\' 必须带 replyTo（指向要接手的那份交接的 msgId）' }
+  }
+  const target = state.messages.find((item) => item.msgId === targetId)
+  if (!target) {
+    return { ok: false, error: 'not-found', message: '找不到要接手的交接：' + targetId }
+  }
+  if (target.kind !== 'handoff' || !target.handoff) {
+    return { ok: false, error: 'bad-request', message: targetId + ' 不是一份交接条目（kind=' + String(target.kind) + '）' }
+  }
+  if (target.handoff.status !== 'final') {
+    return { ok: false, error: 'bad-request', message: targetId + ' 还是草稿（status=draft），只有定稿（final）才允许接手' }
+  }
+  if (target.handoff.acceptedBy !== undefined && target.handoff.acceptedBy !== '') {
+    return { ok: false, error: 'conflict', message: targetId + ' 已由 ' + target.handoff.acceptedBy + ' 接手，不能重复接手' }
+  }
+  if (inFamily(actor, target.author)) {
+    return { ok: false, error: 'bad-request', message: '不能接手自己或自家子智能体写的交接（' + target.author + ' 与你在同一家族）' }
+  }
+  target.handoff.acceptedBy = actor.holderId
+  target.handoff.acceptedAt = tNowMs
+  return { ok: true, target }
 }
 
 /** `kind` 归一：缺省 note；非法值返回 `'invalid'`（由调用方挡回）。 */
