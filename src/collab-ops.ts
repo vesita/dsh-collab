@@ -730,10 +730,40 @@ export function post(state: StateDocument, h: HolderInput, a: PostInput, tNow: C
     return { ok: false, changed: false, state, tNow, data: { error: 'bad-request', message: '未知的 kind「' + String((a as { kind?: unknown }).kind) + '」(one of: note, handoff, handoff-accept)' } }
   }
   let handoff: Handoff | undefined
+  let targetHandoffMsg: Message | undefined
   if (kind === 'handoff') {
     const checked = validateHandoff(a.handoff, body)
     if (checked.ok === false) return { ok: false, changed: false, state, tNow, data: { error: 'bad-request', message: checked.message } }
     handoff = checked.handoff
+  } else if (kind === 'handoff-accept') {
+    // ---- handoff-accept：声明接手某份交接 ----
+    //
+    // 不变量：
+    //   · 必须有 replyTo 指向目标 msgId（接的是哪份必须确定）
+    //   · 目标必须存在、必须是 kind='handoff'、必须是 status='final'（草稿不许接）
+    //   · 目标若已被接手，挡回（不静默覆盖别人的接手）
+    //   · 不能接手自己（含会话家族）写的交接（自己接自己毫无意义）
+    const replyTo = typeof a.replyTo === 'string' ? a.replyTo.trim() : ''
+    if (!replyTo) {
+      return { ok: false, changed: false, state, tNow, data: { error: 'bad-request', message: 'kind=\'handoff-accept\' 必须带 replyTo（指向要接手的那份交接的 msgId）' } }
+    }
+    const target = state.messages.find((item) => item.msgId === replyTo)
+    if (!target) {
+      return { ok: false, changed: false, state, tNow, data: { error: 'not-found', message: '找不到要接手的交接：' + replyTo } }
+    }
+    if (target.kind !== 'handoff' || !target.handoff) {
+      return { ok: false, changed: false, state, tNow, data: { error: 'bad-request', message: replyTo + ' 不是一份交接条目（kind=' + String(target.kind) + '）' } }
+    }
+    if (target.handoff.status !== 'final') {
+      return { ok: false, changed: false, state, tNow, data: { error: 'bad-request', message: replyTo + ' 还是草稿（status=draft），只有定稿（final）才允许接手' } }
+    }
+    if (target.handoff.acceptedBy !== undefined && target.handoff.acceptedBy !== '') {
+      return { ok: false, changed: false, state, tNow, data: { error: 'conflict', message: replyTo + ' 已由 ' + target.handoff.acceptedBy + ' 接手，不能重复接手' } }
+    }
+    if (inFamily(h, target.author)) {
+      return { ok: false, changed: false, state, tNow, data: { error: 'bad-request', message: '不能接手自己或自家子智能体写的交接（' + target.author + ' 与你在同一家族）' } }
+    }
+    targetHandoffMsg = target
   } else if (a.handoff !== undefined) {
     // kind 不是 handoff 却带了 handoff 内容：挡回，避免"写了但不会被读到"的静默丢失。
     return { ok: false, changed: false, state, tNow, data: { error: 'bad-request', message: 'handoff 内容只允许与 kind=\'handoff\' 一起写' } }
@@ -748,6 +778,14 @@ export function post(state: StateDocument, h: HolderInput, a: PostInput, tNow: C
   // 保证"老写法的落盘结果逐字节不变"。
   if (kind !== 'note') m.kind = kind
   if (handoff !== undefined) m.handoff = handoff
+  // handoff-accept 成功：把目标交接的 acceptedBy 与 acceptedAt 一并置位。
+  //
+  // 放在 state.messages.push 之前或之后都满足原子性（都在这一个事务里落盘）。
+  // 这里写在 push 之前：即使下面异常，整个事务也会回滚，不会留下半更新。
+  if (targetHandoffMsg && targetHandoffMsg.handoff) {
+    targetHandoffMsg.handoff.acceptedBy = h.holderId
+    targetHandoffMsg.handoff.acceptedAt = tNow()
+  }
   state.messages.push(m)
   return { ok: true, changed: true, state, tNow, data: { msgId: m.msgId, seq: state.seq, ts: m.ts, channel: m.channel, delivered: false, deliveryNote: BOARD_NO_DELIVERY_HINT } }
 }

@@ -238,6 +238,63 @@ console.log('# 并发接手：acceptedBy 有值者胜（只留一个）')
   ok(up.messages[0].handoff.status === 'final', 'draft ∪ final = final（只前进）')
 }
 
+// ── handoff-accept 的五条约束 ─────────────────────────────────────
+
+console.log('# handoff-accept 约束')
+{
+  const st = init()
+  postOp(st, { holderId: 'agent:author', name: 'Author' }, {
+    body: FINAL_BODY, kind: 'handoff',
+    handoff: { status: 'final', items: [{ text: 'x', status: 'unverified' }] },
+  }, T)
+  const targetId = st.messages[st.messages.length - 1].msgId
+
+  // 1) 缺 replyTo ⇒ 挡回
+  const noReply = postOp(st, { holderId: 'agent:taker', name: 'Taker' }, {
+    body: '接了', kind: 'handoff-accept',
+  }, T)
+  ok(badRequest(noReply), '缺 replyTo ⇒ 挡回')
+
+  // 2) 目标不存在 ⇒ 404
+  const notFound = postOp(st, { holderId: 'agent:taker', name: 'Taker' }, {
+    body: '接了', kind: 'handoff-accept', replyTo: 'm_9999',
+  }, T)
+  ok(notFound.ok === false && notFound.data.error === 'not-found', '目标不存在 ⇒ not-found')
+
+  // 3) 自己接自己的交接 ⇒ 挡回（毫无意义）
+  const selfAccept = postOp(st, { holderId: 'agent:author', name: 'Author' }, {
+    body: '接了', kind: 'handoff-accept', replyTo: targetId,
+  }, T)
+  ok(badRequest(selfAccept), '接自己写的不允许')
+
+  // 4) 目标还是草稿 ⇒ 挡回（只有 final 允许接）
+  const draftSt = init()
+  postOp(draftSt, { holderId: 'agent:author', name: 'Author' }, {
+    body: '草稿正文', kind: 'handoff',
+    handoff: { status: 'draft', items: [{ text: 'x', status: 'unverified' }] },
+  }, T)
+  const draftId = draftSt.messages[draftSt.messages.length - 1].msgId
+  const acceptDraft = postOp(draftSt, { holderId: 'agent:taker', name: 'Taker' }, {
+    body: '接了', kind: 'handoff-accept', replyTo: draftId,
+  }, T)
+  ok(badRequest(acceptDraft), '接草稿不允许（只有 final 允许接）')
+
+  // 5) 正常接手 ⇒ 成功，且目标交接的 acceptedBy 被置位
+  const okAccept = postOp(st, { holderId: 'agent:taker', name: 'Taker' }, {
+    body: '接了', kind: 'handoff-accept', replyTo: targetId,
+  }, T)
+  ok(okAccept.ok === true, '正常接手 ⇒ 成功')
+  const target = st.messages.find((m) => m.msgId === targetId)
+  ok(target.handoff.acceptedBy === 'agent:taker', '目标交接的 acceptedBy 被置位')
+  ok(target.handoff.acceptedAt === 5000, 'acceptedAt 被置位')
+
+  // 6) 重复接手 ⇒ 冲突（已被接手的不能再接）
+  const dupAccept = postOp(st, { holderId: 'agent:another', name: 'Another' }, {
+    body: '我也想接', kind: 'handoff-accept', replyTo: targetId,
+  }, T)
+  ok(dupAccept.ok === false && dupAccept.data.error === 'conflict', '已被接手的不允许重复接手')
+}
+
 console.log('')
 if (failed > 0) { console.log('FAILURES: ' + passed + ' passed, ' + failed + ' failed'); process.exit(1) }
 console.log('ALL PASS: ' + passed + ' passed, 0 failed')
