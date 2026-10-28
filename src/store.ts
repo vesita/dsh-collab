@@ -63,6 +63,8 @@ export interface StateStore {
   /** op=reap（0.9.8）：确证死亡的声明的**显式**回收。默认 dry-run，见 collab-core.ts 的 reap 注释。 */
   reapOp(a: CollabArgs, h: HolderInput, agentId: string | null, agent?: AgentLike): Promise<ToolResult>
   waitFor(a: CollabArgs, h: HolderInput, agentId: string | null, agent?: AgentLike): Promise<ToolResult>
+  /** 与 sweep 同一判据的只读投影：登记已废弃的 holder（见 state-core 的同名方法）。 */
+  staleHolderIds(state: StateDocument): Set<string>
 }
 
 export function installStore(ctx: CollabContext): StateStore {
@@ -319,6 +321,19 @@ export function installStore(ctx: CollabContext): StateStore {
     return pure.cleanName(name || h.holderId)
   }
 
+  /**
+   * 闲置阈值（0.2.14）：`DSH_COLLAB_STALE_CLAIM_DAYS` 覆盖默认的 7 天，`0` = 关闭该判据。
+   * 读不出数字（空串 / 非数）⇒ 不传，由 `collab-core` 用默认值 —— 「配置写错」不该退化成
+   * 「判据关闭」，那会让锁重新永久挂住。
+   */
+  const staleClaimMs = ((): number | undefined => {
+    const raw = process.env.DSH_COLLAB_STALE_CLAIM_DAYS
+    if (typeof raw !== 'string' || !raw.trim()) return undefined
+    const days = Number(raw)
+    if (!Number.isFinite(days)) return undefined
+    return days <= 0 ? 0 : days * 24 * 60 * 60 * 1000
+  })()
+
   // 环境面的注入点：状态机本体（load/mutate/几个只读 op）全部来自 state-core，
   // 与动态外壳共用同一份源码（构建期内联）。下面这些就是两形态**真实差异**的全部清单。
   const state = createStateCore({
@@ -331,6 +346,7 @@ export function installStore(ctx: CollabContext): StateStore {
     legacyTargets,
     liveProcsOf,
     selfProcToken,
+    staleClaimMs,
     removeFile: (absPath: string) => rm(absPath, { force: true }),
     sleep: (ms: number) => ctx.timer.timeout(ms),
     teamTasks,
@@ -347,6 +363,7 @@ export function installStore(ctx: CollabContext): StateStore {
     status: (a, agentId, agent) => state.status(a, agentId, agent),
     msgs: (a, agentId, agent) => state.msgs(a, agentId, agent),
     reapOp: (a, h, agentId, agent) => state.reapOp(a, h, agentId, agent),
-    waitFor: (a, h, agentId, agent) => state.waitFor(a, h, agentId, agent)
+    waitFor: (a, h, agentId, agent) => state.waitFor(a, h, agentId, agent),
+    staleHolderIds: (state2) => state.staleHolderIds(state2)
   }
 }

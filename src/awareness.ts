@@ -43,7 +43,8 @@ export function installAwareness(ctx: CollabContext, store: StateStore): Awarene
   // 之后同 cwd 的所有会话都会读到这份"含自己锁"的缓存 —— 持有者被自己的占用误导。
   // 结论：**视角是读取侧的事**，按当前发起者现场过滤；渲染（renderDigest）与时间无关，
   // 所以按 cwd 缓存原始列表是安全的（谁刷新都一样，不再有"后写覆盖先写"的语义）。
-  const digestCache = new Map<string, { claims: Claim[]; handoffs: Message[]; at: number }>()
+  // `stale` 与 `claims` 一起缓存：它由 holders + claims + 当前时刻算出，同步的 text() 里读不了盘。
+  const digestCache = new Map<string, { claims: Claim[]; stale: Set<string>; handoffs: Message[]; at: number }>()
   const digestBusy = new Set<string>()
 
   // 摘要文本必须**时间稳定**，否则会毁掉 DSH 自己的快照去重：
@@ -64,7 +65,10 @@ export function installAwareness(ctx: CollabContext, store: StateStore): Awarene
       // 交接也进缓存：接手提示与占用是同一份上下文的两个部分，分两次读盘没有意义
       // （而且同步的 text() 里读不了盘）。只留交接条目，别的留言与这里无关。
       const handoffs = state.messages.filter((m) => m.kind === 'handoff')
-      digestCache.set(cwd, { claims: active, handoffs, at: t })
+      // 登记已废弃的 holder（写它的进程已死 + 长期闲置）与 sweep 用同一判据：
+      // 不在这里另算一套，否则摘要会把一条 list 里看不见的锁继续报成"其他会话占用"。
+      const stale = store.staleHolderIds(state)
+      digestCache.set(cwd, { claims: active, stale, handoffs, at: t })
     } catch (e) {
       // 态势刷新是尽力而为：失败时保留上一份缓存，绝不打断任何模型步或工具调用。
     } finally {
@@ -88,9 +92,11 @@ export function installAwareness(ctx: CollabContext, store: StateStore): Awarene
           // 0.9.11 起排的是**整个会话家族**（自己 + 祖先 + 后代）：自家子智能体与我共享写域，
           // 把它报成"其他会话占用"会让父 AI 去协商一个根本不存在的竞争者（backlog §2.2）。
           const fam = new Set(store.familyIds(init.id ? String(init.id) : null, init))
-          // 只认 oracle。not-live ⇒ 持有者确证死亡，不再报成"其他会话占用"。
+          // 两条判据任一成立就不报：oracle 说 not-live，或这条登记已废弃（`stale`，与 sweep 同源）。
           // 拿不到 oracle 或 oracle 自己坏了（failed）⇒ 照常报（fail-closed）。
+          const staleSet = hit ? hit.stale : new Set<string>()
           const dead = (holderId: string): boolean => {
+            if (staleSet.has(holderId)) return true
             const sid = holderId.startsWith('agent:') ? holderId.slice(6) : holderId
             try { return store.livenessOf(sid).state === 'not-live' } catch { return false }
           }

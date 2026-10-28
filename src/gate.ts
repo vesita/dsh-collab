@@ -61,6 +61,12 @@ export function installGate(ctx: CollabContext, store: StateStore, prefs: GatePr
     const me = store.holderOf(execCtx)
     const { state } = await store.load(id, agent)
     const t = store.now()
+    // 登记已废弃的 holder（写它的进程已死 + 长期闲置）与 sweep 用**同一个判据**：
+    // 不在门控里另算一套，否则会出现"list 看不见这条锁、门控还在拦"的分裂。
+    const stale = store.staleHolderIds(state)
+    // 组合后的存活判据：废弃登记直接算 not-live，其余照 oracle 三态。
+    const liveFor = (holderId: string): 'live' | 'not-live' | 'failed' =>
+      stale.has(holderId) ? 'not-live' : isLiveFn(store)(holderId)
     const hits: Array<{ claim: Claim; target: string; kind: 'write' | 'read' }> = []
     // mode 过滤与 collab-core.ts 的 claim() 冲突判据**同源**（见 collab-core.ts 中
     // claim() 的冲突扫描：`c.mode === 'shared' || c.mode === 'read'` 一律 continue），
@@ -74,7 +80,8 @@ export function installGate(ctx: CollabContext, store: StateStore, prefs: GatePr
     const consider = (c: Claim, target: string, kind: 'write' | 'read') => {
       if (inFamily(me, c.holderId)) return
       if (c.mode === 'shared' || c.mode === 'read') return
-      // 存活判据只有 oracle 一条，已在 claimsCovering / 空路径分支里施加（not-live 不进入这里）。
+      // 存活判据：oracle 说 not-live、或这条登记已废弃（见上面的 stale），都在
+      // claimsCovering / 空路径分支里施加，这里不再重复判。
       hits.push({ claim: c, target, kind })
     }
     const collect = (fields: string[], kind: 'write' | 'read') => {
@@ -88,10 +95,10 @@ export function installGate(ctx: CollabContext, store: StateStore, prefs: GatePr
           // 完全绕开门控（2026-10 审计实测）。根的判据取保守侧：**任何他人的未过期
           // exclusive 声明都算冲突**（宁可多拦一次 —— 本部署 ask == deny，而指向根的写
           // 本来也不可能成功，误拦代价≈0；漏拦才是把整道门控关掉）。
-          for (const c of state.claims) if (isLiveFn(store)(c.holderId) !== 'not-live') consider(c, '.', kind)
+          for (const c of state.claims) if (liveFor(c.holderId) !== 'not-live') consider(c, '.', kind)
           continue
         }
-        for (const c of claimsCovering(state.claims, rel, isLiveFn(store))) consider(c, rel, kind)
+        for (const c of claimsCovering(state.claims, rel, liveFor)) consider(c, rel, kind)
       }
     }
     collect(spec.write, 'write')

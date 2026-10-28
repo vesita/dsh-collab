@@ -65,9 +65,11 @@ export function installAccess(ctx: CollabContext, store: StateStore): void {
     // 为它发访问通知只会制造噪声（判据与 claim()/gate 同源）。
     const fam = new Set(store.familyIds(id, agent))
     const { state } = await store.load(id, agent)
-    // 只认 oracle。not-live ⇒ 这条声明的持有者确证死亡，不再当成"别人的占用"报给调用方。
+    // 两条判据任一成立就不报：oracle 说 not-live，或这条登记已废弃（与 sweep 同源）。
     // 拿不到 oracle 或 oracle 自己坏了（failed）⇒ 照常报（fail-closed：宁可多报一次，不可漏报）。
+    const stale = store.staleHolderIds(state)
     const dead = (holderId: string): boolean => {
+      if (stale.has(holderId)) return true
       const sid = holderId.startsWith('agent:') ? holderId.slice(6) : holderId
       try { return store.livenessOf(sid).state === 'not-live' } catch { return false }
     }

@@ -49,6 +49,8 @@ export interface StateCorePure {
   mergeDocs(a: StateDocument, b: StateDocument): StateDocument
   /** 单元 C：规范形（补字段、规范序、墓碑表归一）。 */
   normalizeDoc(s: StateDocument | null | undefined): StateDocument
+  /** 0.2.14：登记已废弃的 holder（进程已死 + 长期闲置）；判据与 sweep 同源。 */
+  staleHolderIds(s: StateDocument, opts?: SweepOptions): Set<string>
   HOLDER_VIEW_LIMIT: number
 }
 
@@ -116,6 +118,11 @@ export interface StateCorePorts {
   /** 本形态的进程身份令牌；null ⇒ `procStamping:false`（旧口径 24h TTL）。 */
   selfProcToken?(): string | null
   /**
+   * 闲置多久算「这条登记已经没人管了」（毫秒）。`0`/负数 ⇒ 关闭该判据；缺失 ⇒ 用
+   * `collab-core` 的默认值（7 天）。包形态从 `DSH_COLLAB_STALE_CLAIM_DAYS` 解析后传进来。
+   */
+  staleClaimMs?: number
+  /**
    * 删除一个绝对路径（清理损坏备份用）。`ctx.fs` 没有删除原语，包形态用 `node:fs` 的 rm；
    * 受限动态宿主给不出删除能力 ⇒ 不传，清理整段跳过（备份只增不减是它已知的限制）。
    */
@@ -140,6 +147,12 @@ export interface StateCore {
   msgs(a: CollabArgs, agentId: string | null, agent?: AgentLike): Promise<ToolResult>
   reapOp(a: CollabArgs, h: HolderInput, agentId: string | null, agent?: AgentLike): Promise<ToolResult>
   waitFor(a: CollabArgs, h: HolderInput, agentId: string | null, agent?: AgentLike): Promise<ToolResult>
+  /**
+   * 与 sweep 同一判据的**只读**投影：哪些 holder 的登记已废弃（写它的进程已死 + 长期闲置）。
+   * 门控 / 态势摘要 / 访问通知用它把废弃声明当成"已死"，与 sweep 的回收保持同一口径 ——
+   * 否则会出现"list 看不见、门控还在拦"的分裂。
+   */
+  staleHolderIds(state: StateDocument): Set<string>
 }
 
 // ---- 磁盘布局（0.15.0，R2）：主文件 + 留言旁挂 ----
@@ -350,17 +363,30 @@ export function createStateCore(ports: StateCorePorts): StateCore {
   // 每次 sweep **现算**：判据只看 state 里实际出现过的那几个进程，不引入定时器、不做全表扫描。
   const sweepOpts = (state: StateDocument): SweepOptions => {
     const toks: string[] = []
-    if (Array.isArray(state.holders)) {
-      for (const h of state.holders) {
-        const p = h && typeof h.proc === 'string' ? h.proc : ''
-        if (p && toks.indexOf(p) < 0) toks.push(p)
-      }
+    const addTok = (p: unknown): void => {
+      if (typeof p !== 'string' || !p) return
+      if (toks.indexOf(p) < 0) toks.push(p)
     }
+    if (Array.isArray(state.holders)) for (const h of state.holders) addTok(h && h.proc)
+    // 声明上的章也要问一次：老状态文件里名册行可能已经换过章，而声明还带着旧进程的章。
+    // 漏了它，`liveProcs` 里就查不到这枚，活进程的声明会被误判成"章已死"。
+    if (Array.isArray(state.claims)) for (const c of state.claims) addTok(c && c.proc)
     const live = typeof ports.liveProcsOf === 'function' ? ports.liveProcsOf(toks) : null
     // liveness 必须一起传：0.2.9 起 sweep 也回收**确证死亡的声明**（不只是名册行）。
     // 以前这里只传进程判据，声明永远不被自动回收，只能等某个会话记得敲一次 op=reap。
-    return { liveProcs: live, procStamping: PROC_TOKEN !== null, liveness: livenessFn(ports) }
+    // `now` / `staleClaimMs`：0.2.14 的废弃登记判据（进程已死 + 长期闲置）要这两样才可判。
+    return {
+      liveProcs: live,
+      procStamping: PROC_TOKEN !== null,
+      liveness: livenessFn(ports),
+      now: now(),
+      staleClaimMs: ports.staleClaimMs
+    }
   }
+
+  /** 与 sweep 同一判据的只读视图：哪些 holder 的登记已废弃（供门控/态势/通知过滤用）。
+   *  局部名带 `Of` 后缀：外壳形态把 core 与本模块内联进**同一作用域**，同名会遮蔽核心函数。 */
+  const staleIdsOf = (state: StateDocument): Set<string> => core.staleHolderIds(state, sweepOpts(state))
 
   const pub = (c: Claim): PublishedClaim => core.publish(c)
 
@@ -868,5 +894,5 @@ export function createStateCore(ports: StateCorePorts): StateCore {
     return { ok: false, error: 'timeout', message: 'paths still claimed', paths, blockers: bList.map(pub), waitedMs: timeoutMs }
   }
 
-  return { load, mutate, list, overviewOp, status, msgs, reapOp, waitFor }
+  return { load, mutate, list, overviewOp, status, msgs, reapOp, waitFor, staleHolderIds: staleIdsOf }
 }

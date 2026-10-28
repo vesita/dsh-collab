@@ -316,15 +316,21 @@ agents.currentInitiator()            → 正在装配的那个会话
 
 ## 声明的生命周期
 
-一条声明的回收**只有三条路径**，都不看时间：
+一条声明有五条回收路径（前三条自动，第 5 条要人明确敲）：
 
 1. **持有者自己 `op=release`** —— 正常收工；
 2. **会话句柄结束**（`agent/disposed`）—— 立即释放它的全部声明，并在留言板留一条审计留言（频道 `agent:<holderId>`），恢复工作前重新 claim；
-3. **持有者已确证死亡**（不在会话注册表里）时显式 `op=reap` —— 默认只列候选，`confirm:true` 才真删。
+3. **持有者已确证死亡**（不在会话注册表里）**且**写它的进程章已死 ⇒ `sweep()` 自动回收（读路径只清内存，写路径落盘并立墓碑）；
+4. **登记已废弃** —— 会话注册表仍说它活着，但写这条声明的进程章已死 **且** 该 holder 闲置 ≥ `DSH_COLLAB_STALE_CLAIM_DAYS`（默认 7 天，`0` 关闭）⇒ `sweep()` 同样回收；
+5. 显式 `op=reap` —— 默认只列候选，`confirm:true` 才真删（见下一节）。
 
-没有租约、没有到期时间、没有按空闲时长推算的自动释放：死没死只由**会话注册表**回答。
-代价如实写在这里：一个活着但忘记 `release` 的会话会一直占着，别人必须 `op=wait` 或协商，
-或者由持有者自己释放。
+第 4 条要解决的问题：会话被重新载入后注册表会一直说它活着（写这条声明的进程早已不存在），
+只认注册表的话这种锁永久不可回收 —— 实测现场一条锁在盘上挂了 7 天，既进不了 `sweep()` 也进不了
+`reap` 候选。第 3、4 条都要求**进程章已死**，所以另一台机器上的活会话不会被误收；
+判据不可用（读不到 `/proc`、`liveProcs` 不是 Set、例行没给 `now`）时一条也不收（fail-closed）。
+
+代价如实写在这里：一个**进程还活着**但忘记 `release` 的会话会一直占着，别人必须 `op=wait`
+或协商，或者由持有者自己释放。
 
 ## 确证死亡的显式回收（`op=reap`）
 
@@ -335,7 +341,8 @@ agents.currentInitiator()            → 正在装配的那个会话
 **判据只有一条**：harness 的**会话注册表**说它不在了（`not-live`）。**不看 age、不看 TTL** ——
 同一条状态不许有两个相反的存活答案。本地进程注册表无法区分"休眠可唤回"与"真死"，
 而误杀的代价不对称（被回收的会话恢复后仍按对话历史以为自己持锁），所以 `op=reap` 是纯显式的：
-默认 dry-run，`confirm: true` 才动手，且**绝不**接进 `sweep()` 或任何读路径、定时器。
+默认 dry-run，`confirm: true` 才动手，`reap` 这个 op 本身**绝不**从 `sweep()` / 读路径 / 定时器里调用
+（`sweep()` 有自己那两条回收判据，见上一节与「状态维护」表）。
 判据不可用（拿不到 oracle、或 oracle 自己抛错）⇒ 一个也不收（fail-closed），并如实标
 `livenessCheck: 'unavailable'`。
 
@@ -499,6 +506,7 @@ node tests/collab-skill.mjs            # 随包 skill + 委托纪律 + 偏好设
 node tests/collab-client-config-page.mjs # 浏览器半边配置页注册面机械检查
 node tests/collab-invariants-i1-i4.mjs # 不变量 I1–I4：唯一存活判据 / 归属 / 有界 / 不误收
 node tests/collab-oracle-liveness.mjs  # 存活 oracle 三态（dead 立刻失效 / live 阻塞 / failed fail-closed）+ 只读不写状态
+node tests/collab-stale-claim.mjs     # 废弃登记：进程章已死 + 闲置 ≥ 7 天 ⇒ 回收（含 7 条负向对照）
 node tests/collab-test-inventory.mjs   # 本清单守卫：无孤儿测试 + 清单与 `npm test` 逐条一致（含负向对照）
 
 pnpm run test:types                    # TypeScript 契约静态检查
@@ -520,7 +528,8 @@ pnpm run test:real                     # 真实 DSH 部署上的委托纪律端�
 | **确证死亡的显式回收** | **仅 `op=reap` + `confirm:true`** | **绝不自动**：dry-run 默认；判据只有一条 —— 会话注册表说持有者不在了 |
 | 留言保留 | 最近 `MAX_MESSAGES = 2000` 条 **且** 总量 ≤ `MAX_MESSAGES_BYTES = 256 KiB` | 两个上限**取先到者**，超出都从最旧的开始丢弃；写入时回报 `swept.droppedMessages`（`swept` 是**条件字段**：仅当本次确有清理时才出现在返回里）。字节口径 = 每条留言 JSON 序列化的 UTF-8 字节之和（不含数组分隔符与外层键名） |
 | 单条留言正文上限 | `MESSAGE_BODY_MAX_CHARS = 8000` 字符 | 只封条数会让状态"任意大"（一条 5MB 实测原样落盘）；超限由 `post()` 以 `bad-request` **显式挡回**，不静默截断 |
-| 失效声明回收 | 会话注册表说持有者不在活名单（`not-live`）**且** 声明带 `proc` 章且该进程不在活进程表 | 两个判据同时成立时 `sweep()` 才收掉声明并立墓碑。没有 `proc` 章的声明（老状态文件 / 盖不了章的形态）不收；判据不可用（没有 liveness、`failed`、`liveProcs` 不是 Set）也不收 —— 证据不足时维持现状（fail-closed） |
+| 失效声明回收 | 会话注册表说持有者不在活名单（`not-live`）**且** 进程章已死 | 两个判据同时成立时 `sweep()` 才收掉声明并立墓碑。进程章取声明自己的；没有（0.2.9 之前的老声明）才回落名册行那一枚 —— 两处都没有 ⇒ 证据不足，不收。判据不可用（`liveProcs` 不是 Set）也不收（fail-closed） |
+| **废弃登记回收** | 会话注册表说**活着**，但进程章已死 **且** 闲置 ≥ `DSH_COLLAB_STALE_CLAIM_DAYS`（默认 7 天） | 判据在 `collab-core` 的 `staleHolderIds()`：闲置时长取「名册行 `lastSeenAt`」与「它各条声明 `createdAt`」的最大值；同一个判据也供门控 / 态势摘要 / 访问通知过滤，避免出现「list 看不见、门控还在拦」。`DSH_COLLAB_STALE_CLAIM_DAYS=0` 关闭，写错成非数则回落到默认值（不关闭） |
 | 名册行回收 | 会话注册表说持有者不在活名单，**或** 名册行的 `proc` 章对应进程已不在活进程表 | 有活跃声明的行一律保留；无声明时两条任一成立即从 `holders` 移除。判据与声明回收同一套证据 |
 | 损坏状态自愈 | JSON 解析失败 | 备份为 `<state>.corrupt-<ts>` 后重置为空状态，并以 `warning` 上报；旧备份只保留最近 3 份（`fs.listDir` 拿不到时静默跳过清理，绝不让自愈失败） |
 | 旁挂损坏自愈 | 留言旁挂 JSON 解析失败 | 同样先备份为 `<name>.messages.json.corrupt-<ts>` 再按无留言继续（**不删不覆盖**），旧备份与主文件**共用同一份保留份数**（最近 3 份） |

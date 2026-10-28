@@ -56,7 +56,7 @@ export const DELEGATION_DISCIPLINE_TEXT = [
   '**默认用官方智能体团队派成员**（spawn_teammate + 共享任务板）：成员继承你的模型、换不了；要指名 provider / model 只能走降级路径（subagent / subagent_fork，先 list_subagent_models 查允许的路由、别编）。',
   '主会话只留结论、决策与验收证据：能用一段话写清规格、且能用一次检查判定对错就委托；验收不外包，要原始输出，别只看摘要。',
   '同一仓库只许一个跑构建；子智能体没有浏览器页面，别派 client 检视。',
-  '锁的存活只看会话注册表：会话句柄结束时（agent/disposed）它持有的声明会被自动释放并留审计留言，恢复工作前先 collab_lock op=claim 重新声明。子智能体意外终止（error 或空收尾）后，同一处最多唤醒一两次，唤醒它时提醒它重新 claim。'
+  '锁的存活看两样：会话注册表说它还在，且写这条声明的进程还在 —— 进程被杀（harness 重启）后它留下的声明会被自动回收，闲置过久的也回收，所以恢复工作前先 collab_lock op=claim 重新声明；会话句柄结束时（agent/disposed）同样会自动释放并留审计留言。子智能体意外终止（error 或空收尾）后，同一处最多唤醒一两次，唤醒它时提醒它重新 claim。'
 ].join('\n')
 
 // ---- 功能 C：写/读调用的路径事实源 ----

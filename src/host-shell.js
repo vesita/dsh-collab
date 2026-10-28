@@ -115,7 +115,7 @@ return {
     // state-core，与包形态 src/store.ts 是**同一份源码**（构建期内联）。这里只把外壳的
     // 环境面递进去，并把内联进本作用域的核心函数收成一个命名空间 —— 状态层因此不需要
     // import（受限宿主里没有 import），两形态也不会各有一份实现。
-    const CORE = { init, sweep, publish, holderView, overview, related, filterMessages, blockers, reap, norm, HOLDER_VIEW_LIMIT, normalizeDoc, mergeDocs, holderAlive }
+    const CORE = { init, sweep, publish, holderView, overview, related, filterMessages, blockers, reap, norm, HOLDER_VIEW_LIMIT, normalizeDoc, mergeDocs, holderAlive, staleHolderIds }
     const store = createStateCore({
       fs: fs,
       core: CORE,

@@ -36,7 +36,8 @@ export interface HolderInput {
    * 就消失，不必再等 24h 计时器。
    *
    * 缺省（纯逻辑语料、受限宿主拿不到进程身份）⇒ 该行退回 24h TTL 老口径，一字不变。
-   * **只影响名册行**：声明（claim）的回收与租约无关（claim 没有过期时间）。
+   * 进程章同时是**声明**的废弃判据之一：写它的进程已死**且**该登记闲置超过
+   * `staleClaimMs`（默认 7 天）⇒ 声明按确证死亡处理（见 `staleHolderIds`）。
    */
   proc?: string
 }
@@ -131,6 +132,81 @@ export interface SweepOptions {
    * 反复删掉。
    */
   procStamping?: boolean
+  /**
+   * 判定「长期闲置」用的**当前时刻**（毫秒）。纯逻辑不隐式读时钟：不给 ⇒ 闲置判据不可用，
+   * 老口径（只看 oracle）原样生效（fail-closed）。
+   */
+  now?: number
+  /**
+   * 闲置多久算**废弃登记**（毫秒）。缺省 `DEFAULT_STALE_CLAIM_MS`；接线层可用
+   * `DSH_COLLAB_STALE_CLAIM_DAYS` 覆盖，`0` = 关闭该判据。
+   */
+  staleClaimMs?: number
+}
+
+/**
+ * 闲置多久算「这条登记已经没人管了」：7 天。
+ *
+ * 判据（`staleHolderIds`）要求**同时**成立：写它的进程已不在、且这条登记 7 天没有任何动静。
+ * 只靠进程一条不够：会话被重新载入后 oracle 会说它活着（尽管写这条声明的进程早已不在），
+ * 于是它既不会被 sweep 收、也不会进 reap 候选，锁一直挂在盘上。
+ */
+export const DEFAULT_STALE_CLAIM_MS: number = 7 * 24 * 60 * 60 * 1000
+
+/** 解析生效的闲置阈值：`0` / 负数 ⇒ `null`（关闭该判据）。 */
+function resolveStaleMs(v: unknown): number | null {
+  if (typeof v === 'number' && Number.isFinite(v) && v <= 0) return null
+  if (typeof v === 'number' && Number.isFinite(v)) return v
+  return DEFAULT_STALE_CLAIM_MS
+}
+
+/**
+ * **废弃登记**的 holderId 集合：写它的那个进程已经不在了，而且它长期没有任何动静。
+ *
+ * 为什么要这条判据：声明（claim）回收原本要求「oracle 说 not-live **且** 进程章已死」。会话被
+ * 重新载入之后 oracle 会说它活着，而写入这条声明的进程早已不存在 —— 两条判据永远凑不齐，
+ * 锁就永久留在盘上（实测现场：一条 7 天前的声明既不进 sweep 也不进 reap 候选）。
+ *
+ * 判据只缩不放，三条证据缺一不可：
+ *   · `liveProcs` 必须是 Set —— 判据不可用（非 Linux / 读不到 /proc / 受限宿主）⇒ 空集（fail-closed）；
+ *   · 进程章（声明上的优先，缺则用名册行的）必须**不在** `liveProcs` 里；
+ *   · 该 holder 最后一次动静（名册行 `lastSeenAt` 与它各条声明 `createdAt` 取最大）距 `now` ≥ 阈值。
+ *
+ * 它对上层只做一件事：把这条登记**当作已死**，交给既有路径处理（sweep 回收声明并立墓碑、
+ * 名册行按进程章淘汰）。本函数自己不删任何东西。
+ */
+export function staleHolderIds(s: StateDocument, opts: SweepOptions = {}): Set<string> {
+  const out = new Set<string>()
+  const liveProcs: Set<string> | null = opts.liveProcs instanceof Set ? opts.liveProcs : null
+  const t = typeof opts.now === 'number' && Number.isFinite(opts.now) ? opts.now : null
+  const ms = resolveStaleMs(opts.staleClaimMs)
+  if (!liveProcs || t === null || ms === null) return out
+  const claims = Array.isArray(s.claims) ? s.claims : []
+  const holders = Array.isArray(s.holders) ? s.holders : []
+  const lastActivity = new Map<string, number>()
+  const procOf = new Map<string, string>()
+  const bump = (id: string, at: number): void => {
+    if (!id || !Number.isFinite(at)) return
+    const cur = lastActivity.get(id)
+    if (cur === undefined || at > cur) lastActivity.set(id, at)
+  }
+  for (const h of holders) {
+    if (!h || !h.holderId) continue
+    bump(h.holderId, Number(h.lastSeenAt) || 0)
+    if (typeof h.proc === 'string' && h.proc) procOf.set(h.holderId, h.proc)
+  }
+  for (const c of claims) {
+    if (!c || !c.holderId) continue
+    bump(c.holderId, Number(c.createdAt) || 0)
+    // 声明自己的章优先：它才是写这条声明时的进程。
+    if (typeof c.proc === 'string' && c.proc) procOf.set(c.holderId, c.proc)
+  }
+  for (const [holderId, proc] of procOf) {
+    if (liveProcs.has(proc)) continue
+    const seen = lastActivity.get(holderId) || 0
+    if (t - seen >= ms) out.add(holderId)
+  }
+  return out
 }
 
 /** sweep 的清理诊断信息。 */
@@ -780,38 +856,50 @@ export function sweep(s: StateDocument, opts: SweepOptions = {}): SweepResult {
   const liveProcs: Set<string> | null = opts.liveProcs instanceof Set ? opts.liveProcs : null
   const procStamping = opts.procStamping === true
 
-  // **声明（claim）的回收**（0.2.9 起）：确证死亡（oracle=not-live）的持有者，其声明在
-  // 这里就收掉并立墓碑 —— 不再只靠 op=reap 手动清。
+  // **声明（claim）的回收**（0.2.9 起）：确证死亡的持有者，其声明在这里就收掉并立墓碑 ——
+  // 不再只靠 op=reap 手动清。
   //
   // 为什么必须加：`agent/disposed` 只覆盖**优雅退场**。进程被 SIGKILL（dsh 重启、整条 cgroup
   // 被杀）时那个事件从头到尾没有发射机会，于是声明永久留在盘上。实测现场：5 条声明残留
   // 2.88～3.64 天，所属进程（315976、43110）全已不存在、oracle 全 not-live，而没有**任何**
   // 自动路径会删它们（reap 被刻意做成纯显式 + 默认 dry-run）。那不是"忘了删"，是回收机制的空档。
   //
+  // 两条入口，共同的前提是**进程章已死**（写这条声明/这一行的进程不在 `liveProcs` 里）：
+  //   ① oracle 说 not-live（0.2.9 起的原判据）；
+  //   ② oracle 说 live，但这条登记早已废弃（0.2.14，`staleHolderIds`）：会话被重新载入后
+  //      oracle 会一直说它活着，而写它的进程早没了 —— 只认 oracle 的话这种锁永久不可回收。
+  //      第 ② 条额外要求闲置 ≥ `staleClaimMs`（默认 7 天），把"刚换进程、正要接着干"的窗口排除在外。
+  //
   // 为什么这里不会误收活会话（**跨进程安全**是这里最硬的要求）：
   //   · oracle（`liveness`）查的是**本进程**的 agents 注册表。多开一个 dsh 实例时，A 看不到
   //     B 里活着的会话 ⇒ 单靠 oracle 会把 B 的锁当死锁删掉。实测本机曾经同时跑着本机会话与
   //     noco 侧 dsh，这不是假想场景。所以 oracle=not-live **只是必要条件，不是充分条件**。
-  //   · 充分条件看声明的 `proc` 章（写这条声明时的进程身份令牌 `<pid>:<开机节拍>`）：
-  //     那个进程确实不在 `liveProcs` 里（= pid 没了，或同 pid 已换成另一个进程）。
-  //     两个判据**同时**成立才收 —— 与名册行回收同一套证据，只是名册行两条任一即可。
-  //   · 没有 `proc` 章的声明（老状态文件 / 盖不了章的形态）**不收**：证据不足，维持现状。
-  //   · 判据不可用（没有 liveness / 'failed' / liveProcs 不是 Set / 本形态不盖章）
-  //     一律**不回收**（fail-closed）—— 漏收只是维持现状，误收会删掉活会话的锁。
+  //   · 充分条件看进程章（`<pid>:<开机节拍>`）：那个进程确实不在 `liveProcs` 里（= pid 没了，
+  //     或同 pid 已换成另一个进程）。两条入口都必须先满足它。
+  //   · 进程章取**声明自己的**；没有（0.2.9 之前写下的老声明）才回落到名册行那一枚 ——
+  //     两处都没有 ⇒ 证据不足 ⇒ 不收。
+  //   · 判据不可用（liveProcs 不是 Set / 本形态不盖章 / 没有 `now`）一律**不回收**（fail-closed）
+  //     —— 漏收只是维持现状，误收会删掉活会话的锁。
   //   · 立墓碑（buryClaims）与 release/reap 同一处理：删除在 join 下不单调，
   //     不立墓碑会被旧副本并回来。
   let prunedClaims = 0
-  if (Array.isArray(s.claims) && typeof opts.liveness === 'function') {
+  if (Array.isArray(s.claims)) {
+    const stale = staleHolderIds(s, opts)
+    const holderProc = new Map<string, string>()
+    for (const h of Array.isArray(s.holders) ? s.holders : []) {
+      if (h && h.holderId && typeof h.proc === 'string' && h.proc) holderProc.set(h.holderId, h.proc)
+    }
     const reclaimable = s.claims.filter(c => {
       if (!c) return false
-      // 必要条件一：oracle 说这个持有者不在活名单里。
-      if (holderAlive(c.holderId, opts.liveness)) return false
-      // 必要条件二：这条声明盖着进程章，且那个进程确实不在了。
-      const proc = typeof c.proc === 'string' ? c.proc : ''
-      if (!proc) return false
-      // liveProcs 不是 Set ⇒ 进程判据不可用 ⇒ fail-closed（与名册行同一口径）。
+      // 共同前提：进程章已死（判据不可用 ⇒ fail-closed）。
       if (!(liveProcs instanceof Set)) return false
-      return !liveProcs.has(proc)
+      const proc = (typeof c.proc === 'string' && c.proc) || holderProc.get(c.holderId) || ''
+      if (!proc || liveProcs.has(proc)) return false
+      // 入口 ②：废弃登记（进程已死 + 长期闲置），不依赖 oracle。
+      if (stale.has(c.holderId)) return true
+      // 入口 ①：oracle 说这个持有者不在活名单里（无 oracle 时无法判定 ⇒ 不收）。
+      if (typeof opts.liveness !== 'function') return false
+      return !holderAlive(c.holderId, opts.liveness)
     })
     if (reclaimable.length) {
       s.claims = s.claims.filter(c => !reclaimable.includes(c))
